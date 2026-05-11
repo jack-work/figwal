@@ -88,6 +88,30 @@ Any subdirectory in the dir tree marks its parent as a branch point: read-only, 
 
 The `.fork` file in a child dir is one line: `base=<N>`. The parent is always `..`.
 
+## In-memory cache
+
+For read-heavy workloads (e.g. re-scanning the whole log between every turn of a conversation), wrap the log with `log.Cached`:
+
+```go
+c, _ := log.OpenCached("/var/wal/session-42", log.Options{Codec: segment.JSONLCodec{}})
+defer c.Close()
+
+c.Write(1, []byte(`{"role":"user"}`))   // fsync + cache update under writer mutex
+payload, _ := c.Read(1)                  // lock-free, ~0.4 ns/op
+c.Range(1, func(idx uint64, p []byte) error { /* ... */ return nil })
+```
+
+Reads are lock-free over an immutable snapshot held in an `atomic.Pointer`. Writes serialize on a writer mutex, fsync to disk, then publish a new snapshot pointer. Many goroutines can read in parallel with zero contention, including while a writer is committing. `Cached.Snapshot()` returns a point-in-time view that survives later writes — useful for marshaling the entire log over the network without coordinating with concurrent activity.
+
+`Cached.Fork` reshapes the cache the same way `Log.Fork` reshapes disk: parent snapshot is resliced to the prefix, the child gets a fresh snapshot whose parent pointer is the truncated trunk. Sibling forks share parent state by pointer, no duplication.
+
+Read benchmarks (lock-free path):
+
+```
+BenchmarkCachedRead       0.4 ns/op   0 B/op  0 allocs/op
+BenchmarkCachedRangeFull  ~1.5 ns/entry over 1024 entries, 0 allocs
+```
+
 ## Parent dedup with a Store
 
 If a process opens many sibling forks off a shared trunk, use a `log.Store` so the trunk's segments load into memory once:
