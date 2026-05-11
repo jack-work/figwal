@@ -31,12 +31,21 @@ func TestBinaryCodecRoundTrip(t *testing.T) {
 	}
 }
 
-func TestBinaryCodecCorruptCRC(t *testing.T) {
+func TestBinaryCodecScanStopsOnCorruptCRC(t *testing.T) {
+	// ReadFrame trusts on-disk integrity for speed; CRC is verified in
+	// ScanFrames during recovery. A bad CRC mid-stream stops the scan
+	// before the bad frame.
 	c := BinaryCodec{}
-	frame, _ := c.Frame(0, []byte("hello"))
-	frame[headerSize] ^= 0xFF
-	if _, _, err := c.ReadFrame(bytes.NewReader(frame), 0, int64(len(frame))); err != ErrCorrupt {
-		t.Fatalf("want ErrCorrupt, got %v", err)
+	var buf bytes.Buffer
+	good, _ := c.Frame(0, []byte("good"))
+	buf.Write(good)
+	bad, _ := c.Frame(0, []byte("bad"))
+	bad[headerSize] ^= 0xFF
+	buf.Write(bad)
+	n := 0
+	c.ScanFrames(&buf, func(_ int64, _ int) error { n++; return nil })
+	if n != 1 {
+		t.Fatalf("want 1 frame before stop, got %d", n)
 	}
 }
 
@@ -138,13 +147,21 @@ func TestJSONLCodecEnvelopeShape(t *testing.T) {
 	}
 }
 
-func TestJSONLCodecHashTamperDetected(t *testing.T) {
+func TestJSONLCodecScanStopsOnHashMismatch(t *testing.T) {
+	// ReadFrame skips the per-row hash check for speed; the recovery
+	// scan still verifies, so a hash mismatch mid-stream stops the
+	// scan before the tampered frame.
 	c := JSONLCodec{}
-	frame, _ := c.Frame(0, []byte(`{"a":1}`))
-	// Mutate the payload bytes; hash should no longer match.
-	tampered := bytes.Replace(frame, []byte(`"a":1`), []byte(`"a":2`), 1)
-	if _, _, err := c.ReadFrame(bytes.NewReader(tampered), 0, int64(len(tampered))); err != ErrCorrupt {
-		t.Fatalf("want ErrCorrupt, got %v", err)
+	var buf bytes.Buffer
+	good, _ := c.Frame(0, []byte(`{"a":1}`))
+	buf.Write(good)
+	bad, _ := c.Frame(1, []byte(`{"a":2}`))
+	tampered := bytes.Replace(bad, []byte(`"a":2`), []byte(`"a":3`), 1)
+	buf.Write(tampered)
+	n := 0
+	c.ScanFrames(&buf, func(_ int64, _ int) error { n++; return nil })
+	if n != 1 {
+		t.Fatalf("want 1 frame before stop, got %d", n)
 	}
 }
 

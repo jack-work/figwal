@@ -63,7 +63,26 @@ func (BinaryCodec) Frame(_ uint64, payload []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func (BinaryCodec) ReadFrame(r io.ReaderAt, off, _ int64) ([]byte, int, error) {
+// ReadFrame trusts the on-disk integrity of the frame; the CRC is
+// verified in ScanFrames during segment recovery, not on every read.
+// When nextOff is known the read is a single syscall.
+func (BinaryCodec) ReadFrame(r io.ReaderAt, off, nextOff int64) ([]byte, int, error) {
+	if nextOff > off {
+		length := int(nextOff - off)
+		if length < headerSize {
+			return nil, 0, ErrCorrupt
+		}
+		buf := make([]byte, length)
+		if _, err := r.ReadAt(buf, off); err != nil {
+			return nil, 0, err
+		}
+		n := binary.LittleEndian.Uint32(buf[0:4])
+		if int(n)+headerSize != length {
+			return nil, 0, ErrCorrupt
+		}
+		return buf[headerSize:], length, nil
+	}
+	// Fallback: nextOff unknown. Used by the offset-based debug path.
 	var hdr [headerSize]byte
 	if _, err := r.ReadAt(hdr[:], off); err != nil {
 		return nil, 0, err
@@ -74,10 +93,6 @@ func (BinaryCodec) ReadFrame(r io.ReaderAt, off, _ int64) ([]byte, int, error) {
 		if _, err := r.ReadAt(payload, off+headerSize); err != nil {
 			return nil, 0, err
 		}
-	}
-	sum := binary.LittleEndian.Uint32(hdr[4:8])
-	if crc32.ChecksumIEEE(payload) != sum {
-		return nil, 0, ErrCorrupt
 	}
 	return payload, headerSize + int(n), nil
 }
@@ -163,6 +178,11 @@ func (JSONLCodec) Frame(idx uint64, payload []byte) ([]byte, error) {
 	return append(line, '\n'), nil
 }
 
+// ReadFrame extracts the payload without verifying the stored hash; the
+// hash is verified in ScanFrames during recovery. When the line is in
+// canonical form (which is what Frame emits) the decode is a slice and
+// pointer dance with no JSON parse and no allocations beyond the read
+// buffer itself.
 func (JSONLCodec) ReadFrame(r io.ReaderAt, off, nextOff int64) ([]byte, int, error) {
 	if nextOff <= off {
 		return nil, 0, errors.New("jsonl ReadFrame requires nextOff > off")
@@ -172,7 +192,7 @@ func (JSONLCodec) ReadFrame(r io.ReaderAt, off, nextOff int64) ([]byte, int, err
 	if _, err := r.ReadAt(buf, off); err != nil {
 		return nil, 0, err
 	}
-	payload, err := decodeJSONLLine(buf)
+	payload, err := decodeJSONLLine(buf, false)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -219,7 +239,7 @@ func (JSONLCodec) ScanFrames(r io.Reader, fn func(off int64, frameLen int) error
 		if b != '\n' {
 			continue
 		}
-		if _, err := decodeJSONLLine(line); err != nil {
+		if _, err := decodeJSONLLine(line, true); err != nil {
 			return nil // torn tail or corruption
 		}
 		frameLen := len(line)
@@ -231,14 +251,86 @@ func (JSONLCodec) ScanFrames(r io.Reader, fn func(off int64, frameLen int) error
 	}
 }
 
-// decodeJSONLLine parses a single JSONL envelope line (with or without
-// trailing newline), extracts and validates the sidecar `_idx` and
-// `_hash` keys against the remaining payload, and returns the payload
-// in canonical JSON form.
-func decodeJSONLLine(line []byte) ([]byte, error) {
+// decodeJSONLLine returns the payload bytes from a JSONL envelope line
+// (with or without a trailing newline). If verify is true, the stored
+// `_hash` is recomputed from the payload and a mismatch returns
+// ErrCorrupt; this is the recovery-scan path. Otherwise the fast
+// canonical-slice path is used when the line matches the on-disk format
+// Frame emits, with a parsing fallback for lines that have been hand
+// edited (e.g. re-pretty-printed by jq).
+//
+// In the fast path the returned slice aliases line; in the slow path it
+// is a freshly allocated canonical re-marshal.
+func decodeJSONLLine(line []byte, verify bool) ([]byte, error) {
 	if n := len(line); n > 0 && line[n-1] == '\n' {
 		line = line[:n-1]
 	}
+	if !verify {
+		if payload, ok := fastDecodeCanonicalLine(line); ok {
+			return payload, nil
+		}
+	}
+	return slowDecodeJSONLLine(line, verify)
+}
+
+// Fixed prefixes for the canonical envelope. _hash sorts before _idx
+// alphabetically, so marshalCanonical always emits them in this order.
+const (
+	hashPrefix = `{"_hash":"`
+	idxPrefix  = `","_idx":`
+)
+
+// fastDecodeCanonicalLine extracts the payload bytes from a line in the
+// exact canonical form Frame emits, with no JSON parse. It mutates one
+// byte of line (the comma between _idx and the first payload key) to
+// splice in a leading `{`; the returned slice then aliases the input
+// buffer. Callers must pass a buffer they own.
+//
+// Returns (nil, false) if the line isn't in canonical form. The slow
+// path is then responsible for handling it.
+func fastDecodeCanonicalLine(line []byte) ([]byte, bool) {
+	min := len(hashPrefix) + hashHexLen + len(idxPrefix) + 1 + 1
+	if len(line) < min {
+		return nil, false
+	}
+	if !bytes.HasPrefix(line, []byte(hashPrefix)) {
+		return nil, false
+	}
+	p := len(hashPrefix) + hashHexLen
+	if !bytes.HasPrefix(line[p:], []byte(idxPrefix)) {
+		return nil, false
+	}
+	p += len(idxPrefix)
+	digitsStart := p
+	for p < len(line) && line[p] >= '0' && line[p] <= '9' {
+		p++
+	}
+	if p == digitsStart {
+		return nil, false
+	}
+	if line[len(line)-1] != '}' {
+		return nil, false
+	}
+	switch line[p] {
+	case '}':
+		// Empty payload: line ends right after _idx digits.
+		if p != len(line)-1 {
+			return nil, false
+		}
+		return []byte{'{', '}'}, true
+	case ',':
+		// Splice the comma into an opening brace and return the suffix.
+		line[p] = '{'
+		return line[p:], true
+	default:
+		return nil, false
+	}
+}
+
+// slowDecodeJSONLLine handles lines that aren't in our canonical
+// on-disk form (e.g. hand-edited by jq) and the recovery-scan path
+// that needs to verify the stored hash.
+func slowDecodeJSONLLine(line []byte, verify bool) ([]byte, error) {
 	obj, err := decodeJSONObject(line)
 	if err != nil {
 		return nil, ErrCorrupt
@@ -260,7 +352,7 @@ func decodeJSONLLine(line []byte) ([]byte, error) {
 	if err != nil {
 		return nil, ErrCorrupt
 	}
-	if hashCanonical(payload) != storedHash {
+	if verify && hashCanonical(payload) != storedHash {
 		return nil, ErrCorrupt
 	}
 	return payload, nil
