@@ -62,11 +62,13 @@ func TestBinaryCodecScanFrames(t *testing.T) {
 
 func TestJSONLCodecRoundTrip(t *testing.T) {
 	c := JSONLCodec{}
+	// Round-trip returns canonical form (keys sorted, no whitespace), so
+	// inputs here are already canonical to compare equal.
 	cases := []string{
 		`{"hello":"world"}`,
-		`[1,2,3]`,
-		`null`,
-		`42`,
+		`{"a":1,"b":[1,2,3]}`,
+		`{"nested":{"x":"y","z":42}}`,
+		`{}`,
 	}
 	for i, in := range cases {
 		frame, err := c.Frame(uint64(i), []byte(in))
@@ -96,6 +98,24 @@ func TestJSONLCodecRejectsNonJSON(t *testing.T) {
 	}
 }
 
+func TestJSONLCodecRejectsNonObject(t *testing.T) {
+	c := JSONLCodec{}
+	for _, in := range []string{`[1,2,3]`, `null`, `42`, `"x"`, `true`} {
+		if _, err := c.Frame(0, []byte(in)); err != ErrNotObject {
+			t.Fatalf("Frame(%s): want ErrNotObject, got %v", in, err)
+		}
+	}
+}
+
+func TestJSONLCodecRejectsReservedKeys(t *testing.T) {
+	c := JSONLCodec{}
+	for _, in := range []string{`{"_idx":1,"a":2}`, `{"_hash":"abc","a":2}`} {
+		if _, err := c.Frame(0, []byte(in)); err != ErrReservedKey {
+			t.Fatalf("Frame(%s): want ErrReservedKey, got %v", in, err)
+		}
+	}
+}
+
 func TestJSONLCodecEnvelopeShape(t *testing.T) {
 	c := JSONLCodec{}
 	frame, err := c.Frame(7, []byte(`{"a":1}`))
@@ -103,19 +123,37 @@ func TestJSONLCodecEnvelopeShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := string(frame)
-	for _, want := range []string{`"idx":7`, `"hash":`, `"value":{"a":1}`} {
+	for _, want := range []string{`"_hash":`, `"_idx":7`, `"a":1`} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("frame missing %q: %s", want, s)
 		}
+	}
+	// Payload is at the top level: no `value` wrapper.
+	if strings.Contains(s, `"value":`) {
+		t.Fatalf("frame should be flat, found value wrapper: %s", s)
+	}
+	// Sidecar keys sort before payload keys (underscore < letters).
+	if i, j := strings.Index(s, `"_idx"`), strings.Index(s, `"a"`); i > j {
+		t.Fatalf("expected _idx before payload keys: %s", s)
 	}
 }
 
 func TestJSONLCodecHashTamperDetected(t *testing.T) {
 	c := JSONLCodec{}
 	frame, _ := c.Frame(0, []byte(`{"a":1}`))
-	// Mutate the value bytes; hash should no longer match.
+	// Mutate the payload bytes; hash should no longer match.
 	tampered := bytes.Replace(frame, []byte(`"a":1`), []byte(`"a":2`), 1)
 	if _, _, err := c.ReadFrame(bytes.NewReader(tampered), 0, int64(len(tampered))); err != ErrCorrupt {
+		t.Fatalf("want ErrCorrupt, got %v", err)
+	}
+}
+
+func TestJSONLCodecMissingSidecarDetected(t *testing.T) {
+	c := JSONLCodec{}
+	// A line that is valid JSON but lacks the sidecar keys should be
+	// rejected as corrupt.
+	line := []byte(`{"a":1}` + "\n")
+	if _, _, err := c.ReadFrame(bytes.NewReader(line), 0, int64(len(line))); err != ErrCorrupt {
 		t.Fatalf("want ErrCorrupt, got %v", err)
 	}
 }

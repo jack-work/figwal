@@ -205,7 +205,7 @@ func TestAppendUsesGlobalIndexInJSONL(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := string(raw)
-	for _, want := range []string{`"idx":100`, `"idx":101`} {
+	for _, want := range []string{`"_idx":100`, `"_idx":101`} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("file missing %q:\n%s", want, got)
 		}

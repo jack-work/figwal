@@ -12,8 +12,10 @@ import (
 )
 
 var (
-	ErrCorrupt = errors.New("corrupt entry")
-	ErrNotJSON = errors.New("payload is not valid JSON")
+	ErrCorrupt     = errors.New("corrupt entry")
+	ErrNotJSON     = errors.New("payload is not valid JSON")
+	ErrNotObject   = errors.New("payload must be a JSON object")
+	ErrReservedKey = errors.New("payload uses reserved sidecar key (_idx or _hash)")
 )
 
 // SegmentCodec abstracts the on-disk representation of one entry.
@@ -108,15 +110,21 @@ func (BinaryCodec) ScanFrames(r io.Reader, fn func(off int64, frameLen int) erro
 	}
 }
 
-// JSONLCodec stores entries as one JSON envelope per line:
+// JSONLCodec stores entries as one flat JSON object per line, with the
+// payload's keys at the top level alongside two reserved sidecar keys:
 //
-//	{"idx":N,"hash":"<16 hex>","value":<payload>}
+//	{"_hash":"<16 hex>","_idx":N,"<payload keys>":...}
 //
-// `value` is the user payload as raw JSON (no escaping). `hash` is the
-// truncated value-stable hash of the canonical JSON form of the payload.
-// Frame returns ErrNotJSON if payload is not valid JSON; ReadFrame
-// returns ErrCorrupt if the envelope is malformed or the hash does not
-// match the payload.
+// `_idx` is the global log index of the entry. `_hash` is the truncated
+// value-stable hash of the canonical JSON form of the payload (the
+// object with `_idx` and `_hash` removed). Key order on disk is
+// alphabetical because `_` sorts before letters, so the sidecar keys
+// always lead the line.
+//
+// Payloads must be JSON objects. Frame returns ErrNotObject for scalars
+// or arrays, and ErrReservedKey if the payload contains `_idx` or
+// `_hash`. ReadFrame returns ErrCorrupt if the envelope is malformed or
+// the hash does not match the payload.
 type JSONLCodec struct{}
 
 func (JSONLCodec) Name() string    { return "jsonl" }
@@ -126,30 +134,33 @@ func (JSONLCodec) Hash(payload []byte) (string, error) {
 	return ValueHash(payload)
 }
 
-type jsonlEnvelope struct {
-	Idx   uint64          `json:"idx"`
-	Hash  string          `json:"hash"`
-	Value json.RawMessage `json:"value"`
-}
+const (
+	sidecarIdx  = "_idx"
+	sidecarHash = "_hash"
+)
 
 func (JSONLCodec) Frame(idx uint64, payload []byte) ([]byte, error) {
-	if !json.Valid(payload) {
-		return nil, ErrNotJSON
-	}
-	hash, err := ValueHash(payload)
+	obj, err := decodeJSONObject(payload)
 	if err != nil {
 		return nil, err
 	}
-	var compact bytes.Buffer
-	if err := json.Compact(&compact, payload); err != nil {
-		return nil, err
+	if _, exists := obj[sidecarIdx]; exists {
+		return nil, ErrReservedKey
 	}
-	env := jsonlEnvelope{Idx: idx, Hash: hash, Value: compact.Bytes()}
-	out, err := json.Marshal(env)
+	if _, exists := obj[sidecarHash]; exists {
+		return nil, ErrReservedKey
+	}
+	canon, err := marshalCanonical(obj)
 	if err != nil {
 		return nil, err
 	}
-	return append(out, '\n'), nil
+	obj[sidecarIdx] = idx
+	obj[sidecarHash] = hashCanonical(canon)
+	line, err := marshalCanonical(obj)
+	if err != nil {
+		return nil, err
+	}
+	return append(line, '\n'), nil
 }
 
 func (JSONLCodec) ReadFrame(r io.ReaderAt, off, nextOff int64) ([]byte, int, error) {
@@ -166,6 +177,22 @@ func (JSONLCodec) ReadFrame(r io.ReaderAt, off, nextOff int64) ([]byte, int, err
 		return nil, 0, err
 	}
 	return payload, length, nil
+}
+
+// decodeJSONObject parses b and asserts it decodes to a JSON object.
+// Numbers are decoded as json.Number to preserve precision.
+func decodeJSONObject(b []byte) (map[string]any, error) {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, ErrNotJSON
+	}
+	obj, ok := v.(map[string]any)
+	if !ok {
+		return nil, ErrNotObject
+	}
+	return obj, nil
 }
 
 func (JSONLCodec) ScanFrames(r io.Reader, fn func(off int64, frameLen int) error) error {
@@ -205,26 +232,37 @@ func (JSONLCodec) ScanFrames(r io.Reader, fn func(off int64, frameLen int) error
 }
 
 // decodeJSONLLine parses a single JSONL envelope line (with or without
-// trailing newline), validates the stored hash against the payload, and
-// returns the raw payload JSON.
+// trailing newline), extracts and validates the sidecar `_idx` and
+// `_hash` keys against the remaining payload, and returns the payload
+// in canonical JSON form.
 func decodeJSONLLine(line []byte) ([]byte, error) {
 	if n := len(line); n > 0 && line[n-1] == '\n' {
 		line = line[:n-1]
 	}
-	var env jsonlEnvelope
-	if err := json.Unmarshal(line, &env); err != nil {
-		return nil, ErrCorrupt
-	}
-	if len(env.Value) == 0 {
-		return nil, ErrCorrupt
-	}
-	got, err := ValueHash(env.Value)
+	obj, err := decodeJSONObject(line)
 	if err != nil {
 		return nil, ErrCorrupt
 	}
-	if got != env.Hash {
+	hashAny, ok := obj[sidecarHash]
+	if !ok {
 		return nil, ErrCorrupt
 	}
-	return env.Value, nil
+	storedHash, ok := hashAny.(string)
+	if !ok {
+		return nil, ErrCorrupt
+	}
+	if _, ok := obj[sidecarIdx]; !ok {
+		return nil, ErrCorrupt
+	}
+	delete(obj, sidecarHash)
+	delete(obj, sidecarIdx)
+	payload, err := marshalCanonical(obj)
+	if err != nil {
+		return nil, ErrCorrupt
+	}
+	if hashCanonical(payload) != storedHash {
+		return nil, ErrCorrupt
+	}
+	return payload, nil
 }
 

@@ -434,7 +434,7 @@ func TestGlobalIndexAcrossRotation(t *testing.T) {
 	raw, _ := os.ReadFile(filepath.Join(dir, second.Name()))
 	// Pull baseIndex from the filename to know which global idx to expect.
 	base, _ := parseSegName(second.Name(), ".jsonl")
-	want := []byte(fmt.Sprintf(`"idx":%d`, base))
+	want := []byte(fmt.Sprintf(`"_idx":%d`, base))
 	if !bytes.Contains(raw, want) {
 		t.Fatalf("second segment missing %q in first line:\n%s", want, raw)
 	}
