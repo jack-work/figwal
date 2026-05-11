@@ -24,6 +24,8 @@ var (
 	ErrEmpty           = errors.New("log is empty")
 	ErrCodecMismatch   = errors.New("log directory contains segments with a different codec")
 	ErrPayloadTooLarge = errors.New("payload too large for segment size")
+	ErrReadOnly        = errors.New("log is read-only (branch point with child forks)")
+	ErrForkMismatch    = errors.New(".fork base does not match first segment baseIndex")
 )
 
 // SyncMode controls when Write fsyncs the active segment.
@@ -44,53 +46,135 @@ type Options struct {
 	SegmentSize int64                // 0 = default
 	Codec       segment.SegmentCodec // nil = segment.BinaryCodec{}
 	SyncMode    SyncMode             // zero value = SyncAlways
+	// Parent, if non-nil, is the log this dir was forked from. When nil
+	// and the dir contains a .fork marker file, Open auto-walks `..` to
+	// resolve the parent. Use a Store if you need to deduplicate parent
+	// instances across many sibling forks.
+	Parent *Log
 }
 
 type Log struct {
-	mu     sync.RWMutex
-	dir    string
-	opts   Options
-	codec  segment.SegmentCodec
-	ext    string
-	sealed []*segment.Segment
-	active *segment.Segment
+	mu       sync.RWMutex
+	dir      string
+	opts     Options
+	codec    segment.SegmentCodec
+	ext      string
+	sealed   []*segment.Segment
+	active   *segment.Segment
+	parent   *Log   // nil for root logs
+	forkBase uint64 // first index this log owns; 0 if not a fork
+	readOnly bool   // true when the dir has child subdirs (branch point)
 }
 
 func Open(dir string, opts Options) (*Log, error) {
 	if opts.SegmentSize == 0 {
 		opts.SegmentSize = defaultSegSize
 	}
-	if opts.Codec == nil {
-		opts.Codec = segment.BinaryCodec{}
-	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
+	// Auto-detect codec from the on-disk extension when the caller did
+	// not specify one. Empty dirs default to binary.
+	if opts.Codec == nil {
+		detected, err := detectCodec(dir)
+		if err != nil {
+			return nil, err
+		}
+		if detected != nil {
+			opts.Codec = detected
+		} else {
+			opts.Codec = segment.BinaryCodec{}
+		}
+	}
+	// A leftover fork sentinel means a previous fork operation crashed
+	// before completing; refuse to open until an operator resolves it.
+	if pending, err := hasForkPending(dir); err != nil {
+		return nil, err
+	} else if pending {
+		return nil, fmt.Errorf("%w: %s", ErrForkPending, dir)
+	}
+	base, err := readForkMarker(dir)
+	if err != nil {
+		return nil, err
+	}
+	parent := opts.Parent
+	if parent == nil && base > 0 {
+		// Auto-walk `..` for the parent. Inherit codec/segment options
+		// so the parent reads its own files consistently. Plain Open
+		// without dedup; callers that need sharing should use a Store.
+		parentDir := filepath.Dir(dir)
+		parentOpts := opts
+		parentOpts.Parent = nil // walk fully up the chain
+		p, err := Open(parentDir, parentOpts)
+		if err != nil {
+			return nil, fmt.Errorf("auto-open parent %q: %w", parentDir, err)
+		}
+		parent = p
+	}
+	hasKids, err := hasSubdirs(dir)
+	if err != nil {
+		return nil, err
+	}
 	l := &Log{
-		dir:   dir,
-		opts:  opts,
-		codec: opts.Codec,
-		ext:   opts.Codec.FileExt(),
+		dir:      dir,
+		opts:     opts,
+		codec:    opts.Codec,
+		ext:      opts.Codec.FileExt(),
+		parent:   parent,
+		forkBase: base,
+		readOnly: hasKids,
 	}
 	if err := l.loadSegments(); err != nil {
 		return nil, err
+	}
+	if base > 0 && len(l.sealed)+boolToInt(l.active != nil) > 0 {
+		// Validate the on-disk first segment lines up with the marker.
+		var firstBase uint64
+		if len(l.sealed) > 0 {
+			firstBase = l.sealed[0].FirstIndex()
+		} else {
+			firstBase = l.active.FirstIndex()
+		}
+		if firstBase != base {
+			return nil, fmt.Errorf("%w: marker=%d firstSegment=%d",
+				ErrForkMismatch, base, firstBase)
+		}
 	}
 	slog.Info("log opened",
 		"dir", dir,
 		"codec", l.codec.Name(),
 		"segmentSize", opts.SegmentSize,
 		"sealed", len(l.sealed),
-		"hasActive", l.active != nil)
+		"hasActive", l.active != nil,
+		"readOnly", l.readOnly,
+		"forkBase", l.forkBase,
+		"hasParent", l.parent != nil)
 	return l, nil
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func (l *Log) Write(idx uint64, payload []byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	if l.readOnly {
+		return fmt.Errorf("%w: %s", ErrReadOnly, l.dir)
+	}
+
 	expected := l.lastIndexLocked() + 1
 	if l.isEmptyLocked() {
-		expected = 1
+		// Fresh log: first index is 1 for a root, forkBase for a fork.
+		if l.forkBase > 0 {
+			expected = l.forkBase
+		} else {
+			expected = 1
+		}
 	}
 	if idx != expected {
 		return fmt.Errorf("%w: got %d, want %d", ErrOutOfOrder, idx, expected)
@@ -138,8 +222,17 @@ func (l *Log) Sync() error {
 // Range iterates entries from `from` to the current LastIndex, calling
 // fn for each. If fn returns a non-nil error, iteration stops and that
 // error is returned. If `from` is below FirstIndex, iteration begins at
-// FirstIndex.
+// FirstIndex. For forks, low indices are served from the parent chain.
 func (l *Log) Range(from uint64, fn func(idx uint64, payload []byte) error) error {
+	// Walk parent chain for indices below this fork's range. After a
+	// fork the parent's segments are truncated to end at forkBase-1, so
+	// parent.Range will not yield beyond our forkBase on its own.
+	if l.parent != nil && from < l.forkBase {
+		if err := l.parent.Range(from, fn); err != nil {
+			return err
+		}
+		from = l.forkBase
+	}
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	if l.isEmptyLocked() {
@@ -218,6 +311,11 @@ func (l *Log) TruncateFront(beforeIdx uint64) error {
 func (l *Log) Read(idx uint64) ([]byte, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
+	// Indices below this fork's range live in the parent. Delegate
+	// recursively; the parent's own lock protects its state.
+	if l.parent != nil && idx < l.forkBase {
+		return l.parent.Read(idx)
+	}
 	if l.isEmptyLocked() {
 		return nil, ErrEmpty
 	}
@@ -228,16 +326,30 @@ func (l *Log) Read(idx uint64) ([]byte, error) {
 	return s.ReadIndex(idx - s.BaseIndex())
 }
 
+// FirstIndex returns the first index visible from this log, walking
+// the parent chain if this log is a fork.
 func (l *Log) FirstIndex() uint64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
+	if l.parent != nil {
+		return l.parent.FirstIndex()
+	}
 	return l.firstIndexLocked()
 }
 
+// LastIndex returns the highest index in this log's own segments. For
+// a fork with no local entries yet, LastIndex returns forkBase-1 to
+// reflect that the fork starts immediately after the parent.
 func (l *Log) LastIndex() uint64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	return l.lastIndexLocked()
+	if last := l.lastIndexLocked(); last > 0 {
+		return last
+	}
+	if l.forkBase > 0 {
+		return l.forkBase - 1
+	}
+	return 0
 }
 
 func (l *Log) Hash(idx uint64) (string, error) {
@@ -338,6 +450,41 @@ func (l *Log) findSegmentLocked(idx uint64) *segment.Segment {
 
 // known segment extensions, used to detect codec mismatch in a directory.
 var knownExts = []string{".seg", ".jsonl"}
+
+// detectCodec inspects dir for files with known codec extensions and
+// returns the matching codec. Returns (nil, nil) if the dir is empty
+// or contains no segment files (caller picks a default). Returns an
+// ErrCodecMismatch when both extensions are present.
+func detectCodec(dir string) (segment.SegmentCodec, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var seenBinary, seenJSONL bool
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasSuffix(name, ".seg") {
+			seenBinary = true
+		}
+		if strings.HasSuffix(name, ".jsonl") {
+			seenJSONL = true
+		}
+	}
+	if seenBinary && seenJSONL {
+		return nil, fmt.Errorf("%w: dir %s has both .seg and .jsonl segments",
+			ErrCodecMismatch, dir)
+	}
+	if seenBinary {
+		return segment.BinaryCodec{}, nil
+	}
+	if seenJSONL {
+		return segment.JSONLCodec{}, nil
+	}
+	return nil, nil
+}
 
 func (l *Log) loadSegments() error {
 	entries, err := os.ReadDir(l.dir)

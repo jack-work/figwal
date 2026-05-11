@@ -5,13 +5,14 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 
 	"figwal/segment"
 )
 
 func main() {
-	codec := flag.String("codec", "binary", "codec: binary|jsonl")
+	codec := flag.String("codec", "", "codec: binary|jsonl (default: detect from path ext, else binary)")
 	verbose := flag.Bool("verbose", false, "enable debug-level logging")
 	flag.Usage = usage
 	flag.Parse()
@@ -27,6 +28,13 @@ func main() {
 
 	var c segment.SegmentCodec
 	switch *codec {
+	case "":
+		switch filepath.Ext(path) {
+		case ".jsonl":
+			c = segment.JSONLCodec{}
+		default:
+			c = segment.BinaryCodec{}
+		}
 	case "binary":
 		c = segment.BinaryCodec{}
 	case "jsonl":
