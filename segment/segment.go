@@ -1,0 +1,219 @@
+package segment
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"time"
+)
+
+var (
+	ErrFull       = errors.New("segment full")
+	ErrOutOfRange = errors.New("index out of range")
+	ErrReadOnly   = errors.New("segment is read-only")
+)
+
+// Segment is one append-only file framed by a SegmentCodec.
+//
+// Segment is not safe for concurrent use. Callers (such as Log) must
+// serialize access externally.
+type Segment struct {
+	f         *os.File
+	path      string
+	codec     SegmentCodec
+	baseIndex uint64
+	size      int64
+	maxSize   int64
+	count     uint64
+	offsets   []int64
+	readOnly  bool
+}
+
+func Create(path string, codec SegmentCodec, baseIndex uint64, maxSize int64) (*Segment, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, err
+	}
+	slog.Debug("segment created",
+		"codec", codec.Name(),
+		"path", path,
+		"baseIndex", baseIndex,
+		"maxSize", maxSize)
+	return &Segment{
+		f:         f,
+		path:      path,
+		codec:     codec,
+		baseIndex: baseIndex,
+		maxSize:   maxSize,
+	}, nil
+}
+
+// Open opens an existing segment for read and write. Any torn tail
+// (partial frame at end of file) is truncated.
+func Open(path string, codec SegmentCodec, baseIndex uint64, maxSize int64) (*Segment, error) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0644)
+	if err != nil {
+		return nil, err
+	}
+	s := &Segment{
+		f:         f,
+		path:      path,
+		codec:     codec,
+		baseIndex: baseIndex,
+		maxSize:   maxSize,
+	}
+	if err := s.recover(); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// OpenReadOnly opens an existing segment for reading only. The file is
+// scanned to populate the entry index, but a torn tail is left intact
+// on disk; Append on the returned Segment returns ErrReadOnly.
+func OpenReadOnly(path string, codec SegmentCodec, baseIndex uint64) (*Segment, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	s := &Segment{
+		f:         f,
+		path:      path,
+		codec:     codec,
+		baseIndex: baseIndex,
+		readOnly:  true,
+	}
+	if err := s.recover(); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// recover scans the file to rebuild the in-memory entry index and, for
+// read-write segments, truncates any torn tail. The scan is the standard
+// WAL recovery procedure: read forward until the codec reports a torn
+// frame or clean EOF, accept all frames before that point, and discard
+// everything after.
+func (s *Segment) recover() error {
+	start := time.Now()
+	if _, err := s.f.Seek(0, 0); err != nil {
+		return err
+	}
+	off := int64(0)
+	err := s.codec.ScanFrames(s.f, func(frameOff int64, frameLen int) error {
+		s.offsets = append(s.offsets, frameOff)
+		off = frameOff + int64(frameLen)
+		s.count++
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	s.size = off
+	fi, err := s.f.Stat()
+	if err != nil {
+		return err
+	}
+	tornBytes := int64(0)
+	if fi.Size() > off {
+		tornBytes = fi.Size() - off
+		if s.readOnly {
+			slog.Warn("segment open read-only: torn tail ignored",
+				"path", s.path, "bytes", tornBytes)
+		} else {
+			if err := s.f.Truncate(off); err != nil {
+				return err
+			}
+			slog.Warn("segment recover: torn tail truncated",
+				"path", s.path, "bytes", tornBytes)
+		}
+	}
+	slog.Info("segment recovered",
+		"codec", s.codec.Name(),
+		"path", s.path,
+		"baseIndex", s.baseIndex,
+		"entries", s.count,
+		"size", s.size,
+		"tornBytes", tornBytes,
+		"readOnly", s.readOnly,
+		"duration", time.Since(start))
+	return nil
+}
+
+func (s *Segment) Append(payload []byte) (offset int64, err error) {
+	if s.readOnly {
+		return 0, ErrReadOnly
+	}
+	frame, err := s.codec.Frame(s.baseIndex+s.count, payload)
+	if err != nil {
+		return 0, err
+	}
+	if s.maxSize > 0 && s.size+int64(len(frame)) > s.maxSize {
+		return 0, ErrFull
+	}
+	offset = s.size
+	n, err := s.f.WriteAt(frame, offset)
+	if err != nil {
+		return 0, err
+	}
+	if n != len(frame) {
+		return 0, fmt.Errorf("short write: %d/%d", n, len(frame))
+	}
+	s.size += int64(n)
+	s.offsets = append(s.offsets, offset)
+	s.count++
+	return offset, nil
+}
+
+// ReadAt reads the entry at the given file offset, which must be a known
+// entry boundary. This is the offset-based debug path; ReadIndex is the
+// fast path for log replay.
+func (s *Segment) ReadAt(offset int64) ([]byte, error) {
+	nextOff := s.nextOffsetAfter(offset)
+	payload, _, err := s.codec.ReadFrame(s.f, offset, nextOff)
+	return payload, err
+}
+
+func (s *Segment) ReadIndex(i uint64) ([]byte, error) {
+	if i >= s.count {
+		return nil, ErrOutOfRange
+	}
+	off := s.offsets[i]
+	nextOff := s.size
+	if int(i)+1 < len(s.offsets) {
+		nextOff = s.offsets[i+1]
+	}
+	payload, _, err := s.codec.ReadFrame(s.f, off, nextOff)
+	return payload, err
+}
+
+// nextOffsetAfter is the linear lookup used only by the offset-based
+// ReadAt path. Per-index reads use the direct offsets slice.
+func (s *Segment) nextOffsetAfter(off int64) int64 {
+	for i, o := range s.offsets {
+		if o != off {
+			continue
+		}
+		if i+1 < len(s.offsets) {
+			return s.offsets[i+1]
+		}
+		return s.size
+	}
+	return -1
+}
+
+func (s *Segment) Count() uint64     { return s.count }
+func (s *Segment) Sync() error       { return s.f.Sync() }
+func (s *Segment) Size() int64       { return s.size }
+func (s *Segment) Close() error      { return s.f.Close() }
+func (s *Segment) Path() string      { return s.path }
+func (s *Segment) ReadOnly() bool    { return s.readOnly }
+func (s *Segment) FirstIndex() uint64 { return s.baseIndex }
+func (s *Segment) BaseIndex() uint64  { return s.baseIndex }
+
+// LastIndex returns baseIndex + count - 1. The result is only meaningful
+// when Count() > 0; callers must check before calling.
+func (s *Segment) LastIndex() uint64 { return s.baseIndex + s.count - 1 }
