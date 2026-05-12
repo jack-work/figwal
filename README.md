@@ -69,6 +69,8 @@ A binary codec is also available (`segment.BinaryCodec{}`): length prefix + CRC3
 - Entries `[atIdx, LastIndex]` move into a subdir whose name matches the parent dir's basename. This is the "old future".
 - A fresh subdir named `childName` is created, empty and writable from `atIdx`.
 
+An optional third argument overrides the old-future subdir name: `Log.Fork(atIdx, childName, "kept")` parks the moved suffix under `kept/` instead of the default. Pass `""` (or omit) to keep the default.
+
 Mid-segment forks split the boundary segment byte-level; later sealed segments are renamed across subdirs without re-encoding. Global indices are preserved.
 
 Layout after `Fork(6, "branchB")` on a log dir named `session-42/`:

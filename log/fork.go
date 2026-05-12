@@ -136,18 +136,23 @@ const (
 // subdir named childName is created, empty and writable from atIdx.
 // The new fork is returned, opened with this log as its parent.
 //
+// The optional variadic argument overrides the old-future subdir
+// name (default: path.Base(l.dir)). Pass at most one override; an
+// empty string keeps the default.
+//
 // Constraints:
 //   - atIdx must be in (FirstIndex, LastIndex+1]; the prefix retains
 //     at least one entry.
-//   - childName must be a clean filename and must not equal
-//     path.Base(this.dir) (reserved for the old-future subdir).
+//   - childName must be a clean filename and must not equal the
+//     old-future subdir name.
+//   - oldFutureName (when provided) must also be a clean filename.
 //   - This log must not already be a branch point.
 //
 // Crash safety: a .fork-pending sentinel file is written before any
 // destructive change and removed after the fork completes. If a crash
 // leaves the sentinel behind, Open refuses to proceed and the
 // operator must resolve manually.
-func (l *Log) Fork(atIdx uint64, childName string) (*Log, error) {
+func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (*Log, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -157,9 +162,19 @@ func (l *Log) Fork(atIdx uint64, childName string) (*Log, error) {
 	if err := validateForkName(childName); err != nil {
 		return nil, err
 	}
+	if len(oldFutureNameOpt) > 1 {
+		return nil, fmt.Errorf("Fork: at most one oldFutureName override permitted, got %d",
+			len(oldFutureNameOpt))
+	}
 	oldFutureName := filepath.Base(l.dir)
+	if len(oldFutureNameOpt) == 1 && oldFutureNameOpt[0] != "" {
+		oldFutureName = oldFutureNameOpt[0]
+		if err := validateForkName(oldFutureName); err != nil {
+			return nil, fmt.Errorf("oldFutureName: %w", err)
+		}
+	}
 	if childName == oldFutureName {
-		return nil, fmt.Errorf("%w: %s reserved for old-future subdir",
+		return nil, fmt.Errorf("%w: childName %q equals old-future subdir name",
 			ErrForkConflict, childName)
 	}
 	if l.isEmptyLocked() {

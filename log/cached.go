@@ -180,11 +180,11 @@ func (c *Cached) Sync() error { return c.log.Sync() }
 // writer mutex; the in-memory snapshot is then resliced to the prefix
 // and a child Cached is constructed with the trunk's truncated
 // snapshot as its parent.
-func (c *Cached) Fork(atIdx uint64, name string) (*Cached, error) {
+func (c *Cached) Fork(atIdx uint64, name string, oldFutureNameOpt ...string) (*Cached, error) {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 
-	childLog, err := c.log.Fork(atIdx, name)
+	childLog, err := c.log.Fork(atIdx, name, oldFutureNameOpt...)
 	if err != nil {
 		return nil, err
 	}

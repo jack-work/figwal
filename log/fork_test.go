@@ -347,3 +347,71 @@ func TestForkJSONLPreservesGlobalIdx(t *testing.T) {
 		t.Fatalf("prefix segment missing _idx:1\n%s", raw)
 	}
 }
+
+func TestForkOldFutureNameOverride(t *testing.T) {
+	// Passing a custom oldFutureName parks the moved suffix under that
+	// subdir name instead of path.Base(parentDir).
+	dir, l := forkSetup(t, segment.BinaryCodec{}, 6, 3)
+	defer l.Close()
+	cut := uint64(3)
+	child, err := l.Fork(cut, "fresh", "kept")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Close()
+	// Verify the old-future subdir is "kept", not path.Base(dir).
+	if _, err := os.Stat(filepath.Join(dir, "kept")); err != nil {
+		t.Fatalf("expected old-future subdir 'kept': %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, filepath.Base(dir))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("default-named subdir should not exist when override given: %v", err)
+	}
+	// The kept child holds entries [cut..LastIndex] of its own (with a
+	// .fork base of cut); reads of indices < cut fall through to the
+	// parent.
+	keptLog, err := Open(filepath.Join(dir, "kept"), Options{Codec: segment.BinaryCodec{}})
+	if err != nil {
+		t.Fatalf("open kept: %v", err)
+	}
+	defer keptLog.Close()
+	if got := keptLog.forkBase; got != cut {
+		t.Fatalf("kept forkBase=%d want %d", got, cut)
+	}
+	payload, err := keptLog.Read(cut)
+	if err != nil {
+		t.Fatalf("kept read %d: %v", cut, err)
+	}
+	want := fmt.Sprintf("data%d", cut)
+	if string(payload) != want {
+		t.Fatalf("kept[%d]=%q want %q", cut, payload, want)
+	}
+}
+
+func TestForkOldFutureNameEmptyKeepsDefault(t *testing.T) {
+	// Passing "" as oldFutureName falls back to the default name.
+	dir, l := forkSetup(t, segment.BinaryCodec{}, 6, 3)
+	defer l.Close()
+	if _, err := l.Fork(3, "alt", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, filepath.Base(dir))); err != nil {
+		t.Fatalf("default old-future subdir should exist when override is empty: %v", err)
+	}
+}
+
+func TestForkOldFutureNameValidations(t *testing.T) {
+	_, l := forkSetup(t, segment.BinaryCodec{}, 6, 3)
+	defer l.Close()
+	// Bad name in the override.
+	if _, err := l.Fork(3, "fresh", "a/b"); !errors.Is(err, ErrInvalidForkName) {
+		t.Fatalf("bad override name: want ErrInvalidForkName, got %v", err)
+	}
+	// Child equal to override.
+	if _, err := l.Fork(3, "same", "same"); !errors.Is(err, ErrForkConflict) {
+		t.Fatalf("child==override: want ErrForkConflict, got %v", err)
+	}
+	// More than one override.
+	if _, err := l.Fork(3, "fresh", "a", "b"); err == nil {
+		t.Fatal("expected error on multiple override args")
+	}
+}

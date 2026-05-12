@@ -76,12 +76,16 @@ func main() {
 	case "range":
 		fmt.Printf("%d..%d\n", l.FirstIndex(), l.LastIndex())
 	case "fork":
-		if len(cmdArgs) != 2 {
+		if len(cmdArgs) < 2 || len(cmdArgs) > 3 {
 			usage()
 		}
 		atIdx, err := strconv.ParseUint(cmdArgs[0], 10, 64)
 		check(err)
-		child, err := l.Fork(atIdx, cmdArgs[1])
+		var oldFuture []string
+		if len(cmdArgs) == 3 {
+			oldFuture = []string{cmdArgs[2]}
+		}
+		child, err := l.Fork(atIdx, cmdArgs[1], oldFuture...)
 		check(err)
 		fmt.Printf("forked %s at %d -> %s\n", dir, atIdx, filepath.Join(dir, cmdArgs[1]))
 		child.Close()
@@ -165,7 +169,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  write <idx> <data>   append an entry (idx must be LastIndex+1)")
 	fmt.Fprintln(os.Stderr, "  read <idx>           read the entry at idx")
 	fmt.Fprintln(os.Stderr, "  range                print FirstIndex..LastIndex")
-	fmt.Fprintln(os.Stderr, "  fork <atIdx> <name>  fork at atIdx into subdir <name>")
+	fmt.Fprintln(os.Stderr, "  fork <atIdx> <name> [oldFutureName]  fork at atIdx into subdir <name>; optional override for old-future subdir name")
 	fmt.Fprintln(os.Stderr, "  delete               recursively delete dir and all child forks")
 	os.Exit(2)
 }
