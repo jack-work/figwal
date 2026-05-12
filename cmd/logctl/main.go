@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"strings"
 
-	"figwal/log"
-	"figwal/segment"
+	"github.com/jack-work/figwal/log"
+	"github.com/jack-work/figwal/segment"
 )
 
 func main() {

@@ -7,7 +7,7 @@ package typed
 
 import (
 	"encoding/json"
-	"figwal/log"
+	"github.com/jack-work/figwal/log"
 )
 
 // Log[T] is a *log.Log with JSON marshal/unmarshal for entries of type T.

@@ -3,7 +3,7 @@ package log
 import (
 	"bytes"
 	"errors"
-	"figwal/segment"
+	"github.com/jack-work/figwal/segment"
 	"fmt"
 	"sync"
 	"testing"

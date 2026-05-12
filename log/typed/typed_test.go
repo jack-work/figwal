@@ -1,8 +1,8 @@
 package typed
 
 import (
-	"figwal/log"
-	"figwal/segment"
+	"github.com/jack-work/figwal/log"
+	"github.com/jack-work/figwal/segment"
 	"testing"
 )
 

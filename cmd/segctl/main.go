@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"figwal/segment"
+	"github.com/jack-work/figwal/segment"
 )
 
 func main() {

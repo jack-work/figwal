@@ -1,7 +1,7 @@
 package log
 
 import (
-	"figwal/segment"
+	"github.com/jack-work/figwal/segment"
 	"fmt"
 	"sync"
 	"sync/atomic"

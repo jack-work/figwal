@@ -2,7 +2,7 @@ package log
 
 import (
 	"errors"
-	"figwal/segment"
+	"github.com/jack-work/figwal/segment"
 	"fmt"
 	"log/slog"
 	"os"
