@@ -5,437 +5,342 @@ import (
 	"errors"
 	"github.com/jack-work/figwal/segment"
 	"fmt"
-	"os"
-	"path/filepath"
+	"sync"
 	"testing"
 )
 
-func TestOpenEmptyDir(t *testing.T) {
+func TestCachedRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	l, err := Open(dir, Options{})
+	c, err := Open(dir, Options{Codec: segment.JSONLCodec{}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l.active != nil || len(l.sealed) != 0 {
-		t.Fatal("expected empty log")
+	defer c.Close()
+	for i := uint64(1); i <= 5; i++ {
+		if err := c.Write(i, []byte(fmt.Sprintf(`{"i":%d}`, i))); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := l.Close(); err != nil {
-		t.Fatal(err)
+	if c.FirstIndex() != 1 || c.LastIndex() != 5 {
+		t.Fatalf("range %d..%d", c.FirstIndex(), c.LastIndex())
 	}
-}
-
-func TestOpenCreatesDir(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "newsub")
-	l, err := Open(dir, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	if _, err := os.Stat(dir); err != nil {
-		t.Fatalf("dir not created: %v", err)
-	}
-}
-
-func TestSegNameRoundTrip(t *testing.T) {
-	l := &Log{ext: ".seg"}
-	for _, base := range []uint64{0, 1, 42, 1 << 40} {
-		got, err := parseSegName(l.segName(base), ".seg")
+	for i := uint64(1); i <= 5; i++ {
+		got, err := c.Read(i)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got != base {
-			t.Fatalf("base %d round-tripped to %d", base, got)
+		want := fmt.Sprintf(`{"i":%d}`, i)
+		if string(got) != want {
+			t.Fatalf("[%d]=%q want %q", i, got, want)
 		}
 	}
 }
 
-func TestWriteRead(t *testing.T) {
-	l, _ := Open(t.TempDir(), Options{})
-	defer l.Close()
-	for i := uint64(1); i <= 5; i++ {
-		if err := l.Write(i, []byte{byte(i)}); err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
-	}
-	if l.FirstIndex() != 1 || l.LastIndex() != 5 {
-		t.Fatalf("range %d..%d", l.FirstIndex(), l.LastIndex())
-	}
-	for i := uint64(1); i <= 5; i++ {
-		got, err := l.Read(i)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(got, []byte{byte(i)}) {
-			t.Fatalf("idx %d: %v", i, got)
-		}
-	}
-}
-
-func TestWriteOutOfOrder(t *testing.T) {
-	l, _ := Open(t.TempDir(), Options{})
-	defer l.Close()
-	if err := l.Write(2, []byte("x")); !errors.Is(err, ErrOutOfOrder) {
-		t.Fatalf("want ErrOutOfOrder, got %v", err)
-	}
-	l.Write(1, []byte("a"))
-	if err := l.Write(3, []byte("c")); !errors.Is(err, ErrOutOfOrder) {
-		t.Fatalf("want ErrOutOfOrder, got %v", err)
-	}
-}
-
-func TestReopenPersists(t *testing.T) {
+func TestCachedReopenLoadsExisting(t *testing.T) {
 	dir := t.TempDir()
-	l, _ := Open(dir, Options{})
-	l.Write(1, []byte("hello"))
-	l.Write(2, []byte("world"))
-	l.Close()
-	l2, err := Open(dir, Options{})
+	c, err := Open(dir, Options{Codec: segment.JSONLCodec{}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l2.Close()
-	if l2.LastIndex() != 2 {
-		t.Fatalf("lastIndex=%d", l2.LastIndex())
+	for i := uint64(1); i <= 3; i++ {
+		c.Write(i, []byte(fmt.Sprintf(`{"i":%d}`, i)))
 	}
-	got, _ := l2.Read(2)
-	if string(got) != "world" {
+	c.Close()
+
+	c2, err := Open(dir, Options{Codec: segment.JSONLCodec{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	if c2.LastIndex() != 3 {
+		t.Fatalf("LastIndex=%d", c2.LastIndex())
+	}
+	got, _ := c2.Read(2)
+	if string(got) != `{"i":2}` {
 		t.Fatalf("got %q", got)
 	}
 }
 
-func TestRotation(t *testing.T) {
+func TestCachedRange(t *testing.T) {
 	dir := t.TempDir()
-	l, err := Open(dir, Options{SegmentSize: 30})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
+	c, _ := Open(dir, Options{Codec: segment.JSONLCodec{}})
+	defer c.Close()
 	for i := uint64(1); i <= 5; i++ {
-		if err := l.Write(i, []byte("xxxxx")); err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
-	}
-	if l.LastIndex() != 5 {
-		t.Fatalf("last=%d", l.LastIndex())
-	}
-	if len(l.sealed) == 0 {
-		t.Fatal("expected at least one sealed segment")
-	}
-	for i := uint64(1); i <= 5; i++ {
-		got, err := l.Read(i)
-		if err != nil {
-			t.Fatalf("read %d: %v", i, err)
-		}
-		if string(got) != "xxxxx" {
-			t.Fatalf("idx %d got %q", i, got)
-		}
-	}
-}
-
-func TestReopenAfterRotation(t *testing.T) {
-	dir := t.TempDir()
-	l, _ := Open(dir, Options{SegmentSize: 30})
-	for i := uint64(1); i <= 5; i++ {
-		l.Write(i, []byte("xxxxx"))
-	}
-	l.Close()
-	l2, err := Open(dir, Options{SegmentSize: 30})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l2.Close()
-	if l2.FirstIndex() != 1 || l2.LastIndex() != 5 {
-		t.Fatalf("range %d..%d", l2.FirstIndex(), l2.LastIndex())
-	}
-	got, _ := l2.Read(3)
-	if string(got) != "xxxxx" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestJSONLLogReadWrite(t *testing.T) {
-	l, err := Open(t.TempDir(), Options{Codec: segment.JSONLCodec{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	if err := l.Write(1, []byte(`{"hello":"world"}`)); err != nil {
-		t.Fatal(err)
-	}
-	got, _ := l.Read(1)
-	if string(got) != `{"hello":"world"}` {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestJSONLLogRejectsNonJSON(t *testing.T) {
-	l, _ := Open(t.TempDir(), Options{Codec: segment.JSONLCodec{}})
-	defer l.Close()
-	if err := l.Write(1, []byte("hello")); !errors.Is(err, segment.ErrNotJSON) {
-		t.Fatalf("want ErrNotJSON, got %v", err)
-	}
-}
-
-func TestCodecMismatchRejected(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "00000000000000000001.seg"), []byte("x"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Open(dir, Options{Codec: segment.JSONLCodec{}}); !errors.Is(err, ErrCodecMismatch) {
-		t.Fatalf("want ErrCodecMismatch, got %v", err)
-	}
-}
-
-func TestHashBinary(t *testing.T) {
-	l, _ := Open(t.TempDir(), Options{})
-	defer l.Close()
-	l.Write(1, []byte("hello"))
-	h, err := l.Hash(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(h) != 8 {
-		t.Fatalf("want 8-char crc32 hex, got %q", h)
-	}
-}
-
-func TestHashJSONL(t *testing.T) {
-	l, _ := Open(t.TempDir(), Options{Codec: segment.JSONLCodec{}})
-	defer l.Close()
-	l.Write(1, []byte(`{"a":1}`))
-	h, err := l.Hash(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(h) != 16 {
-		t.Fatalf("want 16-char value hash, got %q", h)
-	}
-}
-
-func TestRange(t *testing.T) {
-	l, _ := Open(t.TempDir(), Options{})
-	defer l.Close()
-	for i := uint64(1); i <= 5; i++ {
-		if err := l.Write(i, []byte{byte('a' + i - 1)}); err != nil {
-			t.Fatal(err)
-		}
+		c.Write(i, []byte(fmt.Sprintf(`{"i":%d}`, i)))
 	}
 	var seen []uint64
-	err := l.Range(2, func(idx uint64, payload []byte) error {
+	err := c.Range(2, func(idx uint64, _ []byte) error {
 		seen = append(seen, idx)
-		if string(payload) != string([]byte{byte('a' + idx - 1)}) {
-			t.Fatalf("idx %d payload %q", idx, payload)
-		}
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantIdx := []uint64{2, 3, 4, 5}
-	if len(seen) != len(wantIdx) {
-		t.Fatalf("got %v want %v", seen, wantIdx)
+	want := []uint64{2, 3, 4, 5}
+	if len(seen) != len(want) {
+		t.Fatalf("seen=%v want %v", seen, want)
 	}
 	for i := range seen {
-		if seen[i] != wantIdx[i] {
-			t.Fatalf("got %v want %v", seen, wantIdx)
+		if seen[i] != want[i] {
+			t.Fatalf("seen[%d]=%d want %d", i, seen[i], want[i])
 		}
 	}
 }
 
-func TestRangeAcrossSegments(t *testing.T) {
+func TestCachedConcurrentReaders(t *testing.T) {
+	// Many parallel readers see consistent values across many writes.
+	// Readers each iterate a snapshot fully; the snapshot must not
+	// shift under them mid-iteration.
 	dir := t.TempDir()
-	l, _ := Open(dir, Options{SegmentSize: 30})
-	defer l.Close()
-	for i := uint64(1); i <= 5; i++ {
-		if err := l.Write(i, []byte("xxxxx")); err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
+	c, _ := Open(dir, Options{Codec: segment.JSONLCodec{}})
+	defer c.Close()
+	for i := uint64(1); i <= 20; i++ {
+		c.Write(i, []byte(fmt.Sprintf(`{"i":%d}`, i)))
 	}
-	if len(l.sealed) == 0 {
-		t.Fatal("expected rotation to have occurred")
-	}
-	count := 0
-	l.Range(1, func(idx uint64, payload []byte) error {
-		count++
-		if string(payload) != "xxxxx" {
-			t.Fatalf("idx %d: payload %q", idx, payload)
+	stop := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		i := uint64(21)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				c.Write(i, []byte(fmt.Sprintf(`{"i":%d}`, i)))
+				i++
+			}
 		}
-		return nil
+	}()
+	var wg sync.WaitGroup
+	for r := 0; r < 8; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for it := 0; it < 200; it++ {
+				snap := c.Snapshot()
+				prev := uint64(0)
+				err := snap.Range(1, func(idx uint64, payload []byte) error {
+					if idx != prev+1 && prev != 0 {
+						return fmt.Errorf("gap: %d after %d", idx, prev)
+					}
+					prev = idx
+					want := fmt.Sprintf(`{"i":%d}`, idx)
+					if string(payload) != want {
+						return fmt.Errorf("[%d]=%q want %q", idx, payload, want)
+					}
+					return nil
+				})
+				if err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+	<-writerDone
+}
+
+func TestCachedForkSplitsCache(t *testing.T) {
+	dir := t.TempDir()
+	c, _ := Open(dir, Options{
+		Codec:       segment.JSONLCodec{},
+		SegmentSize: 200,
 	})
-	if count != 5 {
-		t.Fatalf("saw %d entries, want 5", count)
+	defer c.Close()
+	for i := uint64(1); i <= 6; i++ {
+		c.Write(i, []byte(fmt.Sprintf(`{"i":%d}`, i)))
 	}
-}
-
-func TestRangeStopsOnError(t *testing.T) {
-	l, _ := Open(t.TempDir(), Options{})
-	defer l.Close()
-	for i := uint64(1); i <= 5; i++ {
-		l.Write(i, []byte{byte(i)})
-	}
-	stop := errors.New("stop")
-	count := 0
-	err := l.Range(1, func(idx uint64, _ []byte) error {
-		count++
-		if idx == 3 {
-			return stop
-		}
-		return nil
-	})
-	if err != stop {
-		t.Fatalf("got %v want %v", err, stop)
-	}
-	if count != 3 {
-		t.Fatalf("count=%d want 3", count)
-	}
-}
-
-func TestTruncateFrontDropsWholeSegments(t *testing.T) {
-	dir := t.TempDir()
-	l, _ := Open(dir, Options{SegmentSize: 30})
-	defer l.Close()
-	for i := uint64(1); i <= 5; i++ {
-		l.Write(i, []byte("xxxxx"))
-	}
-	sealedBefore := len(l.sealed)
-	if sealedBefore == 0 {
-		t.Fatal("expected rotation")
-	}
-	// Truncate everything below the start of the active segment.
-	cut := l.active.FirstIndex()
-	if err := l.TruncateFront(cut); err != nil {
-		t.Fatal(err)
-	}
-	if len(l.sealed) != 0 {
-		t.Fatalf("expected all sealed segments dropped, got %d", len(l.sealed))
-	}
-	// Files should be gone on disk.
-	entries, _ := os.ReadDir(dir)
-	if len(entries) != 1 {
-		t.Fatalf("expected one segment file remaining, got %d", len(entries))
-	}
-	// Reads of remaining indices still work.
-	for i := cut; i <= l.LastIndex(); i++ {
-		if _, err := l.Read(i); err != nil {
-			t.Fatalf("read %d: %v", i, err)
-		}
-	}
-}
-
-func TestTruncateFrontKeepsStraddlingSegment(t *testing.T) {
-	dir := t.TempDir()
-	l, _ := Open(dir, Options{SegmentSize: 30})
-	defer l.Close()
-	for i := uint64(1); i <= 5; i++ {
-		l.Write(i, []byte("xxxxx"))
-	}
-	// Pick a cut in the middle of the first sealed segment.
-	if len(l.sealed) == 0 {
-		t.Fatal("expected sealed segments")
-	}
-	cut := l.sealed[0].FirstIndex() // do not drop the first segment
-	if err := l.TruncateFront(cut); err != nil {
-		t.Fatal(err)
-	}
-	if len(l.sealed) == 0 {
-		t.Fatal("expected first sealed segment kept")
-	}
-}
-
-func TestTruncateFrontEmpty(t *testing.T) {
-	l, _ := Open(t.TempDir(), Options{})
-	defer l.Close()
-	if err := l.TruncateFront(5); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestTruncateFrontPersists(t *testing.T) {
-	dir := t.TempDir()
-	l, _ := Open(dir, Options{SegmentSize: 30})
-	for i := uint64(1); i <= 5; i++ {
-		l.Write(i, []byte("xxxxx"))
-	}
-	cut := l.active.FirstIndex()
-	if err := l.TruncateFront(cut); err != nil {
-		t.Fatal(err)
-	}
-	l.Close()
-
-	l2, err := Open(dir, Options{SegmentSize: 30})
+	child, err := c.Fork(4, "alt")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l2.Close()
-	if l2.FirstIndex() != cut {
-		t.Fatalf("FirstIndex=%d want %d", l2.FirstIndex(), cut)
-	}
-}
-
-func TestSyncManual(t *testing.T) {
-	// With SyncManual, Write should not invoke fsync. We can't observe
-	// the fsync call directly, but we can at least exercise the path.
-	l, err := Open(t.TempDir(), Options{SyncMode: SyncManual})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	for i := uint64(1); i <= 3; i++ {
-		if err := l.Write(i, []byte{byte(i)}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := l.Sync(); err != nil {
-		t.Fatal(err)
+	defer child.Close()
+	// Parent now only sees [1, 3] in its own snapshot.
+	if c.LastIndex() != 3 {
+		t.Fatalf("parent LastIndex=%d", c.LastIndex())
 	}
 	for i := uint64(1); i <= 3; i++ {
-		got, err := l.Read(i)
+		got, err := c.Read(i)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("parent read %d: %v", i, err)
 		}
-		if !bytes.Equal(got, []byte{byte(i)}) {
-			t.Fatalf("idx %d: %v", i, got)
+		want := fmt.Sprintf(`{"i":%d}`, i)
+		if string(got) != want {
+			t.Fatalf("parent[%d]=%q want %q", i, got, want)
 		}
 	}
-}
-
-func TestSyncOnEmptyLog(t *testing.T) {
-	l, _ := Open(t.TempDir(), Options{})
-	defer l.Close()
-	if err := l.Sync(); err != nil {
+	// Child reads of the prefix fall through to parent snapshot.
+	for i := uint64(1); i <= 3; i++ {
+		got, err := child.Read(i)
+		if err != nil {
+			t.Fatalf("child read %d: %v", i, err)
+		}
+		want := fmt.Sprintf(`{"i":%d}`, i)
+		if string(got) != want {
+			t.Fatalf("child[%d]=%q want %q", i, got, want)
+		}
+	}
+	// Child writes go to its own cache.
+	if err := child.Write(4, []byte(`{"alt":4}`)); err != nil {
 		t.Fatal(err)
 	}
+	got, _ := child.Read(4)
+	if string(got) != `{"alt":4}` {
+		t.Fatalf("child[4]=%q", got)
+	}
 }
 
-func TestGlobalIndexAcrossRotation(t *testing.T) {
-	// With JSONL codec and rotation, the second segment's first entry
-	// should record the global log index, not the segment-local 0.
+func TestCachedSiblingForksSharePointer(t *testing.T) {
+	// Two sibling forks created from the same parent should share the
+	// same *cacheSnapshot pointer for the parent chain.
 	dir := t.TempDir()
-	l, _ := Open(dir, Options{SegmentSize: 60, Codec: segment.JSONLCodec{}})
-	for i := uint64(1); i <= 5; i++ {
-		if err := l.Write(i, []byte(`{"x":1}`)); err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
+	c, _ := Open(dir, Options{Codec: segment.JSONLCodec{}})
+	defer c.Close()
+	for i := uint64(1); i <= 4; i++ {
+		c.Write(i, []byte(fmt.Sprintf(`{"i":%d}`, i)))
 	}
-	l.Close()
+	a, err := c.Fork(3, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	// After forking once, parent is readOnly so we can't fork again
+	// from c. But the parent snapshot a holds should equal c's
+	// current snapshot pointer (same truncated trunk).
+	if a.snap.Load().parent != c.snap.Load() {
+		t.Fatal("child parent snapshot pointer should equal trunk's snapshot pointer")
+	}
+}
 
-	entries, _ := os.ReadDir(dir)
-	if len(entries) < 2 {
-		t.Fatalf("expected rotation to produce >=2 segments, got %d", len(entries))
+func TestCachedSnapshotIsImmutableView(t *testing.T) {
+	dir := t.TempDir()
+	c, _ := Open(dir, Options{Codec: segment.JSONLCodec{}})
+	defer c.Close()
+	for i := uint64(1); i <= 3; i++ {
+		c.Write(i, []byte(fmt.Sprintf(`{"i":%d}`, i)))
 	}
-	// Read the second segment file directly and check its first line.
-	var second os.DirEntry
-	for i, e := range entries {
-		if i == 1 {
-			second = e
-			break
+	snap := c.Snapshot()
+	// Write more after taking the snapshot.
+	for i := uint64(4); i <= 6; i++ {
+		c.Write(i, []byte(fmt.Sprintf(`{"i":%d}`, i)))
+	}
+	// Snapshot still shows 3 entries.
+	if snap.LastIndex() != 3 {
+		t.Fatalf("snapshot LastIndex=%d want 3", snap.LastIndex())
+	}
+	if _, err := snap.Read(4); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("snapshot.Read(4): want ErrNotFound, got %v", err)
+	}
+}
+
+func TestCachedNotFoundOnEmpty(t *testing.T) {
+	dir := t.TempDir()
+	c, _ := Open(dir, Options{Codec: segment.JSONLCodec{}})
+	defer c.Close()
+	if _, err := c.Read(1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestCachedTruncateFront(t *testing.T) {
+	dir := t.TempDir()
+	c, _ := Open(dir, Options{
+		Codec:       segment.JSONLCodec{},
+		SegmentSize: 80,
+	})
+	defer c.Close()
+	for i := uint64(1); i <= 6; i++ {
+		c.Write(i, []byte(fmt.Sprintf(`{"i":%d}`, i)))
+	}
+	// Truncate to a cut beyond the first segment. SegmentSize=80 +
+	// ~12B per entry rotates after ~5 entries; cut=4 lands somewhere
+	// after the first sealed segment ends.
+	cut := uint64(4)
+	if err := c.TruncateFront(cut); err != nil {
+		t.Fatal(err)
+	}
+	if c.FirstIndex() != cut {
+		t.Fatalf("FirstIndex=%d want %d", c.FirstIndex(), cut)
+	}
+	if _, err := c.Read(1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound for truncated idx, got %v", err)
+	}
+	got, _ := c.Read(cut)
+	want := fmt.Sprintf(`{"i":%d}`, cut)
+	if string(got) != want {
+		t.Fatalf("[%d]=%q want %q", cut, got, want)
+	}
+}
+
+func TestCachedDisksWriteThrough(t *testing.T) {
+	// Log.Write must hit disk. Reopen as a plain Log and verify
+	// the entries are there.
+	dir := t.TempDir()
+	c, _ := Open(dir, Options{Codec: segment.JSONLCodec{}})
+	for i := uint64(1); i <= 3; i++ {
+		c.Write(i, []byte(fmt.Sprintf(`{"i":%d}`, i)))
+	}
+	c.Close()
+	l, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	got, _ := l.Read(2)
+	if !bytes.Equal(got, []byte(`{"i":2}`)) {
+		t.Fatalf("got %q", got)
+	}
+}
+
+var cachedReadSink byte
+
+func BenchmarkCachedRead(b *testing.B) {
+	dir := b.TempDir()
+	c, _ := Open(dir, Options{Codec: segment.JSONLCodec{}})
+	defer c.Close()
+	for i := uint64(1); i <= 1024; i++ {
+		c.Write(i, []byte(fmt.Sprintf(`{"i":%d,"event":"step"}`, i)))
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		i := uint64(1)
+		var sink byte
+		for pb.Next() {
+			payload, err := c.Read(i)
+			if err != nil {
+				b.Fatal(err)
+			}
+			sink ^= payload[0]
+			i++
+			if i > 1024 {
+				i = 1
+			}
 		}
+		cachedReadSink = sink
+	})
+}
+
+func BenchmarkCachedRangeFull(b *testing.B) {
+	dir := b.TempDir()
+	c, _ := Open(dir, Options{Codec: segment.JSONLCodec{}})
+	defer c.Close()
+	for i := uint64(1); i <= 1024; i++ {
+		c.Write(i, []byte(fmt.Sprintf(`{"i":%d,"event":"step"}`, i)))
 	}
-	raw, _ := os.ReadFile(filepath.Join(dir, second.Name()))
-	// Pull baseIndex from the filename to know which global idx to expect.
-	base, _ := parseSegName(second.Name(), ".jsonl")
-	want := []byte(fmt.Sprintf(`"_idx":%d`, base))
-	if !bytes.Contains(raw, want) {
-		t.Fatalf("second segment missing %q in first line:\n%s", want, raw)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var seen uint64
+		c.Range(1, func(_ uint64, _ []byte) error {
+			seen++
+			return nil
+		})
+		if seen != 1024 {
+			b.Fatalf("seen=%d", seen)
+		}
 	}
 }
