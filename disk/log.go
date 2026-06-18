@@ -587,19 +587,6 @@ func (l *Log) loadSegments() error {
 	return nil
 }
 
-// syncDir opens the directory and fsyncs it, durably persisting recent
-// dentry changes (file creation, unlink) in that directory.
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	if err := d.Sync(); err != nil {
-		d.Close()
-		return err
-	}
-	return d.Close()
-}
 
 func (l *Log) segName(base uint64) string {
 	return fmt.Sprintf("%0*d%s", segNameWidth, base, l.ext)
