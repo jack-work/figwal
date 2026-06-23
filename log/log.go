@@ -185,7 +185,12 @@ func (l *Log) Hash(idx uint64) (string, error) {
 	return l.inner.HashPayload(payload)
 }
 
-// Fork splits this Log at atIdx. See disk.Log.Fork for semantics.
+// Fork splits this Log at atIdx. See disk.Log.Fork for semantics
+// (N-ary siblings, re-split below an existing branch point). The cache
+// snapshot is updated for this handle and the returned child; sibling
+// handles already open in memory are NOT updated on a re-split-below —
+// their in-memory parent pointer goes stale. Reopen affected
+// descendants (the on-disk layout is always correct).
 func (l *Log) Fork(atIdx uint64, name string, oldFutureNameOpt ...string) (*Log, error) {
 	l.wmu.Lock()
 	defer l.wmu.Unlock()

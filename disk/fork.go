@@ -106,6 +106,28 @@ func hasSubdirs(dir string) (bool, error) {
 	return false, nil
 }
 
+// pathExists reports whether a filesystem entry exists at p.
+func pathExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+// childSubdirs returns the names of non-dot subdirectories of dir (the
+// child forks of a branch point).
+func childSubdirs(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			out = append(out, e.Name())
+		}
+	}
+	return out, nil
+}
+
 // validateForkName rejects empty, dot, double-dot, and names containing
 // any path separator. The user explicitly opted out of canonicalization
 // so we only reject the unambiguously broken inputs.
@@ -140,13 +162,21 @@ const (
 // name (default: path.Base(l.dir)). Pass at most one override; an
 // empty string keeps the default.
 //
+// Branch points are N-ary and re-splittable:
+//   - Forking again at the same point (atIdx == LastIndex+1) just adds
+//     another sibling child; no data moves.
+//   - Forking BELOW an existing branch point (atIdx < its split index)
+//     inserts an intermediate branch point: the suffix and all existing
+//     child forks are re-homed into the old-future, since they descend
+//     from it. Re-homing is a directory move; `..`-walk parent
+//     resolution adapts automatically.
+//
 // Constraints:
 //   - atIdx must be in (FirstIndex, LastIndex+1]; the prefix retains
 //     at least one entry.
-//   - childName must be a clean filename and must not equal the
-//     old-future subdir name.
+//   - childName must be a clean filename, must not equal the old-future
+//     subdir name, and must not collide with an existing sibling.
 //   - oldFutureName (when provided) must also be a clean filename.
-//   - This log must not already be a branch point.
 //
 // Crash safety: a .fork-pending sentinel file is written before any
 // destructive change and removed after the fork completes. If a crash
@@ -156,9 +186,6 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if l.readOnly {
-		return nil, fmt.Errorf("%w: %s", ErrReadOnly, l.dir)
-	}
 	if err := validateForkName(childName); err != nil {
 		return nil, err
 	}
@@ -186,13 +213,17 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 		return nil, fmt.Errorf("fork index %d out of range (%d, %d]",
 			atIdx, first, last+1)
 	}
-	for _, name := range []string{childName, oldFutureName} {
-		p := filepath.Join(l.dir, name)
-		if _, err := os.Stat(p); err == nil {
-			return nil, fmt.Errorf("%w: %s", ErrForkConflict, p)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return nil, err
-		}
+	// childName must not collide with an existing entry (a segment file
+	// or a sibling fork). The old-future name is validated later, only
+	// when an old-future child is actually created.
+	if p := filepath.Join(l.dir, childName); pathExists(p) {
+		return nil, fmt.Errorf("%w: %s", ErrForkConflict, p)
+	}
+	// Capture pre-existing child forks before we create any new subdir.
+	// On a re-split below this branch point they move into the old-future.
+	existingChildren, err := childSubdirs(l.dir)
+	if err != nil {
+		return nil, err
 	}
 
 	// Seal the active segment so the fork plan only has to consider
@@ -222,6 +253,13 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 		}
 	}
 	oldFutureExists := hasMoves || hasSplit
+	// The old-future is only created when there's a suffix to carry; its
+	// name conflict is therefore only relevant then.
+	if oldFutureExists {
+		if p := filepath.Join(l.dir, oldFutureName); pathExists(p) {
+			return nil, fmt.Errorf("%w: %s", ErrForkConflict, p)
+		}
+	}
 	oldFutureDir := filepath.Join(l.dir, oldFutureName)
 	newForkDir := filepath.Join(l.dir, childName)
 
@@ -332,6 +370,22 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 		}
 		if err := os.Rename(src, dst); err != nil {
 			return nil, rollbackPending(err)
+		}
+	}
+
+	// Re-home pre-existing child forks into the old-future. They branched
+	// from the suffix [atIdx, ...], which now lives there; their own .fork
+	// base is unchanged and their parent resolves via `..` to the
+	// old-future. Only happens on a re-split below an existing branch
+	// point (oldFutureExists is always true there, since the branch
+	// point's own segments supply the suffix).
+	if oldFutureExists {
+		for _, name := range existingChildren {
+			src := filepath.Join(l.dir, name)
+			dst := filepath.Join(oldFutureDir, name)
+			if err := os.Rename(src, dst); err != nil {
+				return nil, rollbackPending(err)
+			}
 		}
 	}
 

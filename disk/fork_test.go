@@ -230,12 +230,93 @@ func TestForkReadOnlyParentRejectsWrite(t *testing.T) {
 func TestForkNameConflict(t *testing.T) {
 	_, l := forkSetup(t, segment.BinaryCodec{}, 3, 2)
 	defer l.Close()
-	if _, err := l.Fork(2, "alt"); err != nil {
+	a, err := l.Fork(2, "alt")
+	if err != nil {
 		t.Fatal(err)
 	}
-	// Cannot fork again because parent is now readOnly.
-	if _, err := l.Fork(3, "again"); !errors.Is(err, ErrReadOnly) {
-		t.Fatalf("want ErrReadOnly on second fork, got %v", err)
+	defer a.Close()
+	// Re-using an existing sibling's name conflicts.
+	if _, err := l.Fork(2, "alt"); !errors.Is(err, ErrForkConflict) {
+		t.Fatalf("want ErrForkConflict for duplicate child name, got %v", err)
+	}
+}
+
+// N-ary: a branch point accepts more than one sibling at the same split
+// point. (Old semantics rejected a second fork with ErrReadOnly.)
+func TestForkNArySiblings(t *testing.T) {
+	_, l := forkSetup(t, segment.BinaryCodec{}, 3, 2)
+	defer l.Close()
+	a, err := l.Fork(2, "alt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := l.Fork(2, "alt2") // second sibling at the same split point
+	if err != nil {
+		t.Fatalf("N-ary sibling fork should succeed, got %v", err)
+	}
+	defer b.Close()
+	// Both branches are appendable from the split point.
+	if err := a.Write(2, []byte("a2")); err != nil {
+		t.Fatalf("write to a: %v", err)
+	}
+	if err := b.Write(2, []byte("b2")); err != nil {
+		t.Fatalf("write to b: %v", err)
+	}
+	// Branch point itself stays read-only for appends.
+	if err := l.Write(2, []byte("nope")); !errors.Is(err, ErrReadOnly) {
+		t.Fatalf("branch point must reject writes, got %v", err)
+	}
+}
+
+// Re-split below an existing branch point inserts an intermediate node
+// and re-homes the existing children + suffix into the old-future. The
+// original continuation must still read the full history through the new
+// chain. (The user's a→b→c→{d,e,f}, then fork below c, case.)
+func TestForkResplitBelowBranchPoint(t *testing.T) {
+	dir, l := forkSetup(t, segment.BinaryCodec{}, 5, 3)
+	ofName := filepath.Base(dir) // default old-future name from the first fork
+	// First fork at 4: l keeps [1,3]; suffix [4,5] -> old-future; child "d".
+	d, err := l.Fork(4, "d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Close()
+	// Re-split at 2 (< split index 4). Distinct old-future name "mid".
+	x, err := l.Fork(2, "x", "mid")
+	if err != nil {
+		t.Fatalf("re-split below branch point should succeed, got %v", err)
+	}
+	x.Close()
+	l.Close()
+
+	// Reopen from disk (source of truth) via a Store that resolves the
+	// nested parent chain, and verify the original continuation —
+	// dir/mid/<ofName> — still reads the full [1..5].
+	store := NewStore()
+	defer store.Close()
+	orig, err := store.Open(filepath.Join(dir, "mid", ofName), Options{Codec: segment.BinaryCodec{}})
+	if err != nil {
+		t.Fatalf("reopen original continuation: %v", err)
+	}
+	var got []string
+	if err := orig.Range(orig.FirstIndex(), func(idx uint64, p []byte) error {
+		got = append(got, string(p))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"data1", "data2", "data3", "data4", "data5"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("original continuation history = %v, want %v", got, want)
+	}
+	// The re-homed empty child "d" lives under mid now and reads [1..3].
+	dd, err := store.Open(filepath.Join(dir, "mid", "d"), Options{Codec: segment.BinaryCodec{}})
+	if err != nil {
+		t.Fatalf("reopen re-homed child d: %v", err)
+	}
+	if dd.LastIndex() != 3 {
+		t.Fatalf("re-homed d LastIndex=%d want 3", dd.LastIndex())
 	}
 }
 

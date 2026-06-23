@@ -207,11 +207,23 @@ func TestCachedSiblingForksSharePointer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Close()
-	// After forking once, parent is readOnly so we can't fork again
-	// from c. But the parent snapshot a holds should equal c's
-	// current snapshot pointer (same truncated trunk).
+	// The parent snapshot a holds should equal c's current snapshot
+	// pointer (same truncated trunk).
 	if a.snap.Load().parent != c.snap.Load() {
 		t.Fatal("child parent snapshot pointer should equal trunk's snapshot pointer")
+	}
+	// N-ary: a branch point accepts a second sibling at the same split
+	// point, and it shares the same trunk snapshot pointer.
+	b, err := c.Fork(3, "b")
+	if err != nil {
+		t.Fatalf("second sibling fork should succeed, got %v", err)
+	}
+	defer b.Close()
+	if b.snap.Load().parent != c.snap.Load() {
+		t.Fatal("second child should share the trunk snapshot pointer")
+	}
+	if err := b.Write(3, []byte(`{"b":3}`)); err != nil {
+		t.Fatalf("write to second sibling: %v", err)
 	}
 }
 
