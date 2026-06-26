@@ -1,3 +1,8 @@
 # Built CLI binaries
 /segctl
 /logctl
+
+# ad-hoc CLI demo data
+/conv
+/demo
+/figwal

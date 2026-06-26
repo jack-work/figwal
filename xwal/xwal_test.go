@@ -34,8 +34,8 @@ func triune(t *testing.T, dir string) (*XWAL, Config) {
 	t.Helper()
 	cfg := Config{
 		Main:        "ir",
-		Registry:    map[string]ReduceFunc{"jsonmerge": jsonMerge},
-		SegmentSize: 96, // small, to force watermark rotation
+		Registry:    map[string]Reducer{"jsonmerge": {Reduce: jsonMerge, Initial: []byte("{}")}},
+		SegmentSize: 256, // small, to force watermark rotation across entries
 		Channels: []ChannelSpec{
 			{Name: "ir", Kind: ChannelLog},
 			{Name: "translations", Kind: ChannelLog},
@@ -141,7 +141,7 @@ func TestXWAL_ReopenManifest(t *testing.T) {
 	x.Close()
 
 	// Reopen with only the registry (no channel specs): manifest drives it.
-	x2, err := Open(dir, Config{Registry: map[string]ReduceFunc{"jsonmerge": jsonMerge}})
+	x2, err := Open(dir, Config{Registry: map[string]Reducer{"jsonmerge": {Reduce: jsonMerge, Initial: []byte("{}")}}})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

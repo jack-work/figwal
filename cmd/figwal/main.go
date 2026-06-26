@@ -39,9 +39,9 @@ func main() {
 
 // ---- reducer registry (shared by xwal reducible channels) ----
 
-func registry() map[string]xwal.ReduceFunc {
-	return map[string]xwal.ReduceFunc{
-		"jsonmerge": jsonMerge,
+func registry() map[string]xwal.Reducer {
+	return map[string]xwal.Reducer{
+		"jsonmerge": {Reduce: jsonMerge, Initial: []byte("{}")},
 	}
 }
 
@@ -180,12 +180,14 @@ func runXWAL(args []string) {
 	rest := args[2:]
 
 	if cmd == "init" {
-		// figwal xwal init <dir> <main> <ch[:reducer]>...
+		// figwal xwal init <dir> <main> <ch[:reducer]>... [--codec jsonl|binary]
+		var codec string
+		rest = extractFlags(rest, map[string]*string{"codec": &codec})
 		if len(rest) < 1 {
 			usageXWAL()
 		}
 		main := rest[0]
-		cfg := xwal.Config{Main: main, Registry: registry()}
+		cfg := xwal.Config{Main: main, Registry: registry(), Codec: codec}
 		seen := false
 		for _, spec := range rest[1:] {
 			name, reducer, isRed := strings.Cut(spec, ":")
@@ -263,9 +265,7 @@ func runXWAL(args []string) {
 		}
 		m, payload, err := x.Read(pos[0], mustU64(pos[1]))
 		check(err)
-		fmt.Printf("main-lt %d  ", m)
-		os.Stdout.Write(payload)
-		fmt.Println()
+		fmt.Printf("main-lt %d  %s\n", m, displayPayload(payload))
 	case "state":
 		if len(pos) != 2 {
 			usageXWAL()
@@ -354,6 +354,18 @@ func extractFlags(args []string, vals map[string]*string) []string {
 	return pos
 }
 
+// displayPayload renders a stored payload: a JSON string is unquoted
+// back to its text; anything else (objects, numbers) prints as-is.
+func displayPayload(p []byte) string {
+	if len(p) > 0 && p[0] == '"' {
+		var s string
+		if err := json.Unmarshal(p, &s); err == nil {
+			return s
+		}
+	}
+	return string(p)
+}
+
 func mustU64(s string) uint64 {
 	n, err := strconv.ParseUint(s, 10, 64)
 	check(err)
@@ -391,7 +403,9 @@ func usageLog() {
 
 func usageXWAL() {
 	fmt.Fprintln(os.Stderr, `figwal xwal <command> <dir> [args]   [--branch p] [--main-lt N] [--seg-size N]
-  init <main> <ch[:reducer]>...   create; e.g. init ./c ir translations chalkboard:jsonmerge
+  init <main> <ch[:reducer]>... [--codec jsonl|binary]
+                                  create; e.g. init ./c ir translations chalkboard:jsonmerge
+                                  (jsonl, the default, stores readable frames + watermarks)
   info                            channels, kinds, bounds (alias: channels)
   appendmain <data>               append a main-timeline entry
   append <channel> <data>         append to a channel (main-lt defaults to main tail)

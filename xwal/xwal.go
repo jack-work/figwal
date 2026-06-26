@@ -7,7 +7,6 @@
 package xwal
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,10 +37,17 @@ func (k Kind) String() string {
 	return "log"
 }
 
-// ReduceFunc applies one patch to a state, returning the new state. A
-// nil/empty state is the initial (empty) value. Used both to fold
-// watermarks on rotation/fork and to answer StateAt.
+// ReduceFunc applies one patch to a state, returning the new state. Used
+// both to fold watermarks on rotation/fork and to answer StateAt.
 type ReduceFunc func(state, patch []byte) ([]byte, error)
+
+// Reducer is a reducible channel's fold plus its initial (empty) state.
+// Initial must be a valid value for the codec — a JSON object such as
+// `{}` under the JSONL codec, since it seeds the very first watermark.
+type Reducer struct {
+	Reduce  ReduceFunc
+	Initial []byte
+}
 
 // ChannelSpec declares one channel at creation time.
 type ChannelSpec struct {
@@ -57,7 +63,8 @@ type ChannelSpec struct {
 type Config struct {
 	Main        string
 	Channels    []ChannelSpec
-	Registry    map[string]ReduceFunc
+	Registry    map[string]Reducer
+	Codec       string // "jsonl" (default) | "binary"; persisted in the manifest
 	SegmentSize int64
 }
 
@@ -74,17 +81,19 @@ type XWAL struct {
 }
 
 type channel struct {
-	name   string
-	kind   Kind
-	rname  string
-	log    *disk.Log
-	reduce ReduceFunc
+	name    string
+	kind    Kind
+	rname   string
+	log     *disk.Log
+	reduce  ReduceFunc
+	initial []byte
 }
 
 const manifestName = "xwal.json"
 
 type manifest struct {
 	Main     string            `json:"main"`
+	Codec    string            `json:"codec"`
 	Channels []manifestChannel `json:"channels"`
 }
 
@@ -107,6 +116,10 @@ func Open(dir string, cfg Config, branch ...string) (*XWAL, error) {
 	if err != nil {
 		return nil, err
 	}
+	codec, err := codecByName(man.Codec)
+	if err != nil {
+		return nil, err
+	}
 	x := &XWAL{
 		root:   dir,
 		branch: append([]string(nil), branch...),
@@ -119,17 +132,18 @@ func Open(dir string, cfg Config, branch ...string) (*XWAL, error) {
 		switch mc.Kind {
 		case "reducible":
 			ch.kind = ChannelReducible
-			fn := cfg.Registry[mc.Reducer]
-			if fn == nil {
+			r, ok := cfg.Registry[mc.Reducer]
+			if !ok || r.Reduce == nil {
 				return nil, fmt.Errorf("xwal: no reducer %q registered for channel %q", mc.Reducer, mc.Name)
 			}
-			ch.reduce = fn
+			ch.reduce = r.Reduce
+			ch.initial = r.Initial
 		default:
 			ch.kind = ChannelLog
 		}
-		opts := disk.Options{Codec: segment.BinaryCodec{}, SegmentSize: cfg.SegmentSize}
+		opts := disk.Options{Codec: codec, SegmentSize: cfg.SegmentSize}
 		if ch.kind == ChannelReducible {
-			opts.OnSegmentOpen = reducibleFold(ch.reduce)
+			opts.OnSegmentOpen = reducibleFold(ch.reduce, ch.initial)
 		}
 		l, err := disk.Open(x.channelDir(mc.Name), opts)
 		if err != nil {
@@ -166,12 +180,16 @@ func pathExists(p string) bool {
 	return err == nil
 }
 
-// reducibleFold adapts a ReduceFunc into figwal's OnSegmentOpen: the new
-// watermark is the previous one with every sealed entry's patch folded
-// in. Entries carry an 8-byte main-LT prefix that the fold strips.
-func reducibleFold(reduce ReduceFunc) func(prevHeader []byte, sealed [][]byte) ([]byte, error) {
+// reducibleFold adapts a Reducer into figwal's OnSegmentOpen: the new
+// watermark is the previous one (or the initial state, for the very
+// first segment) with every sealed entry's patch folded in. Each sealed
+// frame is the channel's JSON envelope; the fold pulls out the patch.
+func reducibleFold(reduce ReduceFunc, initial []byte) func(prevHeader []byte, sealed [][]byte) ([]byte, error) {
 	return func(prevHeader []byte, sealed [][]byte) ([]byte, error) {
 		state := prevHeader
+		if len(state) == 0 {
+			state = initial
+		}
 		for _, f := range sealed {
 			_, patch, err := decodeFrame(f)
 			if err != nil {
@@ -183,6 +201,17 @@ func reducibleFold(reduce ReduceFunc) func(prevHeader []byte, sealed [][]byte) (
 			}
 		}
 		return state, nil
+	}
+}
+
+func codecByName(name string) (segment.SegmentCodec, error) {
+	switch name {
+	case "", "jsonl":
+		return segment.JSONLCodec{}, nil
+	case "binary":
+		return segment.BinaryCodec{}, nil
+	default:
+		return nil, fmt.Errorf("xwal: unknown codec %q", name)
 	}
 }
 
@@ -203,7 +232,14 @@ func loadOrCreateManifest(dir string, cfg Config) (manifest, error) {
 	if cfg.Main == "" || len(cfg.Channels) == 0 {
 		return manifest{}, fmt.Errorf("xwal: no manifest at %s and no Config to create one", dir)
 	}
-	m := manifest{Main: cfg.Main}
+	codecName := cfg.Codec
+	if codecName == "" {
+		codecName = "jsonl"
+	}
+	if _, err := codecByName(codecName); err != nil {
+		return manifest{}, err
+	}
+	m := manifest{Main: cfg.Main, Codec: codecName}
 	seenMain := false
 	for _, c := range cfg.Channels {
 		if c.Name == cfg.Main {
@@ -350,16 +386,33 @@ func (x *XWAL) Close() error {
 	return first
 }
 
+// A channel entry is stored as a JSON object so it round-trips through
+// either codec (the JSONL codec needs JSON objects; the binary codec
+// stores the bytes opaquely): {"m":<mainLT>,"p":<payload>}. The payload
+// is embedded raw when it is itself valid JSON (patches, structured
+// entries), else as a JSON string (free-form text). Reducible watermarks
+// are stored as the bare state object, not wrapped.
+type frameObj struct {
+	M uint64          `json:"m"`
+	P json.RawMessage `json:"p"`
+}
+
 func encodeFrame(mainLT uint64, payload []byte) []byte {
-	b := make([]byte, 8+len(payload))
-	binary.BigEndian.PutUint64(b[:8], mainLT)
-	copy(b[8:], payload)
+	var p json.RawMessage
+	if json.Valid(payload) {
+		p = json.RawMessage(payload)
+	} else {
+		q, _ := json.Marshal(string(payload))
+		p = json.RawMessage(q)
+	}
+	b, _ := json.Marshal(frameObj{M: mainLT, P: p})
 	return b
 }
 
 func decodeFrame(f []byte) (uint64, []byte, error) {
-	if len(f) < 8 {
-		return 0, nil, fmt.Errorf("xwal: short frame (%d bytes)", len(f))
+	var o frameObj
+	if err := json.Unmarshal(f, &o); err != nil {
+		return 0, nil, fmt.Errorf("xwal: decode frame: %w", err)
 	}
-	return binary.BigEndian.Uint64(f[:8]), f[8:], nil
+	return o.M, o.P, nil
 }
