@@ -10,13 +10,13 @@ func TestXWAL_ForkRecovery(t *testing.T) {
 	dir := t.TempDir()
 	x, _ := triune(t, dir)
 	for i := uint64(1); i <= 4; i++ {
-		if _, err := x.AppendMain([]byte("msg")); err != nil {
+		if _, err := x.AppendMain([]byte("msg"), nil); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := x.Append("translations", i, []byte("wire")); err != nil {
+		if _, err := x.Append("translations", i, []byte("wire"), nil); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := x.Append("chalkboard", i, []byte(`{"set":{"turn":`+itoa(i)+`}}`)); err != nil {
+		if _, err := x.Append("chalkboard", i, []byte(`{"set":{"turn":`+itoa(i)+`}}`), nil); err != nil {
 			t.Fatal(err)
 		}
 	}

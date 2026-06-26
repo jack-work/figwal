@@ -78,6 +78,7 @@ type XWAL struct {
 	order  []string
 	chans  map[string]*channel
 	cfg    Config
+	codec  segment.SegmentCodec
 }
 
 type channel struct {
@@ -88,6 +89,24 @@ type channel struct {
 	log     *disk.Log
 	reduce  ReduceFunc
 	initial []byte
+	fk      map[uint64]uint64 // main-LT -> channel-LT (last wins)
+}
+
+// buildFK scans the channel to populate its main-LT -> channel-LT index.
+func (ch *channel) buildFK() error {
+	ch.fk = map[uint64]uint64{}
+	first := ch.log.FirstIndex()
+	if first == 0 {
+		return nil
+	}
+	return ch.log.Range(first, func(idx uint64, payload []byte) error {
+		m, _, err := decodeFrame(payload)
+		if err != nil {
+			return err
+		}
+		ch.fk[m] = idx
+		return nil
+	})
 }
 
 const manifestName = "xwal.json"
@@ -139,6 +158,7 @@ func Open(dir string, cfg Config, branch ...string) (*XWAL, error) {
 		main:   man.Main,
 		chans:  make(map[string]*channel, len(man.Channels)),
 		cfg:    cfg,
+		codec:  codec,
 	}
 	for _, mc := range man.Channels {
 		ch := &channel{name: mc.Name, rname: mc.Reducer}
@@ -166,6 +186,10 @@ func Open(dir string, cfg Config, branch ...string) (*XWAL, error) {
 		}
 		ch.dir = cdir
 		ch.log = l
+		if err := ch.buildFK(); err != nil {
+			x.Close()
+			return nil, fmt.Errorf("xwal: index channel %q: %w", mc.Name, err)
+		}
 		x.chans[mc.Name] = ch
 		x.order = append(x.order, mc.Name)
 	}
@@ -268,33 +292,123 @@ func loadOrCreateManifest(dir string, cfg Config) (manifest, error) {
 	if !seenMain {
 		return manifest{}, fmt.Errorf("xwal: main channel %q not in Channels", cfg.Main)
 	}
-	body, _ := json.MarshalIndent(m, "", "  ")
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, body, 0o644); err != nil {
-		return manifest{}, err
-	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := writeManifest(dir, m); err != nil {
 		return manifest{}, err
 	}
 	return m, nil
 }
 
-// AppendMain appends payload to the main channel. The returned mainLT is
-// the channel index it landed at; related-channel entries reference it.
-func (x *XWAL) AppendMain(payload []byte) (uint64, error) {
+func writeManifest(dir string, m manifest) error {
+	body, _ := json.MarshalIndent(m, "", "  ")
+	path := filepath.Join(dir, manifestName)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, body, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// fullChannelDir is the channel dir at this exact branch (no ancestor
+// fallback) — used when creating a brand-new channel on this branch.
+func (x *XWAL) fullChannelDir(name string) string {
+	return filepath.Join(append([]string{x.root, name}, x.branch...)...)
+}
+
+func (x *XWAL) channelOpts(ch *channel) disk.Options {
+	opts := disk.Options{Codec: x.codec, SegmentSize: x.cfg.SegmentSize}
+	if ch.kind == ChannelReducible {
+		opts.OnSegmentOpen = reducibleFold(ch.reduce, ch.initial)
+	}
+	return opts
+}
+
+// Clear wipes a channel's own data and reopens it empty, resetting its
+// index — for caches that invalidate wholesale (translation fingerprint
+// drift). NOTE: on a forked branch this also drops the branch's link to
+// its parent for that channel; intended for trunk-level cache resets.
+func (x *XWAL) Clear(channelName string) error {
+	ch := x.chans[channelName]
+	if ch == nil {
+		return fmt.Errorf("xwal: no channel %q", channelName)
+	}
+	if err := ch.log.Close(); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(ch.dir); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(ch.dir, 0o755); err != nil {
+		return err
+	}
+	l, err := disk.Open(ch.dir, x.channelOpts(ch))
+	if err != nil {
+		return err
+	}
+	ch.log = l
+	ch.fk = map[uint64]uint64{}
+	return nil
+}
+
+// AddChannel adds a channel to an existing xwal (e.g. a translation
+// stream for a newly-seen provider), updating the manifest and opening it
+// on this branch. Reducible channels must name a registered reducer.
+func (x *XWAL) AddChannel(spec ChannelSpec) error {
+	if _, exists := x.chans[spec.Name]; exists {
+		return fmt.Errorf("xwal: channel %q already exists", spec.Name)
+	}
+	man, err := loadOrCreateManifest(x.root, x.cfg)
+	if err != nil {
+		return err
+	}
+	if spec.Kind == ChannelReducible && spec.Reducer == "" {
+		return fmt.Errorf("xwal: reducible channel %q needs a reducer name", spec.Name)
+	}
+	man.Channels = append(man.Channels, manifestChannel{
+		Name: spec.Name, Kind: spec.Kind.String(), Reducer: spec.Reducer,
+	})
+	if err := writeManifest(x.root, man); err != nil {
+		return err
+	}
+	ch := &channel{name: spec.Name, kind: spec.Kind, rname: spec.Reducer}
+	if spec.Kind == ChannelReducible {
+		r, ok := x.cfg.Registry[spec.Reducer]
+		if !ok || r.Reduce == nil {
+			return fmt.Errorf("xwal: no reducer %q registered for channel %q", spec.Reducer, spec.Name)
+		}
+		ch.reduce = r.Reduce
+		ch.initial = r.Initial
+	}
+	cdir := x.fullChannelDir(spec.Name)
+	l, err := disk.Open(cdir, x.channelOpts(ch))
+	if err != nil {
+		return err
+	}
+	ch.dir = cdir
+	ch.log = l
+	ch.fk = map[uint64]uint64{}
+	x.chans[spec.Name] = ch
+	x.order = append(x.order, spec.Name)
+	return nil
+}
+
+// AppendMain appends payload (with optional opaque meta) to the main
+// channel. The returned mainLT is the channel index it landed at;
+// related-channel entries reference it.
+func (x *XWAL) AppendMain(payload, meta []byte) (uint64, error) {
 	ch := x.chans[x.main]
 	next := ch.log.LastIndex() + 1
-	if err := ch.log.Write(next, encodeFrame(next, payload)); err != nil {
+	if err := ch.log.Write(next, encodeFrame(next, payload, meta)); err != nil {
 		return 0, err
 	}
+	ch.fk[next] = next
 	return next, nil
 }
 
-// Append appends payload to a related channel, tagged with the main LT
-// it belongs to. mainLT must be >= the channel's last referenced main LT
-// (it may exceed the current main tail, to support catch-up). The
-// returned value is the channel's own LT.
-func (x *XWAL) Append(channelName string, mainLT uint64, payload []byte) (uint64, error) {
+// Append appends payload (with optional opaque meta) to a related
+// channel, tagged with the main LT it belongs to. mainLT must be >= the
+// channel's last referenced main LT (it may exceed the current main tail,
+// to support catch-up). The returned value is the channel's own LT.
+func (x *XWAL) Append(channelName string, mainLT uint64, payload, meta []byte) (uint64, error) {
 	ch := x.chans[channelName]
 	if ch == nil {
 		return 0, fmt.Errorf("xwal: no channel %q", channelName)
@@ -309,23 +423,51 @@ func (x *XWAL) Append(channelName string, mainLT uint64, payload []byte) (uint64
 			channelName, mainLT, lastMain)
 	}
 	next := ch.log.LastIndex() + 1
-	if err := ch.log.Write(next, encodeFrame(mainLT, payload)); err != nil {
+	if err := ch.log.Write(next, encodeFrame(mainLT, payload, meta)); err != nil {
 		return 0, err
 	}
+	ch.fk[mainLT] = next
 	return next, nil
 }
 
-// Read returns the (mainLT, payload) at channelLT in a channel.
+// Read returns the (mainLT, payload) at channelLT — the meta-free view.
 func (x *XWAL) Read(channelName string, channelLT uint64) (uint64, []byte, error) {
-	ch := x.chans[channelName]
-	if ch == nil {
-		return 0, nil, fmt.Errorf("xwal: no channel %q", channelName)
-	}
-	f, err := ch.log.Read(channelLT)
+	r, err := x.ReadAt(channelName, channelLT)
 	if err != nil {
 		return 0, nil, err
 	}
-	return decodeFrame(f)
+	return r.MainLT, r.Payload, nil
+}
+
+// ReadAt returns the full record (incl. meta) at channelLT in a channel.
+func (x *XWAL) ReadAt(channelName string, channelLT uint64) (Record, error) {
+	ch := x.chans[channelName]
+	if ch == nil {
+		return Record{}, fmt.Errorf("xwal: no channel %q", channelName)
+	}
+	f, err := ch.log.Read(channelLT)
+	if err != nil {
+		return Record{}, err
+	}
+	return decodeRecord(channelLT, f)
+}
+
+// Lookup finds the entry referencing a given main LT in a channel (the
+// foreign-key view; last entry wins if several share the main LT).
+func (x *XWAL) Lookup(channelName string, mainLT uint64) (Record, bool, error) {
+	ch := x.chans[channelName]
+	if ch == nil {
+		return Record{}, false, fmt.Errorf("xwal: no channel %q", channelName)
+	}
+	lt, ok := ch.fk[mainLT]
+	if !ok {
+		return Record{}, false, nil
+	}
+	r, err := x.ReadAt(channelName, lt)
+	if err != nil {
+		return Record{}, false, err
+	}
+	return r, true, nil
 }
 
 // StateAt folds a reducible channel to channelLT (watermark + patches).
@@ -403,31 +545,60 @@ func (x *XWAL) Close() error {
 
 // A channel entry is stored as a JSON object so it round-trips through
 // either codec (the JSONL codec needs JSON objects; the binary codec
-// stores the bytes opaquely): {"m":<mainLT>,"p":<payload>}. The payload
-// is embedded raw when it is itself valid JSON (patches, structured
-// entries), else as a JSON string (free-form text). Reducible watermarks
-// are stored as the bare state object, not wrapped.
+// stores the bytes opaquely): {"m":<mainLT>,"p":<payload>,"x":<meta>}.
+// Payload (and optional opaque meta) are embedded raw when themselves
+// valid JSON, else as a JSON string. Meta is a free side-channel for the
+// caller (e.g. a cache fingerprint). Reducible watermarks are stored as
+// the bare state object, not wrapped.
 type frameObj struct {
 	M uint64          `json:"m"`
 	P json.RawMessage `json:"p"`
+	X json.RawMessage `json:"x,omitempty"`
 }
 
-func encodeFrame(mainLT uint64, payload []byte) []byte {
-	var p json.RawMessage
-	if json.Valid(payload) {
-		p = json.RawMessage(payload)
-	} else {
-		q, _ := json.Marshal(string(payload))
-		p = json.RawMessage(q)
+// Record is a decoded channel entry.
+type Record struct {
+	ChannelLT uint64
+	MainLT    uint64
+	Payload   []byte
+	Meta      []byte
+}
+
+func embedJSON(b []byte) json.RawMessage {
+	if len(b) == 0 {
+		return nil
 	}
-	b, _ := json.Marshal(frameObj{M: mainLT, P: p})
+	if json.Valid(b) {
+		return json.RawMessage(b)
+	}
+	q, _ := json.Marshal(string(b))
+	return json.RawMessage(q)
+}
+
+func encodeFrame(mainLT uint64, payload, meta []byte) []byte {
+	o := frameObj{M: mainLT, P: embedJSON(payload)}
+	if len(o.P) == 0 {
+		o.P = json.RawMessage("null")
+	}
+	o.X = embedJSON(meta)
+	b, _ := json.Marshal(o)
 	return b
 }
 
+// decodeFrame returns the main-LT and payload, ignoring meta. Used by the
+// fold and fork-boundary paths that don't care about meta.
 func decodeFrame(f []byte) (uint64, []byte, error) {
 	var o frameObj
 	if err := json.Unmarshal(f, &o); err != nil {
 		return 0, nil, fmt.Errorf("xwal: decode frame: %w", err)
 	}
 	return o.M, o.P, nil
+}
+
+func decodeRecord(channelLT uint64, f []byte) (Record, error) {
+	var o frameObj
+	if err := json.Unmarshal(f, &o); err != nil {
+		return Record{}, fmt.Errorf("xwal: decode frame: %w", err)
+	}
+	return Record{ChannelLT: channelLT, MainLT: o.M, Payload: o.P, Meta: o.X}, nil
 }

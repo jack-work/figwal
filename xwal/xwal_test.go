@@ -56,18 +56,18 @@ func TestXWAL_TriuneAppendAndState(t *testing.T) {
 	// Drive a small conversation: each IR tic gets a translation and a
 	// chalkboard patch (keyed to that tic).
 	for i := uint64(1); i <= 6; i++ {
-		mainLT, err := x.AppendMain([]byte("msg"))
+		mainLT, err := x.AppendMain([]byte("msg"), nil)
 		if err != nil {
 			t.Fatalf("appendMain %d: %v", i, err)
 		}
 		if mainLT != i {
 			t.Fatalf("mainLT = %d, want %d", mainLT, i)
 		}
-		if _, err := x.Append("translations", mainLT, []byte("wire")); err != nil {
+		if _, err := x.Append("translations", mainLT, []byte("wire"), nil); err != nil {
 			t.Fatalf("append translation: %v", err)
 		}
 		patch := []byte(`{"set":{"turn":` + itoa(i) + `}}`)
-		if _, err := x.Append("chalkboard", mainLT, patch); err != nil {
+		if _, err := x.Append("chalkboard", mainLT, patch, nil); err != nil {
 			t.Fatalf("append chalkboard: %v", err)
 		}
 	}
@@ -82,7 +82,7 @@ func TestXWAL_TriuneAppendAndState(t *testing.T) {
 	}
 
 	// Monotonic main-LT enforced.
-	if _, err := x.Append("translations", 3, []byte("late")); err == nil {
+	if _, err := x.Append("translations", 3, []byte("late"), nil); err == nil {
 		t.Fatal("expected non-decreasing main-LT violation, got nil")
 	}
 
@@ -110,14 +110,14 @@ func TestXWAL_TriuneAppendAndState(t *testing.T) {
 	}
 
 	// Child diverges: new tic at main-LT 4 with a different patch.
-	mainLT, err := child.AppendMain([]byte("alt-msg"))
+	mainLT, err := child.AppendMain([]byte("alt-msg"), nil)
 	if err != nil {
 		t.Fatalf("child appendMain: %v", err)
 	}
 	if mainLT != 4 {
 		t.Fatalf("child mainLT = %d, want 4 (continues numbering at fork)", mainLT)
 	}
-	if _, err := child.Append("chalkboard", mainLT, []byte(`{"set":{"branch":"alt"}}`)); err != nil {
+	if _, err := child.Append("chalkboard", mainLT, []byte(`{"set":{"branch":"alt"}}`), nil); err != nil {
 		t.Fatalf("child append chalkboard: %v", err)
 	}
 	st, err = child.StateAt("chalkboard", child.chans["chalkboard"].log.LastIndex())
@@ -135,7 +135,7 @@ func TestXWAL_TriuneAppendAndState(t *testing.T) {
 func TestXWAL_ReopenManifest(t *testing.T) {
 	dir := t.TempDir()
 	x, _ := triune(t, dir)
-	if _, err := x.AppendMain([]byte("a")); err != nil {
+	if _, err := x.AppendMain([]byte("a"), nil); err != nil {
 		t.Fatal(err)
 	}
 	x.Close()

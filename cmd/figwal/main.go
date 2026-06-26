@@ -238,7 +238,7 @@ func runXWAL(args []string) {
 		if len(pos) != 1 {
 			usageXWAL()
 		}
-		lt, err := x.AppendMain([]byte(pos[0]))
+		lt, err := x.AppendMain([]byte(pos[0]), nil)
 		check(err)
 		fmt.Printf("main @%d\n", lt)
 	case "append":
@@ -247,7 +247,7 @@ func runXWAL(args []string) {
 		}
 		ch := pos[0]
 		if ch == x.Main() {
-			lt, err := x.AppendMain([]byte(pos[1]))
+			lt, err := x.AppendMain([]byte(pos[1]), nil)
 			check(err)
 			fmt.Printf("main @%d\n", lt)
 			return
@@ -256,7 +256,7 @@ func runXWAL(args []string) {
 		if mainLT < 0 {
 			m = defaultMainLT(x, ch)
 		}
-		lt, err := x.Append(ch, m, []byte(pos[1]))
+		lt, err := x.Append(ch, m, []byte(pos[1]), nil)
 		check(err)
 		fmt.Printf("%s @%d (main-lt %d)\n", ch, lt, m)
 	case "read":
