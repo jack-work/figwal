@@ -1,6 +1,36 @@
 package xwal
 
-import "fmt"
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/jack-work/figwal/disk"
+)
+
+// forkPendingName, in the xwal root, records a joint fork that began but
+// did not finish. Open completes it (roll-forward) before serving any
+// branch, so a crash mid-fork never leaves the triune half-diverged.
+const forkPendingName = ".xwal-fork-pending"
+
+// forkPlan is the durable description of a joint fork: where to split,
+// what to name the branches, and the exact per-channel boundary indexes
+// (recorded so recovery never has to recompute them from partial state).
+// Channels are listed in apply order — the main channel last.
+type forkPlan struct {
+	AtMainLT  uint64          `json:"atMainLT"`
+	Child     string          `json:"child"`
+	OldFuture string          `json:"oldFuture"`
+	Channels  []forkPlanEntry `json:"channels"`
+}
+
+type forkPlanEntry struct {
+	Name  string `json:"name"`
+	Dir   string `json:"dir"` // channel log dir, relative to the xwal root
+	AtIdx uint64 `json:"atIdx"`
+}
 
 // Fork branches every channel as a unit at the main timeline position
 // atMainLT. childName is the new branch; oldFutureName is the original
@@ -14,66 +44,172 @@ import "fmt"
 // atMainLT (or its tail if it has not yet caught up). Reducible channels
 // get a fresh watermark at the boundary so the new branch folds from the
 // fork-point state. A channel with no entries is left unforked.
+//
+// The fork is crash-atomic across channels: a plan sentinel is written
+// before any channel diverges and removed only once all have, and Open
+// rolls a partial fork forward to completion.
 func (x *XWAL) Fork(atMainLT uint64, childName, oldFutureName string) (*XWAL, error) {
-	type plan struct {
-		ch    *channel
-		atIdx uint64
-		fork  bool
+	plan, err := x.buildForkPlan(atMainLT, childName, oldFutureName)
+	if err != nil {
+		return nil, err
 	}
-	plans := make([]plan, 0, len(x.order))
+	if err := writeForkPlan(x.root, plan); err != nil {
+		return nil, err
+	}
+	// Apply through the already-open channel handles; each Fork makes its
+	// log a read-only branch point.
+	getLog := func(e forkPlanEntry) (*disk.Log, func(), error) {
+		return x.chans[e.Name].log, func() {}, nil
+	}
+	if err := applyForkPlan(x.root, plan, getLog); err != nil {
+		return nil, err
+	}
+	if err := removeForkPlan(x.root); err != nil {
+		return nil, err
+	}
+	childBranch := append(append([]string(nil), x.branch...), childName)
+	return Open(x.root, x.cfg, childBranch...)
+}
+
+// buildForkPlan computes the per-channel boundaries for a joint fork at
+// atMainLT. Empty channels are skipped (nothing to inherit). The main
+// channel is placed last so it is the commit point.
+func (x *XWAL) buildForkPlan(atMainLT uint64, childName, oldFutureName string) (forkPlan, error) {
+	if childName == "" || oldFutureName == "" || childName == oldFutureName {
+		return forkPlan{}, fmt.Errorf("xwal: fork needs distinct non-empty child and old-future names")
+	}
+	plan := forkPlan{AtMainLT: atMainLT, Child: childName, OldFuture: oldFutureName}
+	var mainEntry *forkPlanEntry
 	for _, name := range x.order {
 		ch := x.chans[name]
-		first := ch.log.FirstIndex()
-		if first == 0 {
-			plans = append(plans, plan{ch: ch, fork: false})
-			continue
+		if ch.log.FirstIndex() == 0 {
+			continue // empty channel: nothing to fork
 		}
 		var atIdx uint64
 		if name == x.main {
 			atIdx = atMainLT
-			last := ch.log.LastIndex()
+			first, last := ch.log.FirstIndex(), ch.log.LastIndex()
 			if atIdx <= first || atIdx > last+1 {
-				return nil, fmt.Errorf("xwal: fork main-LT %d out of range (%d, %d]", atIdx, first, last+1)
+				return forkPlan{}, fmt.Errorf("xwal: fork main-LT %d out of range (%d, %d]", atIdx, first, last+1)
 			}
 		} else {
 			b, err := x.boundaryFor(ch, atMainLT)
 			if err != nil {
-				return nil, err
+				return forkPlan{}, err
 			}
 			atIdx = b
 		}
-		plans = append(plans, plan{ch: ch, atIdx: atIdx, fork: true})
-	}
-
-	// Fork the main channel last: it is the commit point. If a related
-	// channel fork fails we have not yet diverged the main timeline.
-	ordered := make([]plan, 0, len(plans))
-	var mainPlan *plan
-	for i := range plans {
-		if plans[i].ch.name == x.main {
-			mainPlan = &plans[i]
+		entry := forkPlanEntry{Name: name, Dir: x.relDir(ch.dir), AtIdx: atIdx}
+		if name == x.main {
+			mainEntry = &entry
 			continue
 		}
-		ordered = append(ordered, plans[i])
+		plan.Channels = append(plan.Channels, entry)
 	}
-	if mainPlan != nil {
-		ordered = append(ordered, *mainPlan)
+	if mainEntry != nil {
+		plan.Channels = append(plan.Channels, *mainEntry)
 	}
+	return plan, nil
+}
 
-	for _, p := range ordered {
-		if !p.fork {
-			continue
+// applyForkPlan forks each planned channel that has not been forked yet.
+// It is idempotent: a channel whose child branch already exists is
+// skipped, so re-running a partially applied plan (recovery) completes it
+// without double-forking. getLog yields the log to fork and a cleanup.
+func applyForkPlan(root string, plan forkPlan, getLog func(forkPlanEntry) (*disk.Log, func(), error)) error {
+	for _, e := range plan.Channels {
+		childPath := filepath.Join(root, e.Dir, plan.Child)
+		if pathExists(childPath) {
+			continue // already forked
 		}
-		child, err := p.ch.log.Fork(p.atIdx, childName, oldFutureName)
+		l, done, err := getLog(e)
 		if err != nil {
-			return nil, fmt.Errorf("xwal: fork channel %q at %d: %w", p.ch.name, p.atIdx, err)
+			return fmt.Errorf("xwal: fork %q: open: %w", e.Name, err)
 		}
-		// We reopen the whole branch below; close this transient handle.
+		child, ferr := l.Fork(e.AtIdx, plan.Child, plan.OldFuture)
+		if ferr != nil {
+			done()
+			return fmt.Errorf("xwal: fork channel %q at %d: %w", e.Name, e.AtIdx, ferr)
+		}
 		child.Close()
+		done()
 	}
+	return nil
+}
 
-	childBranch := append(append([]string(nil), x.branch...), childName)
-	return Open(x.root, x.cfg, childBranch...)
+// recoverFork completes a fork that a sentinel says was interrupted. It
+// opens each channel fresh (the parent xwal is not open during recovery)
+// using the manifest to pick the codec and reducible fold.
+func recoverFork(root string, cfg Config, man manifest, plan forkPlan) error {
+	codec, err := codecByName(man.Codec)
+	if err != nil {
+		return err
+	}
+	kinds := map[string]manifestChannel{}
+	for _, mc := range man.Channels {
+		kinds[mc.Name] = mc
+	}
+	getLog := func(e forkPlanEntry) (*disk.Log, func(), error) {
+		mc, ok := kinds[e.Name]
+		if !ok {
+			return nil, nil, fmt.Errorf("channel %q not in manifest", e.Name)
+		}
+		opts := disk.Options{Codec: codec, SegmentSize: cfg.SegmentSize}
+		if mc.Kind == "reducible" {
+			r, ok := cfg.Registry[mc.Reducer]
+			if !ok || r.Reduce == nil {
+				return nil, nil, fmt.Errorf("no reducer %q for channel %q", mc.Reducer, e.Name)
+			}
+			opts.OnSegmentOpen = reducibleFold(r.Reduce, r.Initial)
+		}
+		l, err := disk.Open(filepath.Join(root, e.Dir), opts)
+		if err != nil {
+			return nil, nil, err
+		}
+		return l, func() { l.Close() }, nil
+	}
+	return applyForkPlan(root, plan, getLog)
+}
+
+func writeForkPlan(root string, plan forkPlan) error {
+	body, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		return err
+	}
+	final := filepath.Join(root, forkPendingName)
+	tmp := final + ".tmp"
+	if err := os.WriteFile(tmp, body, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, final)
+}
+
+func readForkPlan(root string) (forkPlan, bool, error) {
+	data, err := os.ReadFile(filepath.Join(root, forkPendingName))
+	if errors.Is(err, os.ErrNotExist) {
+		return forkPlan{}, false, nil
+	}
+	if err != nil {
+		return forkPlan{}, false, err
+	}
+	var p forkPlan
+	if err := json.Unmarshal(data, &p); err != nil {
+		return forkPlan{}, false, fmt.Errorf("xwal: parse fork sentinel: %w", err)
+	}
+	return p, true, nil
+}
+
+func removeForkPlan(root string) error {
+	return os.Remove(filepath.Join(root, forkPendingName))
+}
+
+// relDir returns a channel log dir relative to the xwal root.
+func (x *XWAL) relDir(dir string) string {
+	rel, err := filepath.Rel(x.root, dir)
+	if err != nil {
+		return dir
+	}
+	return rel
 }
 
 // boundaryFor returns the channel LT at which a related channel should

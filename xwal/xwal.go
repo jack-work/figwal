@@ -84,6 +84,7 @@ type channel struct {
 	name    string
 	kind    Kind
 	rname   string
+	dir     string
 	log     *disk.Log
 	reduce  ReduceFunc
 	initial []byte
@@ -116,6 +117,18 @@ func Open(dir string, cfg Config, branch ...string) (*XWAL, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Complete any interrupted joint fork before serving a branch, so the
+	// triune is never observed half-diverged.
+	if plan, pending, perr := readForkPlan(dir); perr != nil {
+		return nil, perr
+	} else if pending {
+		if err := recoverFork(dir, cfg, man, plan); err != nil {
+			return nil, fmt.Errorf("xwal: recover interrupted fork: %w", err)
+		}
+		if err := removeForkPlan(dir); err != nil {
+			return nil, err
+		}
+	}
 	codec, err := codecByName(man.Codec)
 	if err != nil {
 		return nil, err
@@ -145,11 +158,13 @@ func Open(dir string, cfg Config, branch ...string) (*XWAL, error) {
 		if ch.kind == ChannelReducible {
 			opts.OnSegmentOpen = reducibleFold(ch.reduce, ch.initial)
 		}
-		l, err := disk.Open(x.channelDir(mc.Name), opts)
+		cdir := x.channelDir(mc.Name)
+		l, err := disk.Open(cdir, opts)
 		if err != nil {
 			x.Close()
 			return nil, fmt.Errorf("xwal: open channel %q: %w", mc.Name, err)
 		}
+		ch.dir = cdir
 		ch.log = l
 		x.chans[mc.Name] = ch
 		x.order = append(x.order, mc.Name)
