@@ -186,6 +186,13 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	if l.opts.OnSegmentOpen != nil {
+		// Header-mode fork must re-establish a watermark on the new
+		// segments (state at atIdx-1), which requires the caller's fold.
+		// That is driven from the xwal layer; raw header-mode Fork is
+		// not yet supported here.
+		return nil, fmt.Errorf("Fork: header-mode (reducible) log fork must be driven by xwal")
+	}
 	if err := validateForkName(childName); err != nil {
 		return nil, err
 	}

@@ -51,6 +51,15 @@ type Options struct {
 	// resolve the parent. Use a Store if you need to deduplicate parent
 	// instances across many sibling forks.
 	Parent *Log
+	// OnSegmentOpen, if non-nil, puts the log in header mode: every
+	// segment leads with an opaque block-0 header that is not part of
+	// the index. It is invoked when a new segment is opened (the first
+	// one, and on each rotation) to compute that header from the
+	// previous segment's header (nil for the first) and the payloads of
+	// the segment just sealed (nil for the first). The returned bytes
+	// are stored verbatim; figwal never interprets them. Used by the
+	// reducible/watermark model — the fold lives in the caller.
+	OnSegmentOpen func(prevHeader []byte, sealed [][]byte) ([]byte, error)
 }
 
 type Log struct {
@@ -375,6 +384,43 @@ func (l *Log) Parent() *Log { return l.parent }
 // to its parent. Zero for a trunk.
 func (l *Log) ForkBase() uint64 { return l.forkBase }
 
+// HeaderAt returns the opaque block-0 header of the segment that holds
+// idx (the watermark, in reducible use). It walks the parent chain for
+// indices below this fork's range, mirroring Read. Returns nil for a
+// header-less log. The reducible read (state-at-idx) folds the entries
+// in [segment-base, idx] onto this header.
+func (l *Log) HeaderAt(idx uint64) ([]byte, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.parent != nil && idx < l.forkBase {
+		return l.parent.HeaderAt(idx)
+	}
+	if l.isEmptyLocked() {
+		return nil, ErrEmpty
+	}
+	s := l.findSegmentLocked(idx)
+	if s == nil {
+		return nil, ErrNotFound
+	}
+	return s.Header(), nil
+}
+
+// SegmentBaseIndexes returns the base (first owned) index of each of
+// this log's own segments, sealed then active, in order. It does not
+// walk the parent chain. Useful for locating watermark boundaries.
+func (l *Log) SegmentBaseIndexes() []uint64 {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	out := make([]uint64, 0, len(l.sealed)+1)
+	for _, s := range l.sealed {
+		out = append(out, s.BaseIndex())
+	}
+	if l.active != nil && l.active.Count() > 0 {
+		out = append(out, l.active.BaseIndex())
+	}
+	return out
+}
+
 // RangeOwn iterates over this log's own entries (does NOT walk the
 // parent chain), calling fn for each entry from the given index
 // forward. A read lock is held for the duration of the iteration so
@@ -437,6 +483,28 @@ func (l *Log) openActiveLocked(baseIndex uint64) error {
 	if err != nil {
 		return err
 	}
+	if l.opts.OnSegmentOpen != nil {
+		var prevHeader []byte
+		var sealed [][]byte
+		if n := len(l.sealed); n > 0 {
+			prev := l.sealed[n-1]
+			prevHeader = prev.Header()
+			sealed, err = segPayloads(prev)
+			if err != nil {
+				s.Close()
+				return err
+			}
+		}
+		header, herr := l.opts.OnSegmentOpen(prevHeader, sealed)
+		if herr != nil {
+			s.Close()
+			return herr
+		}
+		if err := s.WriteHeader(header); err != nil {
+			s.Close()
+			return err
+		}
+	}
 	// fsync the directory so the new dentry survives a crash.
 	if err := syncDir(l.dir); err != nil {
 		s.Close()
@@ -444,6 +512,20 @@ func (l *Log) openActiveLocked(baseIndex uint64) error {
 	}
 	l.active = s
 	return nil
+}
+
+// segPayloads reads every entry payload of a segment in index order.
+func segPayloads(s *segment.Segment) ([][]byte, error) {
+	n := s.Count()
+	out := make([][]byte, 0, n)
+	for i := uint64(0); i < n; i++ {
+		p, err := s.ReadIndex(i)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, nil
 }
 
 func (l *Log) rotateLocked(baseIndex uint64) error {
@@ -570,14 +652,27 @@ func (l *Log) loadSegments() error {
 	for i, base := range bases {
 		path := filepath.Join(l.dir, l.segName(base))
 		isLast := i == len(bases)-1
+		headered := l.opts.OnSegmentOpen != nil
 		if isLast {
-			s, err := segment.Open(path, l.codec, base, l.opts.SegmentSize)
+			var s *segment.Segment
+			var err error
+			if headered {
+				s, err = segment.OpenHeadered(path, l.codec, base, l.opts.SegmentSize)
+			} else {
+				s, err = segment.Open(path, l.codec, base, l.opts.SegmentSize)
+			}
 			if err != nil {
 				return fmt.Errorf("open active segment %d: %w", base, err)
 			}
 			l.active = s
 		} else {
-			s, err := segment.OpenReadOnly(path, l.codec, base)
+			var s *segment.Segment
+			var err error
+			if headered {
+				s, err = segment.OpenReadOnlyHeadered(path, l.codec, base)
+			} else {
+				s, err = segment.OpenReadOnly(path, l.codec, base)
+			}
 			if err != nil {
 				return fmt.Errorf("open sealed segment %d: %w", base, err)
 			}

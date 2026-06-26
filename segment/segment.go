@@ -28,6 +28,13 @@ type Segment struct {
 	count     uint64
 	offsets   []int64
 	readOnly  bool
+	// hasHeader marks the segment as carrying an opaque block-0 header
+	// (a watermark, in reducible use). The header is framed like any
+	// other record but is not counted in the index: baseIndex/count/
+	// offsets describe the entries that follow it. header caches the
+	// decoded header payload.
+	hasHeader bool
+	header    []byte
 }
 
 func Create(path string, codec SegmentCodec, baseIndex uint64, maxSize int64) (*Segment, error) {
@@ -52,6 +59,16 @@ func Create(path string, codec SegmentCodec, baseIndex uint64, maxSize int64) (*
 // Open opens an existing segment for read and write. Any torn tail
 // (partial frame at end of file) is truncated.
 func Open(path string, codec SegmentCodec, baseIndex uint64, maxSize int64) (*Segment, error) {
+	return openRW(path, codec, baseIndex, maxSize, false)
+}
+
+// OpenHeadered is Open for a segment whose first record is an opaque
+// block-0 header (see Segment.hasHeader / WriteHeader).
+func OpenHeadered(path string, codec SegmentCodec, baseIndex uint64, maxSize int64) (*Segment, error) {
+	return openRW(path, codec, baseIndex, maxSize, true)
+}
+
+func openRW(path string, codec SegmentCodec, baseIndex uint64, maxSize int64, hasHeader bool) (*Segment, error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0644)
 	if err != nil {
 		return nil, err
@@ -62,6 +79,7 @@ func Open(path string, codec SegmentCodec, baseIndex uint64, maxSize int64) (*Se
 		codec:     codec,
 		baseIndex: baseIndex,
 		maxSize:   maxSize,
+		hasHeader: hasHeader,
 	}
 	if err := s.recover(); err != nil {
 		f.Close()
@@ -74,6 +92,15 @@ func Open(path string, codec SegmentCodec, baseIndex uint64, maxSize int64) (*Se
 // scanned to populate the entry index, but a torn tail is left intact
 // on disk; Append on the returned Segment returns ErrReadOnly.
 func OpenReadOnly(path string, codec SegmentCodec, baseIndex uint64) (*Segment, error) {
+	return openRO(path, codec, baseIndex, false)
+}
+
+// OpenReadOnlyHeadered is OpenReadOnly for a headered segment.
+func OpenReadOnlyHeadered(path string, codec SegmentCodec, baseIndex uint64) (*Segment, error) {
+	return openRO(path, codec, baseIndex, true)
+}
+
+func openRO(path string, codec SegmentCodec, baseIndex uint64, hasHeader bool) (*Segment, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY, 0644)
 	if err != nil {
 		return nil, err
@@ -84,6 +111,7 @@ func OpenReadOnly(path string, codec SegmentCodec, baseIndex uint64) (*Segment, 
 		codec:     codec,
 		baseIndex: baseIndex,
 		readOnly:  true,
+		hasHeader: hasHeader,
 	}
 	if err := s.recover(); err != nil {
 		f.Close()
@@ -103,7 +131,16 @@ func (s *Segment) recover() error {
 		return err
 	}
 	off := int64(0)
+	first := true
+	headerEnd := int64(0)
 	err := s.codec.ScanFrames(s.f, func(frameOff int64, frameLen int) error {
+		if s.hasHeader && first {
+			first = false
+			headerEnd = frameOff + int64(frameLen)
+			off = headerEnd
+			return nil
+		}
+		first = false
 		s.offsets = append(s.offsets, frameOff)
 		off = frameOff + int64(frameLen)
 		s.count++
@@ -113,6 +150,13 @@ func (s *Segment) recover() error {
 		return err
 	}
 	s.size = off
+	if s.hasHeader && headerEnd > 0 {
+		payload, _, herr := s.codec.ReadFrame(s.f, 0, headerEnd)
+		if herr != nil {
+			return herr
+		}
+		s.header = payload
+	}
 	fi, err := s.f.Stat()
 	if err != nil {
 		return err
@@ -167,6 +211,42 @@ func (s *Segment) Append(payload []byte) (offset int64, err error) {
 	s.count++
 	return offset, nil
 }
+
+// WriteHeader writes the opaque block-0 header. It must be called on a
+// fresh segment before any Append (the header occupies offset 0). The
+// header is framed by the codec like a record but is never counted in
+// the entry index, so reads and indices are identical to a header-less
+// segment. The framed index is a fixed sentinel (0).
+func (s *Segment) WriteHeader(payload []byte) error {
+	if s.readOnly {
+		return ErrReadOnly
+	}
+	if s.size != 0 || s.count != 0 {
+		return fmt.Errorf("WriteHeader: segment not empty (size=%d count=%d)", s.size, s.count)
+	}
+	frame, err := s.codec.Frame(0, payload)
+	if err != nil {
+		return err
+	}
+	n, err := s.f.WriteAt(frame, 0)
+	if err != nil {
+		return err
+	}
+	if n != len(frame) {
+		return fmt.Errorf("short write: %d/%d", n, len(frame))
+	}
+	s.size = int64(n)
+	s.hasHeader = true
+	s.header = append([]byte(nil), payload...)
+	return nil
+}
+
+// Header returns the opaque block-0 header payload, or nil if the
+// segment has none.
+func (s *Segment) Header() []byte { return s.header }
+
+// HasHeader reports whether the segment carries a block-0 header.
+func (s *Segment) HasHeader() bool { return s.hasHeader }
 
 // ReadAt reads the entry at the given file offset, which must be a known
 // entry boundary. This is the offset-based debug path; ReadIndex is the
