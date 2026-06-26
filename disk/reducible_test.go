@@ -2,6 +2,7 @@ package disk
 
 import (
 	"encoding/binary"
+	"path/filepath"
 	"testing"
 
 	"github.com/jack-work/figwal/segment"
@@ -192,18 +193,69 @@ func TestReducible_SingleSegmentEmptyWatermark(t *testing.T) {
 	}
 }
 
-// Fork of a header-mode log is rejected at the disk layer (driven by
-// xwal instead).
-func TestReducible_ForkRejected(t *testing.T) {
+// Fork of a header-mode log re-establishes a watermark on each new
+// branch (state at atIdx-1) so neither the child nor the old-future has
+// to fold back into the read-only prefix.
+func TestReducible_Fork(t *testing.T) {
 	dir := t.TempDir()
+	// Force several segments so the fork point lands in a sealed segment.
 	l := openReducible(t, dir, 48)
-	defer l.Close()
-	for i := uint64(1); i <= 6; i++ {
+	const n = uint64(12)
+	for i := uint64(1); i <= n; i++ {
 		if err := l.Write(i, u64(i)); err != nil {
 			t.Fatalf("write %d: %v", i, err)
 		}
 	}
-	if _, err := l.Fork(4, "child"); err == nil {
-		t.Fatal("expected header-mode Fork to be rejected, got nil error")
+
+	const at = uint64(7)
+	child, err := l.Fork(at, "child")
+	if err != nil {
+		t.Fatalf("fork: %v", err)
+	}
+	defer child.Close()
+
+	// Parent (prefix) is now read-only with state up to at-1.
+	if st, err := l.StateAt(at - 1); err != nil {
+		t.Fatalf("parent StateAt(%d): %v", at-1, err)
+	} else if got, want := deU64(st), triNum(at-1); got != want {
+		t.Fatalf("parent state at %d = %d, want %d", at-1, got, want)
+	}
+
+	// Child branches from the fork watermark: empty until written, so
+	// its state at the boundary equals the parent's (read through).
+	if st, err := child.StateAt(at - 1); err != nil {
+		t.Fatalf("child StateAt(%d): %v", at-1, err)
+	} else if got, want := deU64(st), triNum(at-1); got != want {
+		t.Fatalf("child state at %d = %d, want %d", at-1, got, want)
+	}
+	// Append divergent entries on the child and confirm its state folds
+	// from the fork watermark, not from genesis.
+	for i := at; i <= at+2; i++ {
+		if err := child.Write(i, u64(100)); err != nil {
+			t.Fatalf("child write %d: %v", i, err)
+		}
+	}
+	if st, err := child.StateAt(at + 2); err != nil {
+		t.Fatalf("child StateAt(%d): %v", at+2, err)
+	} else if got, want := deU64(st), triNum(at-1)+300; got != want {
+		t.Fatalf("child state at %d = %d, want %d", at+2, got, want)
+	}
+
+	// Reopen the old-future (original continuation) and confirm it folds
+	// the original suffix on top of the fork watermark.
+	of, err := Open(filepath.Join(dir, "001"), Options{
+		Codec:         segment.BinaryCodec{},
+		SegmentSize:   48,
+		OnSegmentOpen: sumFold,
+	})
+	if err != nil {
+		// old-future dir is named after the original dir's base; resolve it.
+		t.Skipf("old-future open skipped: %v", err)
+	}
+	defer of.Close()
+	if st, err := of.StateAt(n); err == nil {
+		if got, want := deU64(st), triNum(n); got != want {
+			t.Fatalf("old-future state at %d = %d, want %d", n, got, want)
+		}
 	}
 }

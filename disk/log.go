@@ -405,6 +405,41 @@ func (l *Log) HeaderAt(idx uint64) ([]byte, error) {
 	return s.Header(), nil
 }
 
+// StateAt reconstructs the reducible state at idx for a header-mode log:
+// the watermark (block-0 header) of idx's segment folded — via the
+// OnSegmentOpen callback — with that segment's entries up to and
+// including idx. It walks the parent chain for indices below this fork's
+// range, mirroring Read. Returns an error if the log is not in header
+// mode, or ErrNotFound for a missing idx.
+func (l *Log) StateAt(idx uint64) ([]byte, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.stateAtLocked(idx)
+}
+
+func (l *Log) stateAtLocked(idx uint64) ([]byte, error) {
+	if l.opts.OnSegmentOpen == nil {
+		return nil, fmt.Errorf("StateAt: log %q is not in header mode", l.dir)
+	}
+	if l.parent != nil && idx < l.forkBase {
+		return l.parent.StateAt(idx)
+	}
+	s := l.findSegmentLocked(idx)
+	if s == nil {
+		return nil, ErrNotFound
+	}
+	base := s.BaseIndex()
+	sealed := make([][]byte, 0, idx-base+1)
+	for i := base; i <= idx; i++ {
+		p, err := s.ReadIndex(i - base)
+		if err != nil {
+			return nil, err
+		}
+		sealed = append(sealed, p)
+	}
+	return l.opts.OnSegmentOpen(s.Header(), sealed)
+}
+
 // SegmentBaseIndexes returns the base (first owned) index of each of
 // this log's own segments, sealed then active, in order. It does not
 // walk the parent chain. Useful for locating watermark boundaries.

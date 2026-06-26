@@ -186,13 +186,6 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if l.opts.OnSegmentOpen != nil {
-		// Header-mode fork must re-establish a watermark on the new
-		// segments (state at atIdx-1), which requires the caller's fold.
-		// That is driven from the xwal layer; raw header-mode Fork is
-		// not yet supported here.
-		return nil, fmt.Errorf("Fork: header-mode (reducible) log fork must be driven by xwal")
-	}
 	if err := validateForkName(childName); err != nil {
 		return nil, err
 	}
@@ -241,6 +234,21 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 		}
 		l.sealed = append(l.sealed, l.active)
 		l.active = nil
+	}
+
+	// Header (reducible) mode: the new branches need a fresh watermark
+	// at the fork boundary (state at atIdx-1), because the prefix is
+	// read-only and neither the child nor the old-future should have to
+	// fold back into it. Computed once here, while the log is intact,
+	// via the same fold the log uses on rotation.
+	var forkWatermark []byte
+	headerMode := l.opts.OnSegmentOpen != nil
+	if headerMode {
+		w, werr := l.stateAtLocked(atIdx - 1)
+		if werr != nil {
+			return nil, fmt.Errorf("fork watermark at %d: %w", atIdx-1, werr)
+		}
+		forkWatermark = w
 	}
 
 	// Classify each sealed segment relative to atIdx.
@@ -295,6 +303,27 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 		return nil, rollbackPending(err)
 	}
 
+	// In header mode, seed the child with a header-only first segment
+	// carrying the fork watermark, so its first append builds on the
+	// fork-point state rather than an empty one. The whole-moved
+	// segments already carry their own watermarks; the split suffix got
+	// the watermark above.
+	if headerMode {
+		childSeg, err := segment.Create(filepath.Join(newForkDir, l.segName(atIdx)), l.codec, atIdx, l.opts.SegmentSize)
+		if err != nil {
+			return nil, rollbackPending(err)
+		}
+		if err := childSeg.WriteHeader(forkWatermark); err != nil {
+			childSeg.Close()
+			return nil, rollbackPending(err)
+		}
+		if err := childSeg.Sync(); err != nil {
+			childSeg.Close()
+			return nil, rollbackPending(err)
+		}
+		childSeg.Close()
+	}
+
 	// Split the boundary segment if one exists.
 	var prefixReplacement *segment.Segment
 	for i, s := range l.sealed {
@@ -308,6 +337,15 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 		prefix, err := segment.Create(prefixTmp, l.codec, s.BaseIndex(), 0)
 		if err != nil {
 			return nil, rollbackPending(err)
+		}
+		// The prefix keeps the boundary segment's original watermark
+		// (same starting state); the suffix begins a new branch from the
+		// fork watermark (state at atIdx-1).
+		if headerMode {
+			if err := prefix.WriteHeader(s.Header()); err != nil {
+				prefix.Close()
+				return nil, rollbackPending(err)
+			}
 		}
 		boundaryLocalCut := atIdx - s.BaseIndex()
 		for j := uint64(0); j < boundaryLocalCut; j++ {
@@ -330,6 +368,12 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 		suffix, err := segment.Create(suffixPath, l.codec, atIdx, 0)
 		if err != nil {
 			return nil, rollbackPending(err)
+		}
+		if headerMode {
+			if err := suffix.WriteHeader(forkWatermark); err != nil {
+				suffix.Close()
+				return nil, rollbackPending(err)
+			}
 		}
 		for j := boundaryLocalCut; j < s.Count(); j++ {
 			payload, rerr := s.ReadIndex(j)
@@ -357,7 +401,12 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 		}
 		// Reopen the new prefix as the readOnly segment that will
 		// remain in this Log's sealed list.
-		reopen, err := segment.OpenReadOnly(prefixPath, l.codec, s.BaseIndex())
+		var reopen *segment.Segment
+		if headerMode {
+			reopen, err = segment.OpenReadOnlyHeadered(prefixPath, l.codec, s.BaseIndex())
+		} else {
+			reopen, err = segment.OpenReadOnly(prefixPath, l.codec, s.BaseIndex())
+		}
 		if err != nil {
 			return nil, rollbackPending(err)
 		}
