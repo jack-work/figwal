@@ -254,7 +254,7 @@ func runXWAL(args []string) {
 		}
 		m := uint64(mainLT)
 		if mainLT < 0 {
-			m = mainTail(x)
+			m = defaultMainLT(x, ch)
 		}
 		lt, err := x.Append(ch, m, []byte(pos[1]))
 		check(err)
@@ -312,6 +312,21 @@ func mainTail(x *xwal.XWAL) uint64 {
 		}
 	}
 	return 0
+}
+
+// defaultMainLT picks the main-lt to tag an entry with when none is
+// given. A reducible channel (e.g. chalkboard) records state for the
+// turn about to happen, so it defaults one ahead (mainTail+1). A log
+// channel (e.g. translations) is a projection of an entry that already
+// exists, so it defaults to the current tail. Always overridable with
+// --main-lt.
+func defaultMainLT(x *xwal.XWAL, channel string) uint64 {
+	for _, c := range x.Channels() {
+		if c.Name == channel && c.Kind == xwal.ChannelReducible {
+			return mainTail(x) + 1
+		}
+	}
+	return mainTail(x)
 }
 
 func branchParts(s string) []string {
