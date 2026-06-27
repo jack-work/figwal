@@ -85,6 +85,16 @@ func (x *XWAL) buildForkPlan(atMainLT uint64, childName, oldFutureName string) (
 		if ch.log.FirstIndex() == 0 {
 			continue // empty channel: nothing to fork
 		}
+		// A fork child whose OWN log is empty (no entries appended since
+		// its own fork base) has nothing to split — its LastIndex is
+		// forkBase-1. Skip it; the new child keeps inheriting this channel
+		// from the ancestor chain (reads resolve through the parent, and a
+		// later write lazily creates the child's own branch). Without this
+		// a multi-level fork would try to split an empty own-log and fail
+		// ("cannot fork empty log").
+		if fb := ch.log.ForkBase(); fb > 0 && ch.log.LastIndex() < fb {
+			continue
+		}
 		var atIdx uint64
 		if name == x.main {
 			atIdx = atMainLT
