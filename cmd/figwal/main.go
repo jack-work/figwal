@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -283,9 +284,79 @@ func runXWAL(args []string) {
 		check(err)
 		child.Close()
 		fmt.Printf("forked @main-lt %d -> new branch %q, original continuation %q\n", at, pos[1], pos[2])
+	case "dump":
+		dumpXWAL(x)
+	case "branches", "tree":
+		printBranches(dir, x.Main())
 	default:
 		usageXWAL()
 	}
+}
+
+// dumpXWAL prints every channel's full contents for this branch — the
+// joint view of all the trees at a glance. Log channels list each entry
+// (channelLT, its main-lt, payload); a reducible channel also shows its
+// folded state at the tail.
+func dumpXWAL(x *xwal.XWAL) {
+	br := branchJoin(x.Branch())
+	if br == "" {
+		br = "(trunk)"
+	}
+	fmt.Printf("xwal branch=%s main=%s\n", br, x.Main())
+	for _, c := range x.Channels() {
+		fmt.Printf("\n== %s (%s)  first=%d last=%d ==\n", c.Name, c.Kind, c.First, c.Last)
+		if c.First == 0 || c.Last < c.First {
+			fmt.Println("  (empty — inherited from ancestor)")
+			continue
+		}
+		if c.Kind == xwal.ChannelReducible {
+			if st, err := x.StateAt(c.Name, c.Last); err == nil {
+				fmt.Printf("  state@%d = %s\n", c.Last, string(st))
+			}
+		}
+		for lt := c.First; lt <= c.Last; lt++ {
+			m, p, err := x.Read(c.Name, lt)
+			if err != nil {
+				fmt.Printf("  [%d] <err: %v>\n", lt, err)
+				continue
+			}
+			fmt.Printf("  [%d] main=%d  %s\n", lt, m, displayPayload(p))
+		}
+	}
+}
+
+// printBranches walks the fork tree under the main channel and prints
+// every branch path (a directory chain of fork names). Branch points —
+// dirs that have fork children — are flagged. Address any branch with
+// --branch <path>.
+func printBranches(dir, main string) {
+	fmt.Printf("fork tree under main channel %q (address with --branch):\n", main)
+	var walk func(d string, chain []string)
+	walk = func(d string, chain []string) {
+		ents, err := os.ReadDir(d)
+		if err != nil {
+			return
+		}
+		var kids []string
+		for _, e := range ents {
+			if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+				kids = append(kids, e.Name())
+			}
+		}
+		label := "(trunk)"
+		if len(chain) > 0 {
+			label = strings.Repeat("  ", len(chain)) + branchJoin(chain)
+		}
+		marker := ""
+		if len(kids) > 0 {
+			marker = "  [branch point, read-only]"
+		}
+		fmt.Printf("  %s%s\n", label, marker)
+		for _, k := range kids {
+			walk(filepath.Join(d, k), append(append([]string(nil), chain...), k))
+		}
+	}
+	walk(filepath.Join(dir, main), nil)
 }
 
 func printXWALInfo(x *xwal.XWAL) {
@@ -426,6 +497,8 @@ func usageXWAL() {
   append <channel> <data>         append to a channel (main-lt defaults to main tail)
   read   <channel> <channelLT>    read one entry (shows its main-lt)
   state  <channel> <channelLT>    fold a reducible channel to channelLT
+  dump                            full contents of every channel for this branch
+  branches                        the fork tree under the main channel (alias: tree)
   fork   <atMainLT> <newName> <origName>   joint-fork every channel; <newName>
                                   is the new branch, <origName> the original
                                   continuation. Address either with --branch.

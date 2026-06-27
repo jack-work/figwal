@@ -6,3 +6,6 @@
 /conv
 /demo
 /figwal
+
+# nix devshell build output
+/.devbin
