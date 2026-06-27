@@ -205,10 +205,9 @@ func runXWAL(args []string) {
 		if !seen {
 			cfg.Channels = append([]xwal.ChannelSpec{{Name: main, Kind: xwal.ChannelLog}}, cfg.Channels...)
 		}
-		x, err := xwal.Open(dir, cfg)
+		_, root, err := xwal.CreateForest(dir, cfg)
 		check(err)
-		x.Close()
-		fmt.Printf("initialized xwal %s (main=%s)\n", dir, main)
+		fmt.Printf("initialized xwal %s (main=%s, root trunk=%s)\n", dir, main, root)
 		return
 	}
 
@@ -228,6 +227,74 @@ func runXWAL(args []string) {
 	}
 
 	cfg := xwal.Config{Registry: registry(), SegmentSize: segSize}
+
+	// Trunk-level verbs — these mirror figaro (a trunk is the addressable
+	// handle; appending at an interior LT forks). They operate on the joint
+	// forest, never on a raw branch.
+	switch cmd {
+	case "send":
+		if len(pos) != 2 {
+			usageXWAL()
+		}
+		trunk, at := parseTrunkLT(pos[0])
+		f, err := xwal.OpenForest(dir, cfg)
+		check(err)
+		res, lt, err := f.Append(trunk, at, []byte(pos[1]), nil)
+		check(err)
+		if res == trunk {
+			fmt.Printf("appended to trunk %s @ main-lt %d\n", trunk, lt)
+		} else {
+			fmt.Printf("forked trunk %s -> new trunk %s @ main-lt %d (existing trunk retained)\n", trunk, res, lt)
+		}
+		return
+	case "fork":
+		if len(pos) != 1 {
+			usageXWAL()
+		}
+		f, err := xwal.OpenForest(dir, cfg)
+		check(err)
+		alt, err := f.ForkTail(pos[0])
+		check(err)
+		fmt.Printf("fork-tail %s -> trunk %s continues (new head), new alternative trunk %s\n", pos[0], pos[0], alt)
+		return
+	case "set":
+		if len(pos) != 2 {
+			usageXWAL()
+		}
+		f, err := xwal.OpenForest(dir, cfg)
+		check(err)
+		m := uint64(0)
+		if mainLT >= 0 {
+			m = uint64(mainLT)
+		}
+		lt, err := f.AppendChannel(pos[0], "chalkboard", m, []byte(pos[1]), nil)
+		check(err)
+		fmt.Printf("set on trunk %s -> chalkboard @%d\n", pos[0], lt)
+		return
+	case "trunks":
+		f, err := xwal.OpenForest(dir, cfg)
+		check(err)
+		printTrunks(f)
+		return
+	case "nodes":
+		f, err := xwal.OpenForest(dir, cfg)
+		check(err)
+		printNodes(f)
+		return
+	case "dump":
+		if len(pos) == 1 { // dump a trunk (by id)
+			f, err := xwal.OpenForest(dir, cfg)
+			check(err)
+			x, _, err := f.Head(pos[0])
+			check(err)
+			defer x.Close()
+			fmt.Printf("trunk %s (head node):\n", pos[0])
+			dumpXWAL(x)
+			return
+		}
+	}
+
+	// Raw branch-level verbs — low-level poking, addressed by --branch.
 	x, err := xwal.Open(dir, cfg, branchParts(branch)...)
 	check(err)
 	defer x.Close()
@@ -275,15 +342,6 @@ func runXWAL(args []string) {
 		check(err)
 		os.Stdout.Write(st)
 		fmt.Println()
-	case "fork":
-		if len(pos) != 3 {
-			usageXWAL()
-		}
-		at := mustU64(pos[0])
-		child, err := x.Fork(at, pos[1], pos[2])
-		check(err)
-		child.Close()
-		fmt.Printf("forked @main-lt %d -> new branch %q, original continuation %q\n", at, pos[1], pos[2])
 	case "dump":
 		dumpXWAL(x)
 	case "branches", "tree":
@@ -291,6 +349,61 @@ func runXWAL(args []string) {
 	default:
 		usageXWAL()
 	}
+}
+
+// parseTrunkLT splits "trunk" or "trunk:LT". No ":" means LT 0 (append at
+// the trunk tail).
+func parseTrunkLT(s string) (string, uint64) {
+	trunk, ltStr, ok := strings.Cut(s, ":")
+	if !ok || ltStr == "" {
+		return trunk, 0
+	}
+	return trunk, mustU64(ltStr)
+}
+
+func printTrunks(f *xwal.Forest) {
+	fmt.Printf("  %-6s %-8s %-8s %5s %-10s %s\n", "TRUNK", "VECTOR", "PARENT", "TIP", "HEAD", "BRANCHED")
+	for _, t := range f.Trunks() {
+		fmt.Printf("  %-6s %-8s %-8s %5d %-10s %s\n",
+			t.ID, vec(t.Vector), dash(t.Parent), t.Tip, t.Head, branchedAt(t.BranchedLT))
+	}
+}
+
+func printNodes(f *xwal.Forest) {
+	fmt.Printf("  %-6s %-8s %-6s %-7s %-8s %s\n", "NODE", "VECTOR", "TRUNK", "FROZEN", "PARENT", "BRANCH")
+	for _, n := range f.Nodes() {
+		fr := ""
+		if n.Frozen {
+			fr = "frozen"
+		}
+		fmt.Printf("  %-6s %-8s %-6s %-7s %-8s %s\n",
+			n.ID, vec(n.Vector), n.Trunk, fr, dash(n.Parent), branchJoin(n.Branch))
+	}
+}
+
+func vec(v []int) string {
+	if len(v) == 0 {
+		return "-"
+	}
+	parts := make([]string, len(v))
+	for i, n := range v {
+		parts[i] = strconv.Itoa(n)
+	}
+	return strings.Join(parts, ".")
+}
+
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func branchedAt(lt uint64) string {
+	if lt == 0 {
+		return "-"
+	}
+	return "@" + strconv.FormatUint(lt, 10)
 }
 
 // dumpXWAL prints every channel's full contents for this branch — the
@@ -488,20 +601,25 @@ func usageLog() {
 }
 
 func usageXWAL() {
-	fmt.Fprintln(os.Stderr, `figwal xwal <command> <dir> [args]   [--branch p] [--main-lt N] [--seg-size N]
-  init <main> <ch[:reducer]>... [--codec jsonl|binary]
-                                  create; e.g. init ./c ir translations chalkboard:jsonmerge
-                                  (jsonl, the default, stores readable frames + watermarks)
-  info                            channels, kinds, bounds (alias: channels)
-  appendmain <data>               append a main-timeline entry
-  append <channel> <data>         append to a channel (main-lt defaults to main tail)
-  read   <channel> <channelLT>    read one entry (shows its main-lt)
-  state  <channel> <channelLT>    fold a reducible channel to channelLT
-  dump                            full contents of every channel for this branch
-  branches                        the fork tree under the main channel (alias: tree)
-  fork   <atMainLT> <newName> <origName>   joint-fork every channel; <newName>
-                                  is the new branch, <origName> the original
-                                  continuation. Address either with --branch.
+	fmt.Fprintln(os.Stderr, `figwal xwal <command> <dir> [args]
+
+trunk verbs (mirror figaro — a trunk is the addressable handle; no attendance):
+  init <main> <ch[:reducer]>...   create the forest; e.g.
+                                  init ./c ir translations chalkboard:jsonmerge
+                                  [--codec jsonl|binary]  (prints the root trunk id)
+  send  <trunk>[:<LT>] <data>     append to a trunk; <LT> < tail FORKS a new trunk
+                                  there and appends (existing trunk retained), else
+                                  appends at the tail
+  fork  <trunk>                   tail-only: bisect the present (trunk continues on a
+                                  new head; a new alternative trunk is founded)
+  set   <trunk> <patch>           append a chalkboard patch to a trunk [--main-lt N]
+  trunks                          list trunks (TRUNK VECTOR PARENT TIP HEAD BRANCHED)
+  dump  <trunk>                   full contents of a trunk's head across all channels
+  nodes                           the raw node tree (debug)
+
+raw branch verbs (low-level, addressed by --branch [--main-lt N] [--seg-size N]):
+  info | appendmain <data> | append <channel> <data> | read <channel> <chLT> |
+  state <channel> <chLT> | dump | branches
 reducers: jsonmerge ({"set":{...},"remove":[...]} over a flat JSON object)`)
 	os.Exit(2)
 }
