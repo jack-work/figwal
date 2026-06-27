@@ -21,14 +21,15 @@
       });
 
       # `nix develop` builds the CLI from the working tree (so it tracks
-      # uncommitted changes) and puts `figwal` on PATH. Play with a joint
-      # xwal of multiple trees:
-      #   figwal xwal init ./demo ir translations chalkboard:jsonmerge
-      #   figwal xwal appendmain ./demo "hello"
-      #   figwal xwal append    ./demo chalkboard '{"set":{"mantra":"x"}}'
-      #   figwal xwal fork ./demo 2 alt orig
-      #   figwal xwal dump ./demo --branch alt
-      #   figwal xwal branches ./demo
+      # uncommitted changes) and puts `figwal` on PATH. Drive trunks (the
+      # figaro-mirroring interface):
+      #   figwal xwal init ./demo ir translations chalkboard:map   # -> root trunk t0
+      #   figwal xwal send  ./demo t0 '"hello"'
+      #   figwal xwal set   ./demo t0 mantra root
+      #   figwal xwal set   ./demo t0 system.tags.42 '{"cache":"x"}'
+      #   figwal xwal send  ./demo t0 '"more"'
+      #   figwal xwal send  ./demo t0:2 '"alt"'   # interior fork -> new trunk t1
+      #   figwal xwal trunks ./demo ; figwal xwal dump ./demo t1
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
           packages = [ pkgs.go pkgs.gopls ];

@@ -166,7 +166,7 @@ func recoverFork(root string, cfg Config, man manifest, plan forkPlan) error {
 		}
 		opts := disk.Options{Codec: codec, SegmentSize: cfg.SegmentSize}
 		if mc.Kind == "reducible" {
-			r, ok := cfg.Registry[mc.Reducer]
+			r, ok := resolveReducer(cfg, mc.Reducer)
 			if !ok || r.Reduce == nil {
 				return nil, nil, fmt.Errorf("no reducer %q for channel %q", mc.Reducer, e.Name)
 			}

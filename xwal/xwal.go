@@ -165,7 +165,7 @@ func Open(dir string, cfg Config, branch ...string) (*XWAL, error) {
 		switch mc.Kind {
 		case "reducible":
 			ch.kind = ChannelReducible
-			r, ok := cfg.Registry[mc.Reducer]
+			r, ok := resolveReducer(cfg, mc.Reducer)
 			if !ok || r.Reduce == nil {
 				return nil, fmt.Errorf("xwal: no reducer %q registered for channel %q", mc.Reducer, mc.Name)
 			}
@@ -371,7 +371,7 @@ func (x *XWAL) AddChannel(spec ChannelSpec) error {
 	}
 	ch := &channel{name: spec.Name, kind: spec.Kind, rname: spec.Reducer}
 	if spec.Kind == ChannelReducible {
-		r, ok := x.cfg.Registry[spec.Reducer]
+		r, ok := resolveReducer(x.cfg, spec.Reducer)
 		if !ok || r.Reduce == nil {
 			return fmt.Errorf("xwal: no reducer %q registered for channel %q", spec.Reducer, spec.Name)
 		}

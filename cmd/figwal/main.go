@@ -258,19 +258,47 @@ func runXWAL(args []string) {
 		fmt.Printf("fork-tail %s -> trunk %s continues (new head), new alternative trunk %s\n", pos[0], pos[0], alt)
 		return
 	case "set":
+		// set <trunk> <dot.path> <value>  — value is JSON, or a bare string
+		// is auto-quoted. Builds a native nested-map patch (validated).
+		if len(pos) != 3 {
+			usageXWAL()
+		}
+		f, err := xwal.OpenForest(dir, cfg)
+		check(err)
+		ch := reducibleChannel(f, pos[0])
+		patch, err := xwal.MapSetPatch(splitPath(pos[1]), jsonOrString(pos[2]))
+		check(err)
+		lt, err := f.AppendChannel(pos[0], ch, setMainLT(mainLT), patch, nil)
+		check(err)
+		fmt.Printf("set %s on trunk %s -> %s @%d\n", pos[1], pos[0], ch, lt)
+		return
+	case "unset":
 		if len(pos) != 2 {
 			usageXWAL()
 		}
 		f, err := xwal.OpenForest(dir, cfg)
 		check(err)
-		m := uint64(0)
-		if mainLT >= 0 {
-			m = uint64(mainLT)
-		}
-		lt, err := f.AppendChannel(pos[0], "chalkboard", m, []byte(pos[1]), nil)
+		ch := reducibleChannel(f, pos[0])
+		patch, err := xwal.MapRemovePatch(splitPath(pos[1]))
 		check(err)
-		fmt.Printf("set on trunk %s -> chalkboard @%d\n", pos[0], lt)
+		lt, err := f.AppendChannel(pos[0], ch, setMainLT(mainLT), patch, nil)
+		check(err)
+		fmt.Printf("unset %s on trunk %s -> %s @%d\n", pos[1], pos[0], ch, lt)
 		return
+	case "state":
+		if len(pos) == 1 { // trunk-level folded reducible state
+			f, err := xwal.OpenForest(dir, cfg)
+			check(err)
+			x, _, err := f.Head(pos[0])
+			check(err)
+			defer x.Close()
+			ch, last := reducibleBounds(x)
+			st, err := x.StateAt(ch, last)
+			check(err)
+			os.Stdout.Write(st)
+			fmt.Println()
+			return
+		}
 	case "trunks":
 		f, err := xwal.OpenForest(dir, cfg)
 		check(err)
@@ -404,6 +432,50 @@ func branchedAt(lt uint64) string {
 		return "-"
 	}
 	return "@" + strconv.FormatUint(lt, 10)
+}
+
+// splitPath turns a dot path ("system.tags.42") into segments.
+func splitPath(s string) []string { return strings.Split(s, ".") }
+
+// jsonOrString returns the arg as raw JSON if it parses, else as a quoted
+// JSON string (so `set t0 mantra root` works without manual quoting).
+func jsonOrString(s string) json.RawMessage {
+	if json.Valid([]byte(s)) {
+		return json.RawMessage(s)
+	}
+	b, _ := json.Marshal(s)
+	return b
+}
+
+// setMainLT maps the --main-lt flag (or its absence) to the AppendChannel
+// main-LT arg: 0 means "default one ahead" (the reducible convention).
+func setMainLT(flag int64) uint64 {
+	if flag >= 0 {
+		return uint64(flag)
+	}
+	return 0
+}
+
+// reducibleChannel returns the trunk's (first) reducible channel name.
+func reducibleChannel(f *xwal.Forest, trunk string) string {
+	x, _, err := f.Head(trunk)
+	check(err)
+	defer x.Close()
+	if name, _ := reducibleBounds(x); name != "" {
+		return name
+	}
+	check(fmt.Errorf("trunk %s has no reducible channel", trunk))
+	return ""
+}
+
+// reducibleBounds returns the first reducible channel's name and last LT.
+func reducibleBounds(x *xwal.XWAL) (string, uint64) {
+	for _, c := range x.Channels() {
+		if c.Kind == xwal.ChannelReducible {
+			return c.Name, c.Last
+		}
+	}
+	return "", 0
 }
 
 // dumpXWAL prints every channel's full contents for this branch — the
@@ -605,14 +677,19 @@ func usageXWAL() {
 
 trunk verbs (mirror figaro — a trunk is the addressable handle; no attendance):
   init <main> <ch[:reducer]>...   create the forest; e.g.
-                                  init ./c ir translations chalkboard:jsonmerge
-                                  [--codec jsonl|binary]  (prints the root trunk id)
+                                  init ./c ir translations chalkboard:map
+                                  ("map" = native nested reducible map, built in;
+                                  [--codec jsonl|binary]; prints the root trunk id)
   send  <trunk>[:<LT>] <data>     append to a trunk; <LT> < tail FORKS a new trunk
                                   there and appends (existing trunk retained), else
                                   appends at the tail
   fork  <trunk>                   tail-only: bisect the present (trunk continues on a
                                   new head; a new alternative trunk is founded)
-  set   <trunk> <patch>           append a chalkboard patch to a trunk [--main-lt N]
+  set   <trunk> <dot.path> <val>  set a nested value in the trunk's reducible map;
+                                  <val> is JSON, or a bare word is auto-quoted
+                                  (e.g. set t0 system.tags.42 '{"cache":"x"}') [--main-lt N]
+  unset <trunk> <dot.path>        remove a nested value [--main-lt N]
+  state <trunk>                   the folded reducible-map state of a trunk
   trunks                          list trunks (TRUNK VECTOR PARENT TIP HEAD BRANCHED)
   dump  <trunk>                   full contents of a trunk's head across all channels
   nodes                           the raw node tree (debug)
