@@ -312,6 +312,60 @@ func (t *Trunks) ForkTail(trunk string) (string, error) {
 	return t.commitFork(head.branch, contDir, altDir)
 }
 
+// SpawnChild adds a new child trunk under a "ceremonial" parent WITHOUT a
+// continuation: the parent's node becomes (or stays) a frozen branch point
+// that only hosts children. This is for nodes that don't continue and only
+// spawn N children — e.g. a null root, or a loadout that many conversations
+// fork from. (ForkTail, by contrast, gives the parent a continuation.)
+// Returns the new child trunk id.
+func (t *Trunks) SpawnChild(parent TrunkID) (TrunkID, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	nodeKey, ok := t.anchorOf(parent)
+	if !ok {
+		return "", fmt.Errorf("xwal: unknown trunk %q", parent)
+	}
+	node := t.nodes[nodeKey]
+	x, err := Open(t.root, t.cfg, node.branch...)
+	if err != nil {
+		return "", err
+	}
+	tail := mainTail(x)
+	x.Close()
+
+	childDir := t.mintNode()
+	fx, err := Open(t.root, t.cfg, node.branch...)
+	if err != nil {
+		return "", err
+	}
+	c, ferr := fx.Fork(tail+1, childDir, "") // N-ary add-one at the tail; no continuation
+	fx.Close()
+	if ferr != nil {
+		return "", fmt.Errorf("spawn-child: %w", ferr)
+	}
+	c.Close()
+
+	childTrunk := t.mintTrunk()
+	if err := writeTrunkID(t.irDir(append(append([]string(nil), node.branch...), childDir)), childTrunk); err != nil {
+		return "", err
+	}
+	return childTrunk, t.rebuild()
+}
+
+// anchorOf returns the node where children of a trunk attach: its live
+// head if it has one, else its (single, frozen) ceremonial node.
+func (t *Trunks) anchorOf(trunk TrunkID) (string, bool) {
+	if k, ok := t.heads[trunk]; ok {
+		return k, true
+	}
+	for k, n := range t.nodes {
+		if n.trunk == trunk {
+			return k, true
+		}
+	}
+	return "", false
+}
+
 // commitFork writes the trunk markers for a freeze+two-children fork: the
 // continuation inherits the (frozen) head's trunk, the alternative founds
 // a new one. Then it rebuilds the cache from disk. Returns the new alt

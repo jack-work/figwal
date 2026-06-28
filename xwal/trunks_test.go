@@ -197,3 +197,64 @@ func chalkLast(t *testing.T, x *XWAL) uint64 {
 	t.Fatal("no chalkboard channel")
 	return 0
 }
+
+func TestTrunks_SpawnChild(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "f")
+	root, rootID, err := CreateTrunks(dir, trunksCfg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// rootID = the ceremonial "null". Spawn two children (loadouts) — no
+	// continuation, both N-ary siblings under the frozen root.
+	l1, err := root.SpawnChild(rootID)
+	if err != nil {
+		t.Fatalf("spawn l1: %v", err)
+	}
+	l2, err := root.SpawnChild(rootID)
+	if err != nil {
+		t.Fatalf("spawn l2 (root now frozen/closed): %v", err)
+	}
+	if l1 == l2 || l1 == rootID || l2 == rootID {
+		t.Fatalf("spawned trunks must be distinct: root=%s l1=%s l2=%s", rootID, l1, l2)
+	}
+	// root is now closed (no live head): Append/ForkTail on it should fail.
+	if _, _, err := root.Append(rootID, 0, []byte(`"x"`), nil); err == nil {
+		t.Fatal("append to a closed ceremonial root should fail")
+	}
+	// A loadout can itself spawn a conversation child.
+	conv, err := root.SpawnChild(l1)
+	if err != nil {
+		t.Fatalf("spawn conv from loadout: %v", err)
+	}
+	// conv is a live trunk: it can take turns and fork normally.
+	if _, _, err := root.Append(conv, 0, []byte(`"hello"`), nil); err != nil {
+		t.Fatalf("append to conversation: %v", err)
+	}
+	if _, _, err := root.Append(conv, 0, []byte(`"more"`), nil); err != nil {
+		t.Fatal(err)
+	}
+	alt, _, err := root.Append(conv, 2, []byte(`"branch"`), nil) // interior fork at conv's first own LT (shares genesis+hello)
+	if err != nil {
+		t.Fatalf("fork conversation: %v", err)
+	}
+	if alt == conv {
+		t.Fatal("interior fork should mint a new trunk")
+	}
+	// Reopen from disk: all trunks still resolve.
+	r2, err := OpenTrunks(dir, trunksCfg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// l1 is now a closed ceremonial trunk (it spawned conv) — no live head,
+	// like a loadout; resolve only the live trunks. l1 stays a SpawnChild parent.
+	if _, err := r2.SpawnChild(l1); err != nil {
+		t.Fatalf("closed l1 must still accept SpawnChild after reopen: %v", err)
+	}
+	for _, tr := range []string{l2, conv, alt} {
+		if x, err := r2.Head(tr); err != nil {
+			t.Fatalf("reopen head %s: %v", tr, err)
+		} else {
+			x.Close()
+		}
+	}
+}
