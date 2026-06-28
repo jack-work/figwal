@@ -71,6 +71,11 @@ type Config struct {
 	// caller use its own genesis encoding instead of the default marker.
 	// Used only at creation; ignored on open.
 	Genesis []byte
+	// MintTrunkID, if set, generates trunk ids instead of the default
+	// sequential "t<N>" (the Trunks layer retries on collision). Lets a
+	// consumer use opaque ids; not persisted directly — the ids land in
+	// the .trunk markers.
+	MintTrunkID func() string
 }
 
 var errStopRange = errors.New("xwal: stop range")

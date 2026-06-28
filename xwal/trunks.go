@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -99,6 +100,9 @@ func CreateTrunks(dir string, cfg Config) (*Trunks, string, error) {
 	x.Close()
 
 	rootTrunk := "t0"
+	if cfg.MintTrunkID != nil {
+		rootTrunk = cfg.MintTrunkID()
+	}
 	if err := writeTrunkID(filepath.Join(dir, cfg.Main), rootTrunk); err != nil {
 		return nil, "", err
 	}
@@ -622,13 +626,25 @@ type TrunkInfo struct {
 func (t *Trunks) List() []TrunkInfo {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	out := make([]TrunkInfo, 0, len(t.heads))
-	for i := 0; i < t.trunkSeq; i++ {
-		id := "t" + strconv.Itoa(i)
-		key, ok := t.heads[id]
-		if !ok {
-			continue
+	// Default (sequential "t<N>") ids list in numeric order. With a custom
+	// minter the ids are opaque, so list the heads sorted by id (callers
+	// re-sort for display anyway).
+	var ids []string
+	if t.cfg.MintTrunkID != nil {
+		for id := range t.heads {
+			ids = append(ids, id)
 		}
+		sort.Strings(ids)
+	} else {
+		for i := 0; i < t.trunkSeq; i++ {
+			if id := "t" + strconv.Itoa(i); t.heads[id] != "" {
+				ids = append(ids, id)
+			}
+		}
+	}
+	out := make([]TrunkInfo, 0, len(ids))
+	for _, id := range ids {
+		key := t.heads[id]
 		ti := TrunkInfo{ID: id, Head: t.nodes[key].branch}
 		ti.Parent, ti.BranchedLT = t.lineage(id)
 		if x, err := Open(t.root, t.cfg, t.nodes[key].branch...); err == nil {
@@ -693,9 +709,28 @@ func (t *Trunks) mintNode() string {
 }
 
 func (t *Trunks) mintTrunk() string {
+	if t.cfg.MintTrunkID != nil {
+		for {
+			id := t.cfg.MintTrunkID()
+			if id != "" && !t.trunkExists(id) {
+				return id
+			}
+		}
+	}
 	id := "t" + strconv.Itoa(t.trunkSeq)
 	t.trunkSeq++
 	return id
+}
+
+// trunkExists reports whether any cached node already carries this trunk id
+// (collision check for a custom minter). Caller holds t.mu.
+func (t *Trunks) trunkExists(id string) bool {
+	for _, n := range t.nodes {
+		if n.trunk == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *Trunks) irDir(branch []string) string {
