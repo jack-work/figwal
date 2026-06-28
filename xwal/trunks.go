@@ -473,6 +473,28 @@ func (t *Trunks) SpawnChild(parent TrunkID) (TrunkID, error) {
 	return childTrunk, t.rebuild()
 }
 
+// OwnerTrunk returns the trunk id of the node that OWNS atMainLT along the
+// given trunk's lineage — the deepest ancestor whose own segments contain it.
+// Callers layer policy on this: e.g. an LT owned by a "ceremonial" trunk (a
+// null root or loadout) can be redirected to SpawnChild instead of a re-split.
+func (t *Trunks) OwnerTrunk(trunk string, atMainLT uint64) (string, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	branch, err := t.headBranch(trunk)
+	if err != nil {
+		return "", err
+	}
+	ob, err := t.ownerOf(branch, atMainLT)
+	if err != nil {
+		return "", err
+	}
+	n := t.nodes[strings.Join(ob, "/")]
+	if n == nil {
+		return "", fmt.Errorf("xwal: no owner node for main-LT %d on trunk %q", atMainLT, trunk)
+	}
+	return n.trunk, nil
+}
+
 // anchorOf returns the node where children of a trunk attach: its live
 // head if it has one, else its (single, frozen) ceremonial node.
 func (t *Trunks) anchorOf(trunk TrunkID) (string, bool) {

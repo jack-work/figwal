@@ -347,3 +347,32 @@ func TestTrunks_ReSplitBelow(t *testing.T) {
 		}
 	}
 }
+
+func TestTrunks_OwnerTrunk(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "f")
+	root, rootID, err := CreateTrunks(dir, trunksCfg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// root owns LT 1 (genesis). ceremonial child (loadout-like) owns LT 2.
+	ld, _ := root.SpawnChild(rootID)
+	if _, _, err := root.Append(ld, 0, []byte(`"loadout-birth"`), nil); err != nil {
+		t.Fatal(err)
+	}
+	conv, _ := root.SpawnChild(ld) // owns [3..]
+	for _, m := range []string{`"u1"`, `"u2"`} {
+		if _, _, err := root.Append(conv, 0, []byte(m), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := map[uint64]string{1: rootID, 2: ld, 3: conv, 4: conv}
+	for lt, want := range cases {
+		got, err := root.OwnerTrunk(conv, lt)
+		if err != nil {
+			t.Fatalf("OwnerTrunk(%d): %v", lt, err)
+		}
+		if got != want {
+			t.Errorf("OwnerTrunk(conv, %d) = %q, want %q", lt, got, want)
+		}
+	}
+}
