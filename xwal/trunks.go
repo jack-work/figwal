@@ -316,6 +316,55 @@ func (t *Trunks) ForkTail(trunk string) (string, error) {
 	return t.commitFork(head.branch, contDir, altDir)
 }
 
+// ForkAt forks a trunk at an interior main-LT WITHOUT appending: it shares
+// [1..atMainLT] and creates an EMPTY alternative trunk diverging at
+// atMainLT+1; the original trunk keeps its id and its suffix. At or past the
+// tail it degenerates to a tail fork (ForkTail). Returns the new alternative
+// trunk. (Append does fork+send in one; ForkAt is the imperative-only fork.)
+func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
+	t.mu.Lock()
+	branch, err := t.headBranch(trunk)
+	if err != nil {
+		t.mu.Unlock()
+		return "", err
+	}
+	x, err := Open(t.root, t.cfg, branch...)
+	if err != nil {
+		t.mu.Unlock()
+		return "", err
+	}
+	tail := mainTail(x)
+	ownFirst := ownFirstIdx(x)
+	x.Close()
+
+	if atMainLT == 0 || atMainLT >= tail {
+		t.mu.Unlock()
+		return t.ForkTail(trunk) // ForkTail re-acquires the lock
+	}
+	if atMainLT < ownFirst {
+		t.mu.Unlock()
+		return "", fmt.Errorf("xwal: main-LT %d is in frozen history of trunk %q (re-split-below not yet supported)", atMainLT, trunk)
+	}
+
+	altDir := t.mintNode()
+	contDir := t.mintNode()
+	fx, err := Open(t.root, t.cfg, branch...)
+	if err != nil {
+		t.mu.Unlock()
+		return "", err
+	}
+	child, ferr := fx.Fork(atMainLT+1, altDir, contDir) // child = alt; old-future = cont
+	fx.Close()
+	if ferr != nil {
+		t.mu.Unlock()
+		return "", ferr
+	}
+	child.Close()
+	alt, cerr := t.commitFork(branch, contDir, altDir)
+	t.mu.Unlock()
+	return alt, cerr
+}
+
 // SpawnChild adds a new child trunk under a "ceremonial" parent WITHOUT a
 // continuation: the parent's node becomes (or stays) a frozen branch point
 // that only hosts children. This is for nodes that don't continue and only

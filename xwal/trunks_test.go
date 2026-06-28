@@ -258,3 +258,45 @@ func TestTrunks_SpawnChild(t *testing.T) {
 		}
 	}
 }
+
+func TestTrunks_ForkAt(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "f")
+	root, rootID, err := CreateTrunks(dir, trunksCfg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv, err := root.SpawnChild(rootID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// conv owns u1,u2,u3 (LTs 2,3,4 after genesis@1 inherited).
+	for _, m := range []string{`"u1"`, `"u2"`, `"u3"`} {
+		if _, _, err := root.Append(conv, 0, []byte(m), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	x, _ := root.Head(conv)
+	tail := mainTail(x)
+	x.Close()
+	// Interior fork at tail-1 (no message) -> empty alt sharing the prefix.
+	alt, err := root.ForkAt(conv, tail-1)
+	if err != nil {
+		t.Fatalf("forkat interior: %v", err)
+	}
+	if alt == conv || alt == "" {
+		t.Fatalf("forkat must mint a new trunk, got %q", alt)
+	}
+	// alt is live and empty-own: a send appends at the divergence point.
+	if _, _, err := root.Append(alt, 0, []byte(`"branch msg"`), nil); err != nil {
+		t.Fatalf("send to forked alt: %v", err)
+	}
+	// conv keeps its id and is still re-forkable / sendable.
+	if _, _, err := root.Append(conv, 0, []byte(`"u4"`), nil); err != nil {
+		t.Fatalf("original trunk still live: %v", err)
+	}
+	// Past-tail ForkAt degenerates to a tail fork.
+	alt2, err := root.ForkAt(conv, 9999)
+	if err != nil || alt2 == "" || alt2 == conv {
+		t.Fatalf("forkat past tail should tail-fork: alt2=%q err=%v", alt2, err)
+	}
+}
