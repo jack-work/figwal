@@ -2,8 +2,8 @@ package disk
 
 import (
 	"errors"
-	"github.com/jack-work/figwal/segment"
 	"fmt"
+	"github.com/jack-work/figwal/segment"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -22,8 +22,8 @@ const forkMarkerName = ".fork"
 const forkPendingName = ".fork-pending"
 
 var (
-	ErrForkPending  = errors.New("fork in progress: dir contains .fork-pending sentinel")
-	ErrForkConflict = errors.New("fork name conflicts with existing entry")
+	ErrForkPending     = errors.New("fork in progress: dir contains .fork-pending sentinel")
+	ErrForkConflict    = errors.New("fork name conflicts with existing entry")
 	ErrInvalidForkName = errors.New("fork name must be a non-empty filename without separators")
 )
 
@@ -204,21 +204,36 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 		return nil, fmt.Errorf("%w: childName %q equals old-future subdir name",
 			ErrForkConflict, childName)
 	}
-	if l.isEmptyLocked() {
+	// A truly-empty root log (no parent, no entries) can't be forked.
+	// An empty-OWN log of a fork child (forkBase>0, all content inherited)
+	// CAN be forked — it materializes empty inheriting children so every
+	// node has its own branch in every channel (write isolation).
+	if l.isEmptyLocked() && l.forkBase == 0 {
 		return nil, fmt.Errorf("cannot fork empty log %q", l.dir)
 	}
+	oldFutureExplicit := len(oldFutureNameOpt) == 1 && oldFutureNameOpt[0] != ""
 	first := l.firstIndexLocked()
 	last := l.lastIndexLocked()
-	// atIdx must leave a non-empty prefix — EXCEPT a forked node
-	// (forkBase>0) may fork at its own first index: all of its own entries
-	// move to the old-future, the prefix keeps none of its own, reads below
-	// forkBase resolve through the parent, and the watermark folds from the
-	// parent. This is how a sparse related channel (e.g. a chalkboard whose
-	// own patches are all past the fork point) forks correctly.
-	lowOK := atIdx > first || (l.forkBase > 0 && atIdx == first)
-	if !lowOK || atIdx > last+1 {
-		return nil, fmt.Errorf("fork index %d out of range (%d, %d]",
-			atIdx, first, last+1)
+	if l.isEmptyLocked() && l.forkBase > 0 {
+		// Empty-own log (all content inherited from the parent): it has no
+		// own segments, so firstIndexLocked/lastIndexLocked read as 0; the
+		// only meaningful fork point is its own first index (forkBase). The
+		// children become empty inheriting branches (write isolation).
+		if atIdx != l.forkBase {
+			return nil, fmt.Errorf("fork index %d invalid for empty-own log (want %d)", atIdx, l.forkBase)
+		}
+	} else {
+		// atIdx must leave a non-empty prefix — EXCEPT a forked node
+		// (forkBase>0) may fork at its own first index: all of its own
+		// entries move to the old-future, the prefix keeps none of its own,
+		// reads below forkBase resolve through the parent, and the watermark
+		// folds from the parent. This is how a sparse related channel (e.g.
+		// a chalkboard whose own patches are all past the fork point) forks.
+		lowOK := atIdx > first || (l.forkBase > 0 && atIdx == first)
+		if !lowOK || atIdx > last+1 {
+			return nil, fmt.Errorf("fork index %d out of range (%d, %d]",
+				atIdx, first, last+1)
+		}
 	}
 	// childName must not collide with an existing entry (a segment file
 	// or a sibling fork). The old-future name is validated later, only
@@ -274,10 +289,14 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 			hasSplit = true
 		}
 	}
-	oldFutureExists := hasMoves || hasSplit
-	// The old-future is only created when there's a suffix to carry; its
-	// name conflict is therefore only relevant then.
-	if oldFutureExists {
+	// dataMoves: the node's own segments carry a suffix into the old-future
+	// (interior split / re-split). createOldFuture: materialize the
+	// old-future branch at all — always when explicitly named (so the
+	// continuation gets its own branch in every channel, even empty), else
+	// only when there's data to carry.
+	dataMoves := hasMoves || hasSplit
+	createOldFuture := oldFutureExplicit || dataMoves
+	if createOldFuture {
 		if p := filepath.Join(l.dir, oldFutureName); pathExists(p) {
 			return nil, fmt.Errorf("%w: %s", ErrForkConflict, p)
 		}
@@ -301,7 +320,7 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 	}
 
 	// Make subdirs first; populate them next.
-	if oldFutureExists {
+	if createOldFuture {
 		if err := os.MkdirAll(oldFutureDir, 0755); err != nil {
 			return nil, rollbackPending(err)
 		}
@@ -315,20 +334,33 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 	// fork-point state rather than an empty one. The whole-moved
 	// segments already carry their own watermarks; the split suffix got
 	// the watermark above.
-	if headerMode {
-		childSeg, err := segment.Create(filepath.Join(newForkDir, l.segName(atIdx)), l.codec, atIdx, l.opts.SegmentSize)
+	writeWatermarkSeg := func(dir string) error {
+		seg, err := segment.Create(filepath.Join(dir, l.segName(atIdx)), l.codec, atIdx, l.opts.SegmentSize)
 		if err != nil {
+			return err
+		}
+		if err := seg.WriteHeader(forkWatermark); err != nil {
+			seg.Close()
+			return err
+		}
+		if err := seg.Sync(); err != nil {
+			seg.Close()
+			return err
+		}
+		return seg.Close()
+	}
+	if headerMode {
+		if err := writeWatermarkSeg(newForkDir); err != nil {
 			return nil, rollbackPending(err)
 		}
-		if err := childSeg.WriteHeader(forkWatermark); err != nil {
-			childSeg.Close()
-			return nil, rollbackPending(err)
+		// An explicitly-materialized old-future with no data to carry is an
+		// empty inheriting branch; in header mode it needs the fork
+		// watermark too, so its first append builds on the fork-point state.
+		if createOldFuture && !dataMoves {
+			if err := writeWatermarkSeg(oldFutureDir); err != nil {
+				return nil, rollbackPending(err)
+			}
 		}
-		if err := childSeg.Sync(); err != nil {
-			childSeg.Close()
-			return nil, rollbackPending(err)
-		}
-		childSeg.Close()
 	}
 
 	// Split the boundary segment if one exists.
@@ -441,8 +473,10 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 	// base is unchanged and their parent resolves via `..` to the
 	// old-future. Only happens on a re-split below an existing branch
 	// point (oldFutureExists is always true there, since the branch
-	// point's own segments supply the suffix).
-	if oldFutureExists {
+	// point's own segments supply the suffix). Re-home is keyed on actual
+	// data movement (re-split), NOT on createOldFuture — a tail fork with an
+	// empty old-future must leave existing children where they are.
+	if dataMoves {
 		for _, name := range existingChildren {
 			src := filepath.Join(l.dir, name)
 			dst := filepath.Join(oldFutureDir, name)
@@ -454,7 +488,7 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 
 	// Write .fork markers in the children. For the old-future the
 	// declared base equals atIdx (its first segment starts there).
-	if oldFutureExists {
+	if createOldFuture {
 		if err := writeForkMarker(oldFutureDir, atIdx); err != nil {
 			return nil, rollbackPending(err)
 		}
@@ -467,7 +501,7 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 	if err := syncDir(l.dir); err != nil {
 		return nil, rollbackPending(err)
 	}
-	if oldFutureExists {
+	if createOldFuture {
 		if err := syncDir(oldFutureDir); err != nil {
 			return nil, rollbackPending(err)
 		}
@@ -503,7 +537,7 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 		"dir", l.dir,
 		"atIdx", atIdx,
 		"child", childName,
-		"oldFuture", oldFutureExists)
+		"oldFuture", createOldFuture)
 
 	// Open the new fork as a child of this log.
 	childOpts := l.opts

@@ -281,7 +281,7 @@ func (t *Trunks) ForkTail(trunk string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		altX, ferr := px.Fork(fb, altDir, altDir+"_of") // N-ary at the parent's fork point
+		altX, ferr := px.Fork(fb, altDir, "") // N-ary add-one at the parent's fork point (no old-future)
 		px.Close()
 		if ferr != nil {
 			return "", fmt.Errorf("fork-tail (empty head, via parent): %w", ferr)
@@ -294,29 +294,21 @@ func (t *Trunks) ForkTail(trunk string) (string, error) {
 		return altTrunk, t.rebuild()
 	}
 
-	// Head has content: freeze it, two empty children at tail+1.
+	// Head has content: freeze it; one fork creates both children at tail+1
+	// (alt = child, cont = old-future) — both empty, inheriting the full
+	// prefix in every channel (always-materialize → write isolation).
 	altDir := t.mintNode()
 	contDir := t.mintNode()
-	x1, err := Open(t.root, t.cfg, head.branch...)
+	fx, err := Open(t.root, t.cfg, head.branch...)
 	if err != nil {
 		return "", err
 	}
-	a, ferr := x1.Fork(tail+1, altDir, altDir+"_of")
-	x1.Close()
+	child, ferr := fx.Fork(tail+1, altDir, contDir)
+	fx.Close()
 	if ferr != nil {
-		return "", fmt.Errorf("fork-tail alternative: %w", ferr)
+		return "", fmt.Errorf("fork-tail: %w", ferr)
 	}
-	a.Close()
-	x2, err := Open(t.root, t.cfg, head.branch...)
-	if err != nil {
-		return "", err
-	}
-	c, ferr := x2.Fork(tail+1, contDir, contDir+"_of")
-	x2.Close()
-	if ferr != nil {
-		return "", fmt.Errorf("fork-tail continuation: %w", ferr)
-	}
-	c.Close()
+	child.Close()
 	return t.commitFork(head.branch, contDir, altDir)
 }
 

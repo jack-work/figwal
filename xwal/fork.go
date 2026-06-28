@@ -75,26 +75,26 @@ func (x *XWAL) Fork(atMainLT uint64, childName, oldFutureName string) (*XWAL, er
 // atMainLT. Empty channels are skipped (nothing to inherit). The main
 // channel is placed last so it is the commit point.
 func (x *XWAL) buildForkPlan(atMainLT uint64, childName, oldFutureName string) (forkPlan, error) {
-	if childName == "" || oldFutureName == "" || childName == oldFutureName {
-		return forkPlan{}, fmt.Errorf("xwal: fork needs distinct non-empty child and old-future names")
+	// childName is required. oldFutureName may be "" — that means an N-ary
+	// add-one (no old-future / continuation is materialized); used to add a
+	// sibling at a branch point's tail.
+	if childName == "" {
+		return forkPlan{}, fmt.Errorf("xwal: fork needs a non-empty child name")
+	}
+	if oldFutureName != "" && oldFutureName == childName {
+		return forkPlan{}, fmt.Errorf("xwal: fork child and old-future names must differ")
 	}
 	plan := forkPlan{AtMainLT: atMainLT, Child: childName, OldFuture: oldFutureName}
 	var mainEntry *forkPlanEntry
 	for _, name := range x.order {
 		ch := x.chans[name]
 		if ch.log.FirstIndex() == 0 {
-			continue // empty channel: nothing to fork
+			continue // truly-empty channel (never written): nothing to fork
 		}
-		// A fork child whose OWN log is empty (no entries appended since
-		// its own fork base) has nothing to split — its LastIndex is
-		// forkBase-1. Skip it; the new child keeps inheriting this channel
-		// from the ancestor chain (reads resolve through the parent, and a
-		// later write lazily creates the child's own branch). Without this
-		// a multi-level fork would try to split an empty own-log and fail
-		// ("cannot fork empty log").
-		if fb := ch.log.ForkBase(); fb > 0 && ch.log.LastIndex() < fb {
-			continue
-		}
+		// NOTE: an empty-OWN log (forkBase>0, all content inherited) is NOT
+		// skipped — it forks into empty inheriting children so every trunk
+		// gets its own branch in this channel (write isolation). disk.Fork
+		// handles the empty-own case.
 		var atIdx uint64
 		if name == x.main {
 			atIdx = atMainLT
@@ -223,16 +223,24 @@ func (x *XWAL) relDir(dir string) string {
 }
 
 // boundaryFor returns the channel LT at which a related channel should
-// fork for a main-timeline fork at atMainLT: the first entry whose main
-// LT is >= atMainLT, or LastIndex+1 if the channel has not caught up.
+// fork for a main-timeline fork at atMainLT. It works in the channel's
+// OWN index space (the one disk.Fork validates against), not the
+// parent-delegated global view:
+//   - empty-own (no entries since forkBase): fork at the own first index,
+//     so the children are empty inheriting branches (write isolation);
+//   - else: the first OWN entry whose main LT >= atMainLT, or own-tail+1
+//     if the channel hasn't caught up.
 func (x *XWAL) boundaryFor(ch *channel, atMainLT uint64) (uint64, error) {
-	first := ch.log.FirstIndex()
+	ownFirst := ch.log.ForkBase()
+	if ownFirst == 0 {
+		ownFirst = 1
+	}
 	last := ch.log.LastIndex()
-	if first == 0 || last < first {
-		return last + 1, nil
+	if last < ownFirst {
+		return ownFirst, nil // empty-own: fork at the own first index
 	}
 	found := uint64(0)
-	err := ch.log.Range(first, func(idx uint64, payload []byte) error {
+	err := ch.log.RangeOwn(ownFirst, func(idx uint64, payload []byte) error {
 		m, _, derr := decodeFrame(payload)
 		if derr != nil {
 			return derr
