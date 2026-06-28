@@ -79,7 +79,11 @@ func CreateTrunks(dir string, cfg Config) (*Trunks, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	glt, err := x.AppendMain([]byte(genesisMarker), nil)
+	gen := cfg.Genesis
+	if len(gen) == 0 {
+		gen = []byte(genesisMarker)
+	}
+	glt, err := x.AppendMain(gen, nil)
 	if err != nil {
 		x.Close()
 		return nil, "", err

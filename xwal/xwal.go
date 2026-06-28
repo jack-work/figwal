@@ -66,6 +66,11 @@ type Config struct {
 	Registry    map[string]Reducer
 	Codec       string // "jsonl" (default) | "binary"; persisted in the manifest
 	SegmentSize int64
+	// Genesis is the main-channel genesis payload written by CreateTrunks
+	// (the root trunk's first entry, which every trunk inherits). Lets the
+	// caller use its own genesis encoding instead of the default marker.
+	// Used only at creation; ignored on open.
+	Genesis []byte
 }
 
 var errStopRange = errors.New("xwal: stop range")
