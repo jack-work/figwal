@@ -376,3 +376,51 @@ func TestTrunks_OwnerTrunk(t *testing.T) {
 		}
 	}
 }
+
+func TestTrunks_Remove(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "f")
+	root, rootID, err := CreateTrunks(dir, trunksCfg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ld, _ := root.SpawnChild(rootID)
+	root.Append(ld, 0, []byte(`"birth"`), nil)
+	conv, _ := root.SpawnChild(ld)
+	root.Append(conv, 0, []byte(`"u1"`), nil)
+	root.Append(conv, 0, []byte(`"u2"`), nil)
+	alt, _ := root.ForkTail(conv) // conv now has a live branch (alt)
+
+	// Can't remove the root.
+	if err := root.Remove(rootID, false); err == nil {
+		t.Fatal("removing the root trunk must fail")
+	}
+	// conv has a live branch (alt) -> refuse without recursive.
+	if err := root.Remove(conv, false); err == nil {
+		t.Fatal("removing a trunk with live branches must fail without recursive")
+	}
+	// Remove the leaf branch (alt) directly -> ok; conv survives.
+	if err := root.Remove(alt, false); err != nil {
+		t.Fatalf("remove leaf branch: %v", err)
+	}
+	if _, err := root.Head(conv); err != nil {
+		t.Fatalf("conv must survive removing its branch: %v", err)
+	}
+	if _, err := root.Head(alt); err == nil {
+		t.Fatal("alt should be gone")
+	}
+	// Reopen from disk: alt stays gone, conv resolves.
+	r2, _ := OpenTrunks(dir, trunksCfg())
+	if _, err := r2.Head(conv); err != nil {
+		t.Fatalf("conv missing after reopen: %v", err)
+	}
+	if _, err := r2.Head(alt); err == nil {
+		t.Fatal("alt resurrected after reopen")
+	}
+	// Recursive remove of conv (it now has no branches, but exercise the flag).
+	if err := r2.Remove(conv, true); err != nil {
+		t.Fatalf("recursive remove conv: %v", err)
+	}
+	if _, err := r2.Head(conv); err == nil {
+		t.Fatal("conv should be gone after recursive remove")
+	}
+}

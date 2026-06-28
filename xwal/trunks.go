@@ -433,6 +433,68 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 	return alt, cerr
 }
 
+// Remove deletes a trunk: its founding node's entire subtree, in every
+// channel. Trunk-addressed (a node is plumbing). Refuses the root trunk, and
+// refuses a trunk that has live branches (descendant trunks branched off it)
+// unless recursive — in which case those branches go too.
+func (t *Trunks) Remove(trunk string, recursive bool) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// The founding node is the shallowest node carrying this trunk (its
+	// parent is in another trunk, or it is the root).
+	foundKey, ok := "", false
+	for key, n := range t.nodes {
+		if n.trunk != trunk {
+			continue
+		}
+		if n.isRoot {
+			return fmt.Errorf("xwal: cannot remove the root trunk %q", trunk)
+		}
+		if p := t.nodes[n.parent]; p == nil || p.trunk != trunk {
+			foundKey, ok = key, true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("xwal: unknown trunk %q", trunk)
+	}
+
+	// Collect the trunks living in the founding node's subtree.
+	sub := map[string]bool{}
+	var walk func(string)
+	walk = func(key string) {
+		n := t.nodes[key]
+		if n == nil {
+			return
+		}
+		if n.trunk != "" {
+			sub[n.trunk] = true
+		}
+		for _, c := range n.children {
+			walk(c)
+		}
+	}
+	walk(foundKey)
+	delete(sub, trunk)
+	if len(sub) > 0 && !recursive {
+		return fmt.Errorf("xwal: trunk %q has %d live branch(es); remove recursively to take them too", trunk, len(sub))
+	}
+
+	// Delete the founding node's subtree dir in every channel.
+	branch := t.nodes[foundKey].branch
+	names, err := channelNames(t.root)
+	if err != nil {
+		return err
+	}
+	for _, ch := range names {
+		if err := os.RemoveAll(filepath.Join(append([]string{t.root, ch}, branch...)...)); err != nil {
+			return err
+		}
+	}
+	return t.rebuild()
+}
+
 // SpawnChild adds a new child trunk under a "ceremonial" parent WITHOUT a
 // continuation: the parent's node becomes (or stays) a frozen branch point
 // that only hosts children. This is for nodes that don't continue and only
@@ -667,6 +729,25 @@ func numSuffix(s string, prefix byte) int {
 		return -1
 	}
 	return n
+}
+
+// channelNames reads the manifest and returns every channel's name (each
+// maps directly to a dir under the root: "ir", "chalkboard",
+// "translations/<provider>", …).
+func channelNames(dir string) ([]string, error) {
+	data, err := os.ReadFile(filepath.Join(dir, manifestName))
+	if err != nil {
+		return nil, fmt.Errorf("xwal: read manifest: %w", err)
+	}
+	var m manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, fmt.Errorf("xwal: parse manifest: %w", err)
+	}
+	out := make([]string, 0, len(m.Channels))
+	for _, c := range m.Channels {
+		out = append(out, c.Name)
+	}
+	return out, nil
 }
 
 // mainChannelName reads the manifest to find the main channel name.
