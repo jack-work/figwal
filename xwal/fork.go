@@ -23,6 +23,7 @@ type forkPlan struct {
 	AtMainLT  uint64          `json:"atMainLT"`
 	Child     string          `json:"child"`
 	OldFuture string          `json:"oldFuture"`
+	Rehome    []string        `json:"rehome,omitempty"` // child node dirs to re-home into the old-future (joint, by name)
 	Channels  []forkPlanEntry `json:"channels"`
 }
 
@@ -85,6 +86,20 @@ func (x *XWAL) buildForkPlan(atMainLT uint64, childName, oldFutureName string) (
 		return forkPlan{}, fmt.Errorf("xwal: fork child and old-future names must differ")
 	}
 	plan := forkPlan{AtMainLT: atMainLT, Child: childName, OldFuture: oldFutureName}
+	// Joint re-home: decided ONCE from the main channel — every child fork
+	// whose divergence (.fork base) is past the split point moves into the
+	// continuation, and the SAME set moves in every channel (by name). This
+	// keeps the triune's node trees in lockstep on a re-split-below, where a
+	// sparse related channel would otherwise tail-fork and skip the re-home.
+	bases, err := x.chans[x.main].log.ChildForkBases()
+	if err != nil {
+		return forkPlan{}, err
+	}
+	for name, base := range bases {
+		if base > atMainLT {
+			plan.Rehome = append(plan.Rehome, name)
+		}
+	}
 	var mainEntry *forkPlanEntry
 	for _, name := range x.order {
 		ch := x.chans[name]
@@ -136,7 +151,7 @@ func applyForkPlan(root string, plan forkPlan, getLog func(forkPlanEntry) (*disk
 		if err != nil {
 			return fmt.Errorf("xwal: fork %q: open: %w", e.Name, err)
 		}
-		child, ferr := l.Fork(e.AtIdx, plan.Child, plan.OldFuture)
+		child, ferr := l.ForkRehome(e.AtIdx, plan.Child, plan.OldFuture, plan.Rehome)
 		if ferr != nil {
 			done()
 			return fmt.Errorf("xwal: fork channel %q at %d: %w", e.Name, e.AtIdx, ferr)

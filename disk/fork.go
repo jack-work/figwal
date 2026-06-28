@@ -183,22 +183,58 @@ const (
 // leaves the sentinel behind, Open refuses to proceed and the
 // operator must resolve manually.
 func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (*Log, error) {
+	if len(oldFutureNameOpt) > 1 {
+		return nil, fmt.Errorf("Fork: at most one oldFutureName override permitted, got %d",
+			len(oldFutureNameOpt))
+	}
+	oldFutureName := ""
+	if len(oldFutureNameOpt) == 1 {
+		oldFutureName = oldFutureNameOpt[0]
+	}
+	// Heuristic re-home: on a re-split (the node's own segments split), all
+	// existing child forks move into the old-future.
+	return l.forkImpl(atIdx, childName, oldFutureName, oldFutureName != "", nil, true)
+}
+
+// ForkRehome forks with an EXPLICIT list of child subdir names to re-home
+// into the old-future, instead of the per-channel heuristic. The xwal joint
+// fork uses this so every channel re-homes the SAME children — decided once
+// from the main channel — keeping the triune's node trees in lockstep even
+// when a sparse related channel would otherwise tail-fork and skip the
+// re-home. An empty (non-nil) list re-homes nothing.
+func (l *Log) ForkRehome(atIdx uint64, childName, oldFutureName string, rehome []string) (*Log, error) {
+	return l.forkImpl(atIdx, childName, oldFutureName, oldFutureName != "", rehome, false)
+}
+
+// ChildForkBases returns each child fork subdir's declared .fork base. Used
+// by the joint fork to decide which children re-home (base > the split point).
+func (l *Log) ChildForkBases() (map[string]uint64, error) {
+	kids, err := childSubdirs(l.dir)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]uint64, len(kids))
+	for _, name := range kids {
+		base, err := readForkMarker(filepath.Join(l.dir, name))
+		if err != nil {
+			return nil, err
+		}
+		out[name] = base
+	}
+	return out, nil
+}
+
+func (l *Log) forkImpl(atIdx uint64, childName, oldFutureName string, oldFutureExplicit bool, rehome []string, autoRehome bool) (*Log, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if err := validateForkName(childName); err != nil {
 		return nil, err
 	}
-	if len(oldFutureNameOpt) > 1 {
-		return nil, fmt.Errorf("Fork: at most one oldFutureName override permitted, got %d",
-			len(oldFutureNameOpt))
-	}
-	oldFutureName := filepath.Base(l.dir)
-	if len(oldFutureNameOpt) == 1 && oldFutureNameOpt[0] != "" {
-		oldFutureName = oldFutureNameOpt[0]
-		if err := validateForkName(oldFutureName); err != nil {
-			return nil, fmt.Errorf("oldFutureName: %w", err)
-		}
+	if oldFutureName == "" {
+		oldFutureName = filepath.Base(l.dir)
+	} else if err := validateForkName(oldFutureName); err != nil {
+		return nil, fmt.Errorf("oldFutureName: %w", err)
 	}
 	if childName == oldFutureName {
 		return nil, fmt.Errorf("%w: childName %q equals old-future subdir name",
@@ -211,7 +247,6 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 	if l.isEmptyLocked() && l.forkBase == 0 {
 		return nil, fmt.Errorf("cannot fork empty log %q", l.dir)
 	}
-	oldFutureExplicit := len(oldFutureNameOpt) == 1 && oldFutureNameOpt[0] != ""
 	first := l.firstIndexLocked()
 	last := l.lastIndexLocked()
 	if l.isEmptyLocked() && l.forkBase > 0 {
@@ -295,7 +330,22 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 	// continuation gets its own branch in every channel, even empty), else
 	// only when there's data to carry.
 	dataMoves := hasMoves || hasSplit
-	createOldFuture := oldFutureExplicit || dataMoves
+	// Which children re-home into the old-future. autoRehome: the heuristic —
+	// all existing children when the node's own segments split. Otherwise the
+	// explicit list (the joint-fork case), filtered to ones that exist here.
+	var rehomeChildren []string
+	if autoRehome {
+		if dataMoves {
+			rehomeChildren = existingChildren
+		}
+	} else {
+		for _, name := range rehome {
+			if pathExists(filepath.Join(l.dir, name)) {
+				rehomeChildren = append(rehomeChildren, name)
+			}
+		}
+	}
+	createOldFuture := oldFutureExplicit || dataMoves || len(rehomeChildren) > 0
 	if createOldFuture {
 		if p := filepath.Join(l.dir, oldFutureName); pathExists(p) {
 			return nil, fmt.Errorf("%w: %s", ErrForkConflict, p)
@@ -468,21 +518,16 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 		}
 	}
 
-	// Re-home pre-existing child forks into the old-future. They branched
-	// from the suffix [atIdx, ...], which now lives there; their own .fork
-	// base is unchanged and their parent resolves via `..` to the
-	// old-future. Only happens on a re-split below an existing branch
-	// point (oldFutureExists is always true there, since the branch
-	// point's own segments supply the suffix). Re-home is keyed on actual
-	// data movement (re-split), NOT on createOldFuture — a tail fork with an
-	// empty old-future must leave existing children where they are.
-	if dataMoves {
-		for _, name := range existingChildren {
-			src := filepath.Join(l.dir, name)
-			dst := filepath.Join(oldFutureDir, name)
-			if err := os.Rename(src, dst); err != nil {
-				return nil, rollbackPending(err)
-			}
+	// Re-home child forks into the old-future. They branched from the suffix
+	// [atIdx, ...], which now lives there; their own .fork base is unchanged
+	// and their parent resolves via `..` to the old-future. The set was
+	// chosen above (heuristic: all children on a re-split; or the explicit
+	// joint-fork list). A tail fork (no re-home) leaves children in place.
+	for _, name := range rehomeChildren {
+		src := filepath.Join(l.dir, name)
+		dst := filepath.Join(oldFutureDir, name)
+		if err := os.Rename(src, dst); err != nil {
+			return nil, rollbackPending(err)
 		}
 	}
 

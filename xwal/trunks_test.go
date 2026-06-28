@@ -300,3 +300,50 @@ func TestTrunks_ForkAt(t *testing.T) {
 		t.Fatalf("forkat past tail should tail-fork: alt2=%q err=%v", alt2, err)
 	}
 }
+
+func TestTrunks_ReSplitBelow(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "f")
+	root, rootID, err := CreateTrunks(dir, trunksCfg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Build a conversation, then fork it -> a parent/child trunk pair sharing
+	// a prefix. The alt's own range starts above the shared turns.
+	conv, _ := root.SpawnChild(rootID)
+	for _, m := range []string{`"a"`, `"b"`, `"c"`, `"d"`} {
+		if _, _, err := root.Append(conv, 0, []byte(m), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// conv owns LTs 3,4,5,6 (genesis@1, loadout-birth@2 inherited). Fork at 5
+	// -> alt2 shares [1..5], conv continues with its suffix.
+	alt2, _, err := root.Append(conv, 5, []byte(`"alt-from-5"`), nil)
+	if err != nil {
+		t.Fatalf("interior fork: %v", err)
+	}
+	// Now RE-SPLIT-BELOW: fork alt2 at LT 3 — a turn alt2 inherited from conv
+	// (below alt2's own range). Must fork the ancestor and mint a sibling.
+	sib, _, err := root.Append(alt2, 3, []byte(`"resplit-at-3"`), nil)
+	if err != nil {
+		t.Fatalf("re-split-below at inherited LT: %v", err)
+	}
+	if sib == alt2 || sib == conv || sib == "" {
+		t.Fatalf("re-split must mint a distinct sibling trunk, got %q", sib)
+	}
+	// Everyone still resolves + folds after the re-split, and from disk.
+	r2, err := OpenTrunks(dir, trunksCfg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tr := range []string{conv, alt2, sib} {
+		x, err := r2.Head(tr)
+		if err != nil {
+			t.Fatalf("reopen head %s: %v", tr, err)
+		}
+		// each is sendable (write isolation holds through the re-split)
+		x.Close()
+		if _, _, err := r2.Append(tr, 0, []byte(`"more"`), nil); err != nil {
+			t.Fatalf("append to %s after re-split: %v", tr, err)
+		}
+	}
+}

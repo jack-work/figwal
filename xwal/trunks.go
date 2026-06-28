@@ -203,8 +203,9 @@ func (t *Trunks) Head(trunk string) (*XWAL, error) {
 //   - 0 < atMainLT < tail and within the head's own range: interior fork —
 //     a NEW trunk shares [1..atMainLT] and diverges at atMainLT+1; the
 //     existing trunk keeps its full history. Returns the new trunk.
-//   - atMainLT below the head's own range (frozen ancestor): re-split-below,
-//     not yet supported.
+//   - atMainLT below the head's own range (in a frozen ancestor): re-split-below
+//     — fork the owning ancestor, minting a sibling trunk; the original
+//     timeline (and the caller's trunk) continues unchanged.
 func (t *Trunks) Append(trunk string, atMainLT uint64, payload, meta []byte) (string, uint64, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -228,8 +229,11 @@ func (t *Trunks) Append(trunk string, atMainLT uint64, payload, meta []byte) (st
 		return trunk, lt, nil
 	}
 	if atMainLT < ownFirst {
+		// Re-split-below: atMainLT lives in a frozen ancestor. Fork the
+		// ancestor node that owns it (re-homing its suffix + children into
+		// the continuation) and append to the new alternative.
 		x.Close()
-		return "", 0, fmt.Errorf("xwal: main-LT %d is in frozen history of trunk %q (re-split-below not yet supported)", atMainLT, trunk)
+		return t.resplitBelow(branch, atMainLT, payload, meta, true)
 	}
 	// Interior fork: share [1..atMainLT], diverge at atMainLT+1.
 	altDir := t.mintNode()
@@ -249,6 +253,68 @@ func (t *Trunks) Append(trunk string, atMainLT uint64, payload, meta []byte) (st
 		return "", 0, err
 	}
 	return altTrunk, altLT, nil
+}
+
+// resplitBelow forks the ancestor node along `branch` that OWNS atMainLT (a
+// frozen branch point) at atMainLT+1, minting a new alternative trunk that
+// shares [1..atMainLT]. The owner's original timeline beyond atMainLT — its
+// suffix and ALL its child forks (including the caller's own trunk) — re-homes
+// into the continuation (which keeps the owner's trunk id, the normal
+// continuation-chain behavior). If doAppend, payload is written to the new
+// alternative. Caller holds t.mu. This is how a fork at an inherited LT (a
+// turn shared with ancestors) produces a sibling branch.
+func (t *Trunks) resplitBelow(branch []string, atMainLT uint64, payload, meta []byte, doAppend bool) (string, uint64, error) {
+	ownerBranch, err := t.ownerOf(branch, atMainLT)
+	if err != nil {
+		return "", 0, err
+	}
+	altDir := t.mintNode()
+	contDir := t.mintNode()
+	ox, err := Open(t.root, t.cfg, ownerBranch...)
+	if err != nil {
+		return "", 0, err
+	}
+	child, ferr := ox.Fork(atMainLT+1, altDir, contDir) // child = alt; old-future = cont (re-homes children)
+	ox.Close()
+	if ferr != nil {
+		return "", 0, fmt.Errorf("re-split-below: %w", ferr)
+	}
+	var altLT uint64
+	if doAppend {
+		altLT, ferr = child.AppendMain(payload, meta)
+	}
+	child.Close()
+	if ferr != nil {
+		return "", 0, ferr
+	}
+	altTrunk, cerr := t.commitFork(ownerBranch, contDir, altDir)
+	if cerr != nil {
+		return "", 0, cerr
+	}
+	return altTrunk, altLT, nil
+}
+
+// ownerOf returns the branch of the deepest node along `branch` whose own
+// segments contain atMainLT (the deepest with forkBase <= atMainLT). For an
+// atMainLT below the head's own range this is a strict ancestor — the
+// re-split-below target.
+func (t *Trunks) ownerOf(branch []string, atMainLT uint64) ([]string, error) {
+	owner := []string(nil) // root owns [1..]
+	for i := 1; i <= len(branch); i++ {
+		sub := branch[:i]
+		x, err := Open(t.root, t.cfg, sub...)
+		if err != nil {
+			return nil, err
+		}
+		fb := mainForkBase(x)
+		x.Close()
+		if fb <= atMainLT {
+			owner = append([]string(nil), sub...)
+		} else {
+			break
+		}
+	}
+	return owner, nil
 }
 
 // ForkTail bisects a trunk's present.
@@ -342,8 +408,10 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 		return t.ForkTail(trunk) // ForkTail re-acquires the lock
 	}
 	if atMainLT < ownFirst {
+		// Re-split-below: fork the ancestor that owns atMainLT (no append).
+		alt, _, rerr := t.resplitBelow(branch, atMainLT, nil, nil, false)
 		t.mu.Unlock()
-		return "", fmt.Errorf("xwal: main-LT %d is in frozen history of trunk %q (re-split-below not yet supported)", atMainLT, trunk)
+		return alt, rerr
 	}
 
 	altDir := t.mintNode()
