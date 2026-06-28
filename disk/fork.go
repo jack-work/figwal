@@ -209,7 +209,14 @@ func (l *Log) Fork(atIdx uint64, childName string, oldFutureNameOpt ...string) (
 	}
 	first := l.firstIndexLocked()
 	last := l.lastIndexLocked()
-	if atIdx <= first || atIdx > last+1 {
+	// atIdx must leave a non-empty prefix — EXCEPT a forked node
+	// (forkBase>0) may fork at its own first index: all of its own entries
+	// move to the old-future, the prefix keeps none of its own, reads below
+	// forkBase resolve through the parent, and the watermark folds from the
+	// parent. This is how a sparse related channel (e.g. a chalkboard whose
+	// own patches are all past the fork point) forks correctly.
+	lowOK := atIdx > first || (l.forkBase > 0 && atIdx == first)
+	if !lowOK || atIdx > last+1 {
 		return nil, fmt.Errorf("fork index %d out of range (%d, %d]",
 			atIdx, first, last+1)
 	}

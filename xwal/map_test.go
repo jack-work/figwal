@@ -76,7 +76,7 @@ func TestMap_SetValidatesJSON(t *testing.T) {
 
 // --- integration: native "map" reducer via a reducible channel + fork ---
 
-func mapForestCfg() Config {
+func mapTrunksCfg() Config {
 	return Config{
 		Main: "ir",
 		Channels: []ChannelSpec{
@@ -90,7 +90,7 @@ func mapForestCfg() Config {
 func TestMap_BuiltinReducerNoRegistration(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	// Note: cfg.Registry is nil — "map" must resolve from the built-ins.
-	f, root, err := CreateForest(dir, mapForestCfg())
+	f, root, err := CreateTrunks(dir, mapTrunksCfg())
 	if err != nil {
 		t.Fatalf("create with built-in map reducer: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestMap_BuiltinReducerNoRegistration(t *testing.T) {
 	if _, err := f.AppendChannel(root, "chalkboard", lt, mp, nil); err != nil {
 		t.Fatal(err)
 	}
-	x, _, _ := f.Head(root)
+	x, _ := f.Head(root)
 	defer x.Close()
 	var last uint64
 	for _, c := range x.Channels() {
@@ -122,7 +122,7 @@ func TestMap_BuiltinReducerNoRegistration(t *testing.T) {
 
 func TestMap_ForksAlongDeep(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	f, root, _ := CreateForest(dir, mapForestCfg())
+	f, root, _ := CreateTrunks(dir, mapTrunksCfg())
 	_, lt, _ := f.Append(root, 0, []byte(`"u1"`), nil)
 	sp, _ := MapSetPatch([]string{"system", "model"}, []byte(`"opus"`))
 	f.AppendChannel(root, "chalkboard", lt, sp, nil)
@@ -136,7 +136,7 @@ func TestMap_ForksAlongDeep(t *testing.T) {
 	ap, _ := MapSetPatch([]string{"system", "tags", "42"}, []byte(`{"cache":"ephemeral"}`))
 	f.AppendChannel(alt, "chalkboard", 0, ap, nil)
 
-	ax, _, _ := f.Head(alt)
+	ax, _ := f.Head(alt)
 	defer ax.Close()
 	var al uint64
 	for _, c := range ax.Channels() {

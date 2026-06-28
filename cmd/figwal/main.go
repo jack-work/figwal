@@ -205,7 +205,7 @@ func runXWAL(args []string) {
 		if !seen {
 			cfg.Channels = append([]xwal.ChannelSpec{{Name: main, Kind: xwal.ChannelLog}}, cfg.Channels...)
 		}
-		_, root, err := xwal.CreateForest(dir, cfg)
+		_, root, err := xwal.CreateTrunks(dir, cfg)
 		check(err)
 		fmt.Printf("initialized xwal %s (main=%s, root trunk=%s)\n", dir, main, root)
 		return
@@ -237,7 +237,7 @@ func runXWAL(args []string) {
 			usageXWAL()
 		}
 		trunk, at := parseTrunkLT(pos[0])
-		f, err := xwal.OpenForest(dir, cfg)
+		f, err := xwal.OpenTrunks(dir, cfg)
 		check(err)
 		res, lt, err := f.Append(trunk, at, []byte(pos[1]), nil)
 		check(err)
@@ -251,7 +251,7 @@ func runXWAL(args []string) {
 		if len(pos) != 1 {
 			usageXWAL()
 		}
-		f, err := xwal.OpenForest(dir, cfg)
+		f, err := xwal.OpenTrunks(dir, cfg)
 		check(err)
 		alt, err := f.ForkTail(pos[0])
 		check(err)
@@ -263,7 +263,7 @@ func runXWAL(args []string) {
 		if len(pos) != 3 {
 			usageXWAL()
 		}
-		f, err := xwal.OpenForest(dir, cfg)
+		f, err := xwal.OpenTrunks(dir, cfg)
 		check(err)
 		ch := reducibleChannel(f, pos[0])
 		patch, err := xwal.MapSetPatch(splitPath(pos[1]), jsonOrString(pos[2]))
@@ -276,7 +276,7 @@ func runXWAL(args []string) {
 		if len(pos) != 2 {
 			usageXWAL()
 		}
-		f, err := xwal.OpenForest(dir, cfg)
+		f, err := xwal.OpenTrunks(dir, cfg)
 		check(err)
 		ch := reducibleChannel(f, pos[0])
 		patch, err := xwal.MapRemovePatch(splitPath(pos[1]))
@@ -287,9 +287,9 @@ func runXWAL(args []string) {
 		return
 	case "state":
 		if len(pos) == 1 { // trunk-level folded reducible state
-			f, err := xwal.OpenForest(dir, cfg)
+			f, err := xwal.OpenTrunks(dir, cfg)
 			check(err)
-			x, _, err := f.Head(pos[0])
+			x, err := f.Head(pos[0])
 			check(err)
 			defer x.Close()
 			ch, last := reducibleBounds(x)
@@ -300,20 +300,20 @@ func runXWAL(args []string) {
 			return
 		}
 	case "trunks":
-		f, err := xwal.OpenForest(dir, cfg)
+		f, err := xwal.OpenTrunks(dir, cfg)
 		check(err)
 		printTrunks(f)
 		return
 	case "nodes":
-		f, err := xwal.OpenForest(dir, cfg)
+		f, err := xwal.OpenTrunks(dir, cfg)
 		check(err)
 		printNodes(f)
 		return
 	case "dump":
 		if len(pos) == 1 { // dump a trunk (by id)
-			f, err := xwal.OpenForest(dir, cfg)
+			f, err := xwal.OpenTrunks(dir, cfg)
 			check(err)
-			x, _, err := f.Head(pos[0])
+			x, err := f.Head(pos[0])
 			check(err)
 			defer x.Close()
 			fmt.Printf("trunk %s (head node):\n", pos[0])
@@ -389,35 +389,27 @@ func parseTrunkLT(s string) (string, uint64) {
 	return trunk, mustU64(ltStr)
 }
 
-func printTrunks(f *xwal.Forest) {
-	fmt.Printf("  %-6s %-8s %-8s %5s %-10s %s\n", "TRUNK", "VECTOR", "PARENT", "TIP", "HEAD", "BRANCHED")
-	for _, t := range f.Trunks() {
-		fmt.Printf("  %-6s %-8s %-8s %5d %-10s %s\n",
-			t.ID, vec(t.Vector), dash(t.Parent), t.Tip, t.Head, branchedAt(t.BranchedLT))
+func printTrunks(f *xwal.Trunks) {
+	fmt.Printf("  %-6s %-8s %5s %-12s %s\n", "TRUNK", "PARENT", "TIP", "HEAD", "BRANCHED")
+	for _, t := range f.List() {
+		fmt.Printf("  %-6s %-8s %5d %-12s %s\n",
+			t.ID, dash(t.Parent), t.Tip, branchJoin(t.Head), branchedAt(t.BranchedLT))
 	}
 }
 
-func printNodes(f *xwal.Forest) {
-	fmt.Printf("  %-6s %-8s %-6s %-7s %-8s %s\n", "NODE", "VECTOR", "TRUNK", "FROZEN", "PARENT", "BRANCH")
+func printNodes(f *xwal.Trunks) {
+	fmt.Printf("  %-12s %-6s %-7s %s\n", "NODE(branch)", "TRUNK", "FROZEN", "CHILDREN")
 	for _, n := range f.Nodes() {
 		fr := ""
 		if n.Frozen {
 			fr = "frozen"
 		}
-		fmt.Printf("  %-6s %-8s %-6s %-7s %-8s %s\n",
-			n.ID, vec(n.Vector), n.Trunk, fr, dash(n.Parent), branchJoin(n.Branch))
+		id := branchJoin(n.Branch)
+		if id == "" {
+			id = "(root)"
+		}
+		fmt.Printf("  %-12s %-6s %-7s %d\n", id, n.Trunk, fr, len(n.Children))
 	}
-}
-
-func vec(v []int) string {
-	if len(v) == 0 {
-		return "-"
-	}
-	parts := make([]string, len(v))
-	for i, n := range v {
-		parts[i] = strconv.Itoa(n)
-	}
-	return strings.Join(parts, ".")
 }
 
 func dash(s string) string {
@@ -457,8 +449,8 @@ func setMainLT(flag int64) uint64 {
 }
 
 // reducibleChannel returns the trunk's (first) reducible channel name.
-func reducibleChannel(f *xwal.Forest, trunk string) string {
-	x, _, err := f.Head(trunk)
+func reducibleChannel(f *xwal.Trunks, trunk string) string {
+	x, err := f.Head(trunk)
 	check(err)
 	defer x.Close()
 	if name, _ := reducibleBounds(x); name != "" {

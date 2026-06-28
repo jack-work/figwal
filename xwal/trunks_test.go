@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func forestCfg() Config {
+func trunksCfg() Config {
 	return Config{
 		Main: "ir",
 		Channels: []ChannelSpec{
@@ -20,9 +20,9 @@ func forestCfg() Config {
 
 // headMainTail opens a trunk's head and returns its main tail + first
 // real (post-genesis) payloads, for assertions.
-func headPayloads(t *testing.T, f *Forest, trunk TrunkID) []string {
+func headPayloads(t *testing.T, f *Trunks, trunk TrunkID) []string {
 	t.Helper()
-	x, _, err := f.Head(trunk)
+	x, err := f.Head(trunk)
 	if err != nil {
 		t.Fatalf("head %s: %v", trunk, err)
 	}
@@ -41,7 +41,7 @@ func headPayloads(t *testing.T, f *Forest, trunk TrunkID) []string {
 
 func TestForest_TailAppendNoFork(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	f, root, err := CreateForest(dir, forestCfg())
+	f, root, err := CreateTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestForest_TailAppendNoFork(t *testing.T) {
 
 func TestForest_InteriorForkKeepsExistingTrunk(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	f, root, err := CreateForest(dir, forestCfg())
+	f, root, err := CreateTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestForest_InteriorForkKeepsExistingTrunk(t *testing.T) {
 		t.Fatalf("alt did not inherit shared prefix: %v", altGot)
 	}
 	// Trunk listing: root + alt; alt parent = root, branched at 4.
-	trunks := f.Trunks()
+	trunks := f.List()
 	if len(trunks) != 2 {
 		t.Fatalf("want 2 trunks, got %d", len(trunks))
 	}
@@ -115,7 +115,7 @@ func TestForest_InteriorForkKeepsExistingTrunk(t *testing.T) {
 
 func TestForest_ChalkboardForksAlong(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	f, root, err := CreateForest(dir, forestCfg())
+	f, root, err := CreateTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func TestForest_ChalkboardForksAlong(t *testing.T) {
 		t.Fatal(err)
 	}
 	// alt chalkboard folds to alt thread; root stays root thread.
-	ax, _, _ := f.Head(alt)
+	ax, _ := f.Head(alt)
 	defer ax.Close()
 	st, err := ax.StateAt("chalkboard", chalkLast(t, ax))
 	if err != nil {
@@ -145,7 +145,7 @@ func TestForest_ChalkboardForksAlong(t *testing.T) {
 	if string(st) != `{"mantra":"alt thread"}` {
 		t.Fatalf("alt chalkboard = %s", st)
 	}
-	rx, _, _ := f.Head(root)
+	rx, _ := f.Head(root)
 	defer rx.Close()
 	rst, _ := rx.StateAt("chalkboard", chalkLast(t, rx))
 	if string(rst) != `{"mantra":"root thread"}` {
@@ -155,7 +155,7 @@ func TestForest_ChalkboardForksAlong(t *testing.T) {
 
 func TestForest_ForkTailBisectsPresent(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	f, root, err := CreateForest(dir, forestCfg())
+	f, root, err := CreateTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
