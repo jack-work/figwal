@@ -1,0 +1,181 @@
+# Dependencies & layering
+
+figwal is a strictly layered stack. Each layer depends only on the one
+below it, and the public surface a consumer addresses is the *top* layer
+(`xwal.Trunks`); everything underneath is plumbing.
+
+```
+  ┌─────────────────────────────────────────────────────────────┐
+  │  xwal.Trunks      trunk-addressed view; disk is source of    │
+  │  (trunks.go)      truth; .trunk markers; in-mem cache        │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │ depends on
+  ┌───────────────────────────▼─────────────────────────────────┐
+  │  xwal.XWAL        multi-channel "triune" join; Main + reduc- │
+  │  (xwal.go,        ible channels forked as one unit; genesis  │
+  │   fork.go)        seeding; manifest; Config                  │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │ depends on
+  ┌───────────────────────────▼─────────────────────────────────┐
+  │  disk.Log         the fork engine over segments; .fork       │
+  │  (log.go,         markers; own-range vs inherited prefix;    │
+  │   fork.go)        Fork / ForkRehome / ChildForkBases         │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │ depends on
+  ┌───────────────────────────▼─────────────────────────────────┐
+  │  segment          append-only segment files + ValueHash;     │
+  │  (segment.go,     the leaf — no deps on the layers above     │
+  │   hash.go)                                                    │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+A consumer (e.g. the figaro coding agent) addresses `Trunks` and never
+touches `XWAL`, `disk.Log`, or `segment` directly. A trunk id is the
+stable handle; the per-fork node, the per-channel logs, and the segment
+files are all internal mechanism the upper layers manage on its behalf.
+
+---
+
+## `segment` — the leaf
+
+**File:** `segment/segment.go`, `segment/hash.go`
+
+An append-only file framed by a `SegmentCodec`. A `Segment` owns one
+file, a `baseIndex`, a count, and an in-memory offset index rebuilt by
+`recover()` on open (the standard WAL recovery: scan forward, accept
+clean frames, truncate any torn tail). It has no knowledge of forks,
+channels, or trunks — it is the bottom of the stack and depends on
+nothing above it.
+
+Provides:
+
+- `Create` / `Open` / `OpenReadOnly` (and `*Headered` variants),
+  `Append`, `ReadIndex`, `ReadAt`, `Count`, `FirstIndex` / `BaseIndex` /
+  `LastIndex`, `Sync`.
+- **Block-0 header** (`WriteHeader` / `Header` / `HasHeader`): an opaque
+  first record framed like any other but *not* counted in the entry
+  index. This is the watermark slot the reducible model rides on; the
+  segment stores the bytes verbatim and never interprets them.
+- **`ValueHash`** (`hash.go`): value-stable content hashing. It
+  canonicalizes JSON (object keys sorted, whitespace stripped, numbers
+  preserved via `json.Number`) and returns the truncated SHA-256
+  (16 hex chars / 64 bits) of the canonical form. JSON-equal inputs hash
+  identically regardless of key order or formatting — the property the
+  upper layers rely on to compare entries by value.
+
+---
+
+## `disk.Log` — the fork engine over segments
+
+**File:** `disk/log.go`, `disk/fork.go`. **Depends on:** `segment`.
+
+A `Log` is a directory of segment files plus the machinery to fork that
+directory. It is where the fork model actually lives.
+
+**Fork bases & the `.fork` marker.** A child fork's directory carries a
+`.fork` file (`readForkMarker` / `writeForkMarker`) declaring the global
+index (`base=<N>`) at which it begins; the parent is always the
+immediate parent directory. On `Open`, a log with `forkBase > 0` and no
+explicit `Parent` auto-walks `..` to resolve its parent chain.
+
+**Own-range vs inherited prefix (watermarks).** A fork *owns* the index
+range `[forkBase, …]`; indices below `forkBase` are inherited and served
+by delegating to the parent chain (`Read`, `Range`, `HeaderAt`,
+`StateAt` all walk up when `idx < forkBase`). This is the watermark
+boundary: own-range entries live in this log's own segments, the
+inherited prefix lives in ancestors. `LastIndex` of an empty-own fork
+reports `forkBase-1` — it sits immediately after the parent's tail.
+Reducible (header-mode) logs additionally carry a per-segment watermark
+header computed by `OnSegmentOpen`; `StateAt(idx)` folds the segment's
+watermark with its entries up to `idx`.
+
+**`Fork` / `ForkRehome` / `ChildForkBases`** (`fork.go`):
+
+- `Fork(atIdx, childName, oldFutureName?)` splits the log at `atIdx`: the
+  log keeps the prefix `[FirstIndex, atIdx-1]` and becomes read-only; the
+  suffix moves into an "old-future" subdir; a fresh empty child subdir is
+  created, writable from `atIdx`. Branch points are N-ary and
+  re-splittable. The *heuristic* re-home applies — on a re-split (own
+  segments split) all existing children move into the old-future.
+- `ForkRehome(atIdx, child, oldFuture, rehome)` forks with an *explicit*
+  re-home list instead of the heuristic. The xwal joint fork uses this so
+  every channel re-homes the **same** children (decided once from the
+  main channel) and the triune's trees stay in lockstep.
+- `ChildForkBases()` returns each child subdir's `.fork` base — the input
+  the joint fork uses to decide which children re-home.
+
+**Empty-own-log handling.** A truly-empty *root* log (no parent, no
+entries) cannot be forked. But an **empty-own** fork child
+(`forkBase > 0`, all content inherited) *can* be forked: it materializes
+empty inheriting children, so every node gets its own branch in every
+channel (per-trunk write isolation). This is how a sparse related channel
+(whose own entries are all past the fork point) participates in a fork.
+
+Crash safety is per-log: a `.fork-pending` sentinel is written before any
+destructive change and removed on completion; `Open` refuses a log that
+still has the sentinel.
+
+---
+
+## `xwal.XWAL` — the multi-channel "triune" join
+
+**File:** `xwal/xwal.go`, `xwal/fork.go`. **Depends on:** `disk.Log`.
+
+`XWAL` binds several `disk.Log`s into one logical timeline. There is one
+**Main** channel (a `ChannelLog`) plus zero or more related channels;
+reducible channels (`ChannelReducible`, e.g. a jsonmerge chalkboard) ride
+the per-segment watermark headers via `OnSegmentOpen`. Every channel
+entry is a JSON envelope `{"m":<mainLT>,"p":<payload>,"x":<meta>}` so it
+tags the main-timeline LT it belongs to and round-trips through either
+codec.
+
+A `Config` describes the join at creation:
+
+- `Main` — the main channel name.
+- `Channels` — the `ChannelSpec` list (name, kind, reducer key).
+- `Registry` — maps reducer names to `Reducer{Reduce, Initial}`;
+  resolved on every open (functions are never persisted).
+- `Codec` — `"jsonl"` (default) or `"binary"`; persisted in the manifest.
+- `Genesis` — custom main-channel genesis payload (creation only).
+- `MintTrunkID` — pluggable opaque trunk-id generator (consumed by the
+  Trunks layer).
+
+After first open the on-disk `xwal.json` manifest is authoritative; the
+creation-time `Main`/`Channels`/`Codec` fields are ignored thereafter.
+
+**Forks all channels as a unit** (`fork.go`). `XWAL.Fork(atMainLT,
+child, oldFuture)` builds a `forkPlan`: the main channel forks at
+`atMainLT`, each related channel forks at its own boundary
+(`boundaryFor` — the first own entry whose main LT ≥ `atMainLT`, or
+own-tail+1 if it has not caught up; empty-own channels fork at their own
+first index). The re-home set is decided once from the main channel and
+applied to every channel by name via `ForkRehome`. A `.xwal-fork-pending`
+plan sentinel makes the join crash-atomic across channels: `Open`
+roll-forward-completes any interrupted fork before serving a branch, so
+the triune is never observed half-diverged.
+
+---
+
+## `xwal.Trunks` — the trunk-addressed view
+
+**File:** `xwal/trunks.go`. **Depends on:** `xwal.XWAL`.
+
+`Trunks` is the surface a consumer addresses. A **trunk** is one
+continuation chain across all channels (the triune forked as a unit) —
+the stable handle — while the per-fork **node** is plumbing.
+
+**DISK IS THE SOLE SOURCE OF TRUTH.** The node tree *is* the main
+channel's directory tree: `nN` subdirs plus `.fork` markers. Everything
+about a node is derivable from that tree by walking it — *except* a
+node's trunk id. That single non-derivable datum, and only that, is
+persisted: a `.trunk` file per node dir (in the main channel), sitting
+alongside `.fork`. The in-memory structure (`nodes`, `heads`, sequence
+counters) is a derived cache that `rebuild()` reconstructs by one walk of
+the tree on open; it cannot diverge from disk because it is read from
+disk.
+
+Provides the trunk-level operations: `CreateTrunks` / `OpenTrunks`,
+`Head`, `Append`, `ForkAt` / `ForkTail`, `SpawnChild`, `Remove`,
+`OwnerTrunk`, `AppendChannel`, `List` / `Nodes`. See
+[`primitives.md`](./primitives.md) for each one's signature and
+invariant.
