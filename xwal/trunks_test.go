@@ -1,6 +1,7 @@
 package xwal
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -16,6 +17,26 @@ func trunksCfg() Config {
 		Registry:    map[string]Reducer{"jsonmerge": {Reduce: jsonMerge, Initial: []byte("{}")}},
 		SegmentSize: 4096,
 	}
+}
+
+// seedTrunk creates a fresh store and returns it plus a live top-level
+// trunk, rooted at a markerless (birthless) stump so the trunk's own range
+// starts at LT 2 — exactly where the old root-trunk's own content began
+// (genesis@1 inherited). Lets the trunk-mechanics tests read identically.
+func seedTrunk(t *testing.T, dir string) (*Trunks, TrunkID) {
+	t.Helper()
+	f, err := CreateTrunks(dir, trunksCfg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.CreateStump("s"); err != nil {
+		t.Fatalf("create stump: %v", err)
+	}
+	id, err := f.SpawnUnderStump("s")
+	if err != nil {
+		t.Fatalf("spawn under stump: %v", err)
+	}
+	return f, id
 }
 
 // headMainTail opens a trunk's head and returns its main tail + first
@@ -41,10 +62,7 @@ func headPayloads(t *testing.T, f *Trunks, trunk TrunkID) []string {
 
 func TestForest_TailAppendNoFork(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	f, root, err := CreateTrunks(dir, trunksCfg())
-	if err != nil {
-		t.Fatal(err)
-	}
+	f, root := seedTrunk(t, dir)
 	// Tail appends (atMainLT 0) keep the same trunk.
 	tr, _, err := f.Append(root, 0, []byte(`"u1"`), nil)
 	if err != nil || tr != root {
@@ -63,10 +81,7 @@ func TestForest_TailAppendNoFork(t *testing.T) {
 
 func TestForest_InteriorForkKeepsExistingTrunk(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	f, root, err := CreateTrunks(dir, trunksCfg())
-	if err != nil {
-		t.Fatal(err)
-	}
+	f, root := seedTrunk(t, dir)
 	// Build root: genesis(1) u1(2) a1(3) u2(4)  -> tail 4
 	for _, m := range []string{`"u1"`, `"a1"`, `"u2"`} {
 		if _, _, err := f.Append(root, 0, []byte(m), nil); err != nil {
@@ -115,10 +130,7 @@ func TestForest_InteriorForkKeepsExistingTrunk(t *testing.T) {
 
 func TestForest_ChalkboardForksAlong(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	f, root, err := CreateTrunks(dir, trunksCfg())
-	if err != nil {
-		t.Fatal(err)
-	}
+	f, root := seedTrunk(t, dir)
 	// turn 1: append + a chalkboard patch keyed to the committed LT
 	_, lt1, _ := f.Append(root, 0, []byte(`"u1"`), nil)
 	if _, err := f.AppendChannel(root, "chalkboard", lt1, []byte(`{"set":{"mantra":"root thread"}}`), nil); err != nil {
@@ -155,10 +167,7 @@ func TestForest_ChalkboardForksAlong(t *testing.T) {
 
 func TestForest_ForkTailBisectsPresent(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	f, root, err := CreateTrunks(dir, trunksCfg())
-	if err != nil {
-		t.Fatal(err)
-	}
+	f, root := seedTrunk(t, dir)
 	for _, m := range []string{`"u1"`, `"a1"`} {
 		f.Append(root, 0, []byte(m), nil)
 	}
@@ -198,59 +207,103 @@ func chalkLast(t *testing.T, x *XWAL) uint64 {
 	return 0
 }
 
-func TestTrunks_SpawnChild(t *testing.T) {
+// seedTrunkBirth seeds a store with a stump carrying a birth IR entry (@2),
+// then a trunk under it (owns from LT 3) — the figaro loadout→conversation
+// shape (genesis@1, loadout-birth@2 inherited).
+func seedTrunkBirth(t *testing.T, dir, stump string) (*Trunks, TrunkID) {
+	t.Helper()
+	f, err := CreateTrunks(dir, trunksCfg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.CreateStump(stump); err != nil {
+		t.Fatalf("create stump: %v", err)
+	}
+	sx, err := f.StumpHead(stump)
+	if err != nil {
+		t.Fatalf("stump head: %v", err)
+	}
+	if _, err := sx.AppendMain([]byte(`"loadout-birth"`), nil); err != nil {
+		t.Fatalf("birth: %v", err)
+	}
+	sx.Close()
+	conv, err := f.SpawnUnderStump(stump)
+	if err != nil {
+		t.Fatalf("spawn under stump: %v", err)
+	}
+	return f, conv
+}
+
+func TestTrunks_Stumps(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	root, rootID, err := CreateTrunks(dir, trunksCfg())
+	f, err := CreateTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
-	// rootID = the ceremonial "null". Spawn two children (loadouts) — no
-	// continuation, both N-ary siblings under the frozen root.
-	l1, err := root.SpawnChild(rootID)
+	// Two stumps (loadouts) under the markerless root.
+	if err := f.CreateStump("L1@aa"); err != nil {
+		t.Fatalf("stump L1: %v", err)
+	}
+	if err := f.CreateStump("L2@bb"); err != nil {
+		t.Fatalf("stump L2: %v", err)
+	}
+	if err := f.CreateStump("L1@aa"); err == nil {
+		t.Fatal("duplicate stump name must fail")
+	}
+	// Stumps carry no .trunk marker.
+	for _, s := range []string{"L1@aa", "L2@bb"} {
+		if _, err := os.Stat(filepath.Join(dir, "ir", s, ".trunk")); err == nil {
+			t.Fatalf("stump %s must be markerless", s)
+		}
+	}
+	// The root sheds its .trunk marker too.
+	if _, err := os.Stat(filepath.Join(dir, "ir", ".trunk")); err == nil {
+		t.Fatal("root must be markerless")
+	}
+	// A stump spawns multiple top-level trunks (conversations).
+	c1, err := f.SpawnUnderStump("L1@aa")
 	if err != nil {
-		t.Fatalf("spawn l1: %v", err)
+		t.Fatalf("spawn c1: %v", err)
 	}
-	l2, err := root.SpawnChild(rootID)
+	c2, err := f.SpawnUnderStump("L1@aa")
 	if err != nil {
-		t.Fatalf("spawn l2 (root now frozen/closed): %v", err)
+		t.Fatalf("spawn c2: %v", err)
 	}
-	if l1 == l2 || l1 == rootID || l2 == rootID {
-		t.Fatalf("spawned trunks must be distinct: root=%s l1=%s l2=%s", rootID, l1, l2)
+	if c1 == c2 {
+		t.Fatal("spawned trunks must be distinct")
 	}
-	// root is now closed (no live head): Append/ForkTail on it should fail.
-	if _, _, err := root.Append(rootID, 0, []byte(`"x"`), nil); err == nil {
-		t.Fatal("append to a closed ceremonial root should fail")
+	// Each conversation is a live trunk: turns + interior fork work.
+	if _, _, err := f.Append(c1, 0, []byte(`"hello"`), nil); err != nil {
+		t.Fatalf("append c1: %v", err)
 	}
-	// A loadout can itself spawn a conversation child.
-	conv, err := root.SpawnChild(l1)
-	if err != nil {
-		t.Fatalf("spawn conv from loadout: %v", err)
-	}
-	// conv is a live trunk: it can take turns and fork normally.
-	if _, _, err := root.Append(conv, 0, []byte(`"hello"`), nil); err != nil {
-		t.Fatalf("append to conversation: %v", err)
-	}
-	if _, _, err := root.Append(conv, 0, []byte(`"more"`), nil); err != nil {
+	if _, _, err := f.Append(c1, 0, []byte(`"more"`), nil); err != nil {
 		t.Fatal(err)
 	}
-	alt, _, err := root.Append(conv, 2, []byte(`"branch"`), nil) // interior fork at conv's first own LT (shares genesis+hello)
+	alt, _, err := f.Append(c1, 2, []byte(`"branch"`), nil) // interior fork at c1's first own LT
 	if err != nil {
 		t.Fatalf("fork conversation: %v", err)
 	}
-	if alt == conv {
+	if alt == c1 {
 		t.Fatal("interior fork should mint a new trunk")
 	}
-	// Reopen from disk: all trunks still resolve.
+	// List exposes the trunk's stump.
+	for _, ti := range f.List() {
+		if ti.ID == c1 && ti.Stump != "L1@aa" {
+			t.Fatalf("c1 stump = %q, want L1@aa", ti.Stump)
+		}
+	}
+	// Reopen from disk: stumps + trunks resolve.
 	r2, err := OpenTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
-	// l1 is now a closed ceremonial trunk (it spawned conv) — no live head,
-	// like a loadout; resolve only the live trunks. l1 stays a SpawnChild parent.
-	if _, err := r2.SpawnChild(l1); err != nil {
-		t.Fatalf("closed l1 must still accept SpawnChild after reopen: %v", err)
+	if len(r2.Stumps()) != 2 {
+		t.Fatalf("want 2 stumps after reopen, got %d", len(r2.Stumps()))
 	}
-	for _, tr := range []string{l2, conv, alt} {
+	if _, err := r2.SpawnUnderStump("L1@aa"); err != nil {
+		t.Fatalf("stump must still spawn after reopen: %v", err)
+	}
+	for _, tr := range []string{c1, c2, alt} {
 		if x, err := r2.Head(tr); err != nil {
 			t.Fatalf("reopen head %s: %v", tr, err)
 		} else {
@@ -261,25 +314,18 @@ func TestTrunks_SpawnChild(t *testing.T) {
 
 func TestTrunks_ForkAt(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	root, rootID, err := CreateTrunks(dir, trunksCfg())
-	if err != nil {
-		t.Fatal(err)
-	}
-	conv, err := root.SpawnChild(rootID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	f, conv := seedTrunk(t, dir)
 	// conv owns u1,u2,u3 (LTs 2,3,4 after genesis@1 inherited).
 	for _, m := range []string{`"u1"`, `"u2"`, `"u3"`} {
-		if _, _, err := root.Append(conv, 0, []byte(m), nil); err != nil {
+		if _, _, err := f.Append(conv, 0, []byte(m), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
-	x, _ := root.Head(conv)
+	x, _ := f.Head(conv)
 	tail := mainTail(x)
 	x.Close()
 	// Interior fork at tail-1 (no message) -> empty alt sharing the prefix.
-	alt, err := root.ForkAt(conv, tail-1)
+	alt, err := f.ForkAt(conv, tail-1)
 	if err != nil {
 		t.Fatalf("forkat interior: %v", err)
 	}
@@ -287,15 +333,15 @@ func TestTrunks_ForkAt(t *testing.T) {
 		t.Fatalf("forkat must mint a new trunk, got %q", alt)
 	}
 	// alt is live and empty-own: a send appends at the divergence point.
-	if _, _, err := root.Append(alt, 0, []byte(`"branch msg"`), nil); err != nil {
+	if _, _, err := f.Append(alt, 0, []byte(`"branch msg"`), nil); err != nil {
 		t.Fatalf("send to forked alt: %v", err)
 	}
 	// conv keeps its id and is still re-forkable / sendable.
-	if _, _, err := root.Append(conv, 0, []byte(`"u4"`), nil); err != nil {
+	if _, _, err := f.Append(conv, 0, []byte(`"u4"`), nil); err != nil {
 		t.Fatalf("original trunk still live: %v", err)
 	}
 	// Past-tail ForkAt degenerates to a tail fork.
-	alt2, err := root.ForkAt(conv, 9999)
+	alt2, err := f.ForkAt(conv, 9999)
 	if err != nil || alt2 == "" || alt2 == conv {
 		t.Fatalf("forkat past tail should tail-fork: alt2=%q err=%v", alt2, err)
 	}
@@ -303,27 +349,21 @@ func TestTrunks_ForkAt(t *testing.T) {
 
 func TestTrunks_ReSplitBelow(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	root, rootID, err := CreateTrunks(dir, trunksCfg())
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Build a conversation, then fork it -> a parent/child trunk pair sharing
-	// a prefix. The alt's own range starts above the shared turns.
-	conv, _ := root.SpawnChild(rootID)
+	// conv owns LTs 3,4,5,6 (genesis@1, loadout-birth@2 inherited).
+	f, conv := seedTrunkBirth(t, dir, "L@h")
 	for _, m := range []string{`"a"`, `"b"`, `"c"`, `"d"`} {
-		if _, _, err := root.Append(conv, 0, []byte(m), nil); err != nil {
+		if _, _, err := f.Append(conv, 0, []byte(m), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// conv owns LTs 3,4,5,6 (genesis@1, loadout-birth@2 inherited). Fork at 5
-	// -> alt2 shares [1..5], conv continues with its suffix.
-	alt2, _, err := root.Append(conv, 5, []byte(`"alt-from-5"`), nil)
+	// Fork at 5 -> alt2 shares [1..5], conv continues with its suffix.
+	alt2, _, err := f.Append(conv, 5, []byte(`"alt-from-5"`), nil)
 	if err != nil {
 		t.Fatalf("interior fork: %v", err)
 	}
 	// Now RE-SPLIT-BELOW: fork alt2 at LT 3 — a turn alt2 inherited from conv
 	// (below alt2's own range). Must fork the ancestor and mint a sibling.
-	sib, _, err := root.Append(alt2, 3, []byte(`"resplit-at-3"`), nil)
+	sib, _, err := f.Append(alt2, 3, []byte(`"resplit-at-3"`), nil)
 	if err != nil {
 		t.Fatalf("re-split-below at inherited LT: %v", err)
 	}
@@ -340,7 +380,6 @@ func TestTrunks_ReSplitBelow(t *testing.T) {
 		if err != nil {
 			t.Fatalf("reopen head %s: %v", tr, err)
 		}
-		// each is sendable (write isolation holds through the re-split)
 		x.Close()
 		if _, _, err := r2.Append(tr, 0, []byte(`"more"`), nil); err != nil {
 			t.Fatalf("append to %s after re-split: %v", tr, err)
@@ -348,67 +387,62 @@ func TestTrunks_ReSplitBelow(t *testing.T) {
 	}
 }
 
-func TestTrunks_OwnerTrunk(t *testing.T) {
+func TestTrunks_Owner(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	root, rootID, err := CreateTrunks(dir, trunksCfg())
-	if err != nil {
-		t.Fatal(err)
-	}
-	// root owns LT 1 (genesis). ceremonial child (loadout-like) owns LT 2.
-	ld, _ := root.SpawnChild(rootID)
-	if _, _, err := root.Append(ld, 0, []byte(`"loadout-birth"`), nil); err != nil {
-		t.Fatal(err)
-	}
-	conv, _ := root.SpawnChild(ld) // owns [3..]
+	// genesis@1 owned by root; birth@2 owned by the stump; conv owns [3..].
+	f, conv := seedTrunkBirth(t, dir, "L@h")
 	for _, m := range []string{`"u1"`, `"u2"`} {
-		if _, _, err := root.Append(conv, 0, []byte(m), nil); err != nil {
+		if _, _, err := f.Append(conv, 0, []byte(m), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
-	cases := map[uint64]string{1: rootID, 2: ld, 3: conv, 4: conv}
-	for lt, want := range cases {
-		got, err := root.OwnerTrunk(conv, lt)
-		if err != nil {
-			t.Fatalf("OwnerTrunk(%d): %v", lt, err)
+	// LT 1 -> root, LT 2 -> stump, LT 3/4 -> conv.
+	o1, err := f.Owner(conv, 1)
+	if err != nil || !o1.IsRoot {
+		t.Fatalf("Owner(1) = %+v err=%v, want root", o1, err)
+	}
+	o2, err := f.Owner(conv, 2)
+	if err != nil || o2.Stump != "L@h" || o2.Trunk != "" {
+		t.Fatalf("Owner(2) = %+v err=%v, want stump L@h", o2, err)
+	}
+	for _, lt := range []uint64{3, 4} {
+		o, err := f.Owner(conv, lt)
+		if err != nil || o.Trunk != conv {
+			t.Fatalf("Owner(%d) = %+v err=%v, want trunk %s", lt, o, err, conv)
 		}
-		if got != want {
-			t.Errorf("OwnerTrunk(conv, %d) = %q, want %q", lt, got, want)
-		}
+	}
+	// OwnerTrunk still resolves the trunk id (empty for ceremonial owners).
+	if got, _ := f.OwnerTrunk(conv, 3); got != conv {
+		t.Fatalf("OwnerTrunk(3) = %q, want %s", got, conv)
 	}
 }
 
 func TestTrunks_Remove(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	root, rootID, err := CreateTrunks(dir, trunksCfg())
-	if err != nil {
-		t.Fatal(err)
-	}
-	ld, _ := root.SpawnChild(rootID)
-	root.Append(ld, 0, []byte(`"birth"`), nil)
-	conv, _ := root.SpawnChild(ld)
-	root.Append(conv, 0, []byte(`"u1"`), nil)
-	root.Append(conv, 0, []byte(`"u2"`), nil)
-	alt, _ := root.ForkTail(conv) // conv now has a live branch (alt)
+	f, conv := seedTrunkBirth(t, dir, "L@h")
+	f.Append(conv, 0, []byte(`"u1"`), nil)
+	f.Append(conv, 0, []byte(`"u2"`), nil)
+	alt, _ := f.ForkTail(conv) // conv now has a live branch (alt)
 
-	// Can't remove the root.
-	if err := root.Remove(rootID, false); err == nil {
-		t.Fatal("removing the root trunk must fail")
+	// A stump name is not a trunk id -> Remove refuses it.
+	if err := f.Remove("L@h", false); err == nil {
+		t.Fatal("removing a stump (not a trunk) must fail")
 	}
 	// conv has a live branch (alt) -> refuse without recursive.
-	if err := root.Remove(conv, false); err == nil {
+	if err := f.Remove(conv, false); err == nil {
 		t.Fatal("removing a trunk with live branches must fail without recursive")
 	}
 	// Remove the leaf branch (alt) directly -> ok; conv survives.
-	if err := root.Remove(alt, false); err != nil {
+	if err := f.Remove(alt, false); err != nil {
 		t.Fatalf("remove leaf branch: %v", err)
 	}
-	if _, err := root.Head(conv); err != nil {
+	if _, err := f.Head(conv); err != nil {
 		t.Fatalf("conv must survive removing its branch: %v", err)
 	}
-	if _, err := root.Head(alt); err == nil {
+	if _, err := f.Head(alt); err == nil {
 		t.Fatal("alt should be gone")
 	}
-	// Reopen from disk: alt stays gone, conv resolves.
+	// Reopen from disk: alt stays gone, conv resolves, stump intact.
 	r2, _ := OpenTrunks(dir, trunksCfg())
 	if _, err := r2.Head(conv); err != nil {
 		t.Fatalf("conv missing after reopen: %v", err)
@@ -416,7 +450,10 @@ func TestTrunks_Remove(t *testing.T) {
 	if _, err := r2.Head(alt); err == nil {
 		t.Fatal("alt resurrected after reopen")
 	}
-	// Recursive remove of conv (it now has no branches, but exercise the flag).
+	if len(r2.Stumps()) != 1 {
+		t.Fatalf("stump must survive trunk removal, got %d stumps", len(r2.Stumps()))
+	}
+	// Recursive remove of conv.
 	if err := r2.Remove(conv, true); err != nil {
 		t.Fatalf("recursive remove conv: %v", err)
 	}

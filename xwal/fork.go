@@ -91,20 +91,35 @@ func (x *XWAL) buildForkPlan(atMainLT uint64, childName, oldFutureName string) (
 	// continuation, and the SAME set moves in every channel (by name). This
 	// keeps the triune's node trees in lockstep on a re-split-below, where a
 	// sparse related channel would otherwise tail-fork and skip the re-home.
-	bases, err := x.chans[x.main].log.ChildForkBases()
-	if err != nil {
-		return forkPlan{}, err
-	}
-	for name, base := range bases {
-		if base > atMainLT {
-			plan.Rehome = append(plan.Rehome, name)
+	//
+	// An N-ary add-one (oldFutureName == "") has no continuation to re-home
+	// into, so it never re-homes. Skipping the computation also avoids
+	// materializing an old-future for related channels — which, with no
+	// explicit name, would default to filepath.Base(dir) and, for a slashed
+	// channel name like "translations/anthropic", create a stray nested
+	// "anthropic/anthropic" dir.
+	if oldFutureName != "" {
+		bases, err := x.chans[x.main].log.ChildForkBases()
+		if err != nil {
+			return forkPlan{}, err
+		}
+		for name, base := range bases {
+			if base > atMainLT {
+				plan.Rehome = append(plan.Rehome, name)
+			}
 		}
 	}
 	var mainEntry *forkPlanEntry
 	for _, name := range x.order {
 		ch := x.chans[name]
-		if ch.log.FirstIndex() == 0 {
-			continue // truly-empty channel (never written): nothing to fork
+		if ch.log.FirstIndex() == 0 && ch.log.ForkBase() == 0 {
+			// Truly-empty ROOT channel (never written, no fork structure):
+			// nothing to fork. A forked node (ForkBase>0) is NOT skipped even
+			// when FirstIndex reads 0 — that happens for a backfilled log
+			// channel whose ancestors are empty, yet the node still forks
+			// (empty-own → empty inheriting children) so its tree stays
+			// mirrored with the main channel.
+			continue
 		}
 		// NOTE: an empty-OWN log (forkBase>0, all content inherited) is NOT
 		// skipped — it forks into empty inheriting children so every trunk

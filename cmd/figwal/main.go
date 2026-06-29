@@ -205,9 +205,9 @@ func runXWAL(args []string) {
 		if !seen {
 			cfg.Channels = append([]xwal.ChannelSpec{{Name: main, Kind: xwal.ChannelLog}}, cfg.Channels...)
 		}
-		_, root, err := xwal.CreateTrunks(dir, cfg)
+		_, err := xwal.CreateTrunks(dir, cfg)
 		check(err)
-		fmt.Printf("initialized xwal %s (main=%s, root trunk=%s)\n", dir, main, root)
+		fmt.Printf("initialized xwal %s (main=%s); root is markerless — create stumps with `xwal stump`\n", dir, main)
 		return
 	}
 
@@ -232,6 +232,86 @@ func runXWAL(args []string) {
 	// handle; appending at an interior LT forks). They operate on the joint
 	// forest, never on a raw branch.
 	switch cmd {
+	case "stump":
+		// stump <dir> <name> [birth-data]  — create a markerless stump; if
+		// birth-data is given, write it as the stump's first IR entry.
+		if len(pos) < 1 || len(pos) > 2 {
+			usageXWAL()
+		}
+		f, err := xwal.OpenTrunks(dir, cfg)
+		check(err)
+		check(f.CreateStump(pos[0]))
+		if len(pos) == 2 {
+			sx, err := f.StumpHead(pos[0])
+			check(err)
+			_, err = sx.AppendMain([]byte(pos[1]), nil)
+			sx.Close()
+			check(err)
+		}
+		fmt.Printf("created stump %q under root\n", pos[0])
+		return
+	case "spawn":
+		// spawn <dir> <stump-name>  — mint a top-level trunk under a stump.
+		if len(pos) != 1 {
+			usageXWAL()
+		}
+		f, err := xwal.OpenTrunks(dir, cfg)
+		check(err)
+		id, err := f.SpawnUnderStump(pos[0])
+		check(err)
+		fmt.Printf("spawned trunk %s under stump %q\n", id, pos[0])
+		return
+	case "spawn-root":
+		// spawn-root <dir>  — mint a top-level trunk directly under the root.
+		f, err := xwal.OpenTrunks(dir, cfg)
+		check(err)
+		id, err := f.SpawnUnderRoot()
+		check(err)
+		fmt.Printf("spawned trunk %s under root\n", id)
+		return
+	case "promote":
+		// promote <dir> <trunk> [levels]
+		if len(pos) < 1 || len(pos) > 2 {
+			usageXWAL()
+		}
+		levels := 1
+		if len(pos) == 2 {
+			levels = int(mustU64(pos[1]))
+		}
+		f, err := xwal.OpenTrunks(dir, cfg)
+		check(err)
+		climbed, err := f.Promote(pos[0], levels)
+		if err == xwal.ErrAtStump {
+			fmt.Printf("trunk %s is rooted at a stump — cannot promote further\n", pos[0])
+			os.Exit(1)
+		}
+		check(err)
+		fmt.Printf("promoted trunk %s by %d level(s)\n", pos[0], climbed)
+		return
+	case "add-channel":
+		// add-channel <dir> <name[:reducer]>  — add + backfill a channel.
+		if len(pos) != 1 {
+			usageXWAL()
+		}
+		name, reducer, isRed := strings.Cut(pos[0], ":")
+		spec := xwal.ChannelSpec{Name: name, Kind: xwal.ChannelLog}
+		if isRed {
+			spec.Kind = xwal.ChannelReducible
+			spec.Reducer = reducer
+		}
+		x, err := xwal.Open(dir, cfg)
+		check(err)
+		check(x.AddChannel(spec))
+		x.Close()
+		fmt.Printf("added + backfilled channel %q\n", name)
+		return
+	case "stumps":
+		f, err := xwal.OpenTrunks(dir, cfg)
+		check(err)
+		for _, s := range f.Stumps() {
+			fmt.Printf("  %-24s  children=%v\n", s.Name, s.Children)
+		}
+		return
 	case "send":
 		if len(pos) != 2 {
 			usageXWAL()
@@ -390,25 +470,33 @@ func parseTrunkLT(s string) (string, uint64) {
 }
 
 func printTrunks(f *xwal.Trunks) {
-	fmt.Printf("  %-6s %-8s %5s %-12s %s\n", "TRUNK", "PARENT", "TIP", "HEAD", "BRANCHED")
+	if ss := f.Stumps(); len(ss) > 0 {
+		for _, s := range ss {
+			fmt.Printf("  stump %-20s children=%v\n", s.Name, s.Children)
+		}
+	}
+	fmt.Printf("  %-8s %-8s %-12s %5s %-16s %s\n", "TRUNK", "PARENT", "STUMP", "TIP", "HEAD", "BRANCHED")
 	for _, t := range f.List() {
-		fmt.Printf("  %-6s %-8s %5d %-12s %s\n",
-			t.ID, dash(t.Parent), t.Tip, branchJoin(t.Head), branchedAt(t.BranchedLT))
+		fmt.Printf("  %-8s %-8s %-12s %5d %-16s %s\n",
+			t.ID, dash(t.Parent), dash(t.Stump), t.Tip, branchJoin(t.Head), branchedAt(t.BranchedLT))
 	}
 }
 
 func printNodes(f *xwal.Trunks) {
-	fmt.Printf("  %-12s %-6s %-7s %s\n", "NODE(branch)", "TRUNK", "FROZEN", "CHILDREN")
+	fmt.Printf("  %-20s %-8s %-7s %-6s %s\n", "NODE(branch)", "TRUNK", "FROZEN", "CLASS", "CHILDREN")
 	for _, n := range f.Nodes() {
 		fr := ""
 		if n.Frozen {
 			fr = "frozen"
 		}
 		id := branchJoin(n.Branch)
+		class := "trunk"
 		if id == "" {
-			id = "(root)"
+			id, class = "(root)", "root"
+		} else if n.Trunk == "" {
+			class = "stump"
 		}
-		fmt.Printf("  %-12s %-6s %-7s %d\n", id, n.Trunk, fr, len(n.Children))
+		fmt.Printf("  %-20s %-8s %-7s %-6s %d\n", id, n.Trunk, fr, class, len(n.Children))
 	}
 }
 
@@ -482,7 +570,7 @@ func dumpXWAL(x *xwal.XWAL) {
 	fmt.Printf("xwal branch=%s main=%s\n", br, x.Main())
 	for _, c := range x.Channels() {
 		fmt.Printf("\n== %s (%s)  first=%d last=%d ==\n", c.Name, c.Kind, c.First, c.Last)
-		if c.First == 0 || c.Last < c.First {
+		if c.Last == 0 {
 			fmt.Println("  (empty — inherited from ancestor)")
 			continue
 		}
@@ -491,11 +579,17 @@ func dumpXWAL(x *xwal.XWAL) {
 				fmt.Printf("  state@%d = %s\n", c.Last, string(st))
 			}
 		}
-		for lt := c.First; lt <= c.Last; lt++ {
+		// c.First reflects the first index visible up the parent chain, which
+		// is 0 when ancestors are empty even though this node has own entries;
+		// start at 1 and skip the inherited-but-absent low indices.
+		lo := c.First
+		if lo == 0 {
+			lo = 1
+		}
+		for lt := lo; lt <= c.Last; lt++ {
 			m, p, err := x.Read(c.Name, lt)
 			if err != nil {
-				fmt.Printf("  [%d] <err: %v>\n", lt, err)
-				continue
+				continue // below this node's own range (inherited prefix is empty)
 			}
 			fmt.Printf("  [%d] main=%d  %s\n", lt, m, displayPayload(p))
 		}
@@ -668,10 +762,17 @@ func usageXWAL() {
 	fmt.Fprintln(os.Stderr, `figwal xwal <command> <dir> [args]
 
 trunk verbs (mirror figaro — a trunk is the addressable handle; no attendance):
-  init <main> <ch[:reducer]>...   create the forest; e.g.
-                                  init ./c ir translations chalkboard:map
-                                  ("map" = native nested reducible map, built in;
-                                  [--codec jsonl|binary]; prints the root trunk id)
+  init <main> <ch[:reducer]>...   create the forest (markerless root holding
+                                  genesis); e.g. init ./c ir translations chalkboard:jsonmerge
+                                  [--codec jsonl|binary]
+  stump <name> [birth-data]       create a markerless stump under the root (the
+                                  cauterization boundary), optional birth IR entry
+  spawn <stump-name>              mint a top-level trunk under a stump
+  spawn-root                      mint a top-level trunk directly under the root
+  stumps                          list stumps and their trunk children
+  promote <trunk> [levels]        climb a trunk up N stump-bounded levels by
+                                  relabeling .trunk markers (stops at a stump)
+  add-channel <name[:reducer]>    add + backfill a channel (mirrors the main tree)
   send  <trunk>[:<LT>] <data>     append to a trunk; <LT> < tail FORKS a new trunk
                                   there and appends (existing trunk retained), else
                                   appends at the tail

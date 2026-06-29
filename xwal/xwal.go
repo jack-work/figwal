@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/jack-work/figwal/disk"
 	"github.com/jack-work/figwal/segment"
@@ -359,9 +360,20 @@ func (x *XWAL) Clear(channelName string) error {
 	return nil
 }
 
-// AddChannel adds a channel to an existing xwal (e.g. a translation
-// stream for a newly-seen provider), updating the manifest and opening it
-// on this branch. Reducible channels must name a registered reducer.
+// AddChannel adds a channel to an existing xwal (e.g. a translation stream
+// for a newly-seen provider), updating the manifest, then ROOTING and
+// BACKFILLING it: the channel is born at the channel root and its node tree
+// is mirrored from the main channel's tree so every existing node (stumps +
+// trunks) has a matching, empty, correctly-rooted node. Without this a
+// lazily-added channel would exist only on the branch it was added from, and
+// forks could not propagate it. The handle is then opened at THIS branch.
+//
+// Backfilled nodes carry no own segments — their content is derivable (a log
+// channel is empty; a reducible channel seeds each node with the reducer's
+// Initial watermark so StateAt folds from a defined base). Per-channel
+// forkBases are recomputed for an empty channel (every fork lands at the
+// channel's own first index), never copied from the main channel — the index
+// spaces differ. Reducible channels must name a registered reducer.
 func (x *XWAL) AddChannel(spec ChannelSpec) error {
 	if _, exists := x.chans[spec.Name]; exists {
 		return fmt.Errorf("xwal: channel %q already exists", spec.Name)
@@ -388,7 +400,12 @@ func (x *XWAL) AddChannel(spec ChannelSpec) error {
 		ch.reduce = r.Reduce
 		ch.initial = r.Initial
 	}
-	cdir := x.fullChannelDir(spec.Name)
+	// Root + backfill the channel's node tree to mirror the main channel.
+	if err := x.backfillChannel(ch); err != nil {
+		return fmt.Errorf("xwal: backfill channel %q: %w", spec.Name, err)
+	}
+	// Open the handle for THIS branch (now that the structure exists).
+	cdir := x.channelDir(spec.Name)
 	l, err := disk.Open(cdir, x.channelOpts(ch))
 	if err != nil {
 		return err
@@ -396,9 +413,95 @@ func (x *XWAL) AddChannel(spec ChannelSpec) error {
 	ch.dir = cdir
 	ch.log = l
 	ch.fk = map[uint64]uint64{}
+	if err := ch.buildFK(); err != nil {
+		l.Close()
+		return err
+	}
 	x.chans[spec.Name] = ch
 	x.order = append(x.order, spec.Name)
 	return nil
+}
+
+// backfillChannel materializes a newly-added channel's node tree to mirror
+// the main channel's directory tree: for every main-channel node dir it
+// creates the corresponding channel dir, with a .fork marker for non-root
+// nodes (the empty-channel fork base — the node's own first index) and, for a
+// reducible channel, an Initial-watermark seed segment so StateAt has a base
+// to fold from. No payload entries are written (content is derivable).
+func (x *XWAL) backfillChannel(ch *channel) error {
+	mainBase := filepath.Join(x.root, x.main)
+	chBase := filepath.Join(x.root, ch.name)
+	var walk func(mainDir, chDir string, depth int) error
+	walk = func(mainDir, chDir string, depth int) error {
+		if err := os.MkdirAll(chDir, 0o755); err != nil {
+			return err
+		}
+		if depth > 0 {
+			// Empty-channel fork base: an all-empty channel forks at its own
+			// first index (1) at every level — what the joint-fork boundary
+			// computation yields for an empty channel. Reads below it resolve
+			// up the (empty) parent chain.
+			const base = uint64(1)
+			if err := writeBackfillFork(chDir, base, x.codec, ch); err != nil {
+				return err
+			}
+		} else if ch.kind == ChannelReducible {
+			// Seed the channel root with the Initial watermark too.
+			if err := seedWatermark(chDir, 1, x.codec, ch.initial); err != nil {
+				return err
+			}
+		}
+		ents, err := os.ReadDir(mainDir)
+		if err != nil {
+			return err
+		}
+		for _, e := range ents {
+			if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+				if err := walk(filepath.Join(mainDir, e.Name()), filepath.Join(chDir, e.Name()), depth+1); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	return walk(mainBase, chBase, 0)
+}
+
+// writeBackfillFork writes a child node's .fork marker (and, for a reducible
+// channel, its Initial-watermark seed segment at base).
+func writeBackfillFork(chDir string, base uint64, codec segment.SegmentCodec, ch *channel) error {
+	body := fmt.Sprintf("base=%d\n", base)
+	tmp := filepath.Join(chDir, ".fork.tmp")
+	if err := os.WriteFile(tmp, []byte(body), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, filepath.Join(chDir, ".fork")); err != nil {
+		return err
+	}
+	if ch.kind == ChannelReducible {
+		return seedWatermark(chDir, base, codec, ch.initial)
+	}
+	return nil
+}
+
+// seedWatermark writes a header-only segment at baseIndex carrying the
+// reducible Initial state, so an empty reducible node folds from a defined
+// watermark (mirrors disk.Fork's writeWatermarkSeg).
+func seedWatermark(chDir string, baseIndex uint64, codec segment.SegmentCodec, initial []byte) error {
+	name := fmt.Sprintf("%020d%s", baseIndex, codec.FileExt())
+	seg, err := segment.Create(filepath.Join(chDir, name), codec, baseIndex, 0)
+	if err != nil {
+		return err
+	}
+	if err := seg.WriteHeader(initial); err != nil {
+		seg.Close()
+		return err
+	}
+	if err := seg.Sync(); err != nil {
+		seg.Close()
+		return err
+	}
+	return seg.Close()
 }
 
 // AppendMain appends payload (with optional opaque meta) to the main

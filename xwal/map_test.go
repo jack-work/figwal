@@ -87,13 +87,29 @@ func mapTrunksCfg() Config {
 	}
 }
 
+
+// seedMapTrunk seeds a store (map reducer cfg) with a birthless stump and a
+// trunk under it (own range from LT 2), the migration of the old root-trunk.
+func seedMapTrunk(t *testing.T, dir string) (*Trunks, TrunkID) {
+	t.Helper()
+	f, err := CreateTrunks(dir, mapTrunksCfg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.CreateStump("s"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := f.SpawnUnderStump("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f, id
+}
+
 func TestMap_BuiltinReducerNoRegistration(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	// Note: cfg.Registry is nil — "map" must resolve from the built-ins.
-	f, root, err := CreateTrunks(dir, mapTrunksCfg())
-	if err != nil {
-		t.Fatalf("create with built-in map reducer: %v", err)
-	}
+	f, root := seedMapTrunk(t, dir)
 	_, lt, _ := f.Append(root, 0, []byte(`"u1"`), nil)
 	sp, _ := MapSetPatch([]string{"system", "provider"}, []byte(`"anthropic"`))
 	if _, err := f.AppendChannel(root, "chalkboard", lt, sp, nil); err != nil {
@@ -122,7 +138,7 @@ func TestMap_BuiltinReducerNoRegistration(t *testing.T) {
 
 func TestMap_ForksAlongDeep(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	f, root, _ := CreateTrunks(dir, mapTrunksCfg())
+	f, root := seedMapTrunk(t, dir)
 	_, lt, _ := f.Append(root, 0, []byte(`"u1"`), nil)
 	sp, _ := MapSetPatch([]string{"system", "model"}, []byte(`"opus"`))
 	f.AppendChannel(root, "chalkboard", lt, sp, nil)

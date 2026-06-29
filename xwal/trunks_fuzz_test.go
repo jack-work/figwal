@@ -16,10 +16,7 @@ import (
 // Deterministic seed -> reproducible.
 func TestForest_FuzzSequential(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	f, root, err := CreateTrunks(dir, mapTrunksCfg())
-	if err != nil {
-		t.Fatal(err)
-	}
+	f, root := seedMapTrunk(t, dir)
 	rng := rand.New(rand.NewSource(1))
 	trunks := []string{root}
 

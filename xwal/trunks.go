@@ -2,6 +2,7 @@ package xwal
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -55,9 +56,24 @@ type tnode struct {
 	children []string // child node keys
 	parent   string   // parent node key ("" = root's absent parent; root key is also "")
 	isRoot   bool
+	isStump  bool // a markerless depth-1 child of the root (cauterization boundary)
+}
+
+// stumpName is the stump's identity: its (single) branch dir name. Empty
+// for non-stumps.
+func (n *tnode) stumpName() string {
+	if n.isStump && len(n.branch) == 1 {
+		return n.branch[0]
+	}
+	return ""
 }
 
 const trunkMarker = ".trunk"
+
+// ErrAtStump is returned by Promote when a trunk cannot climb further: the
+// node above it is a stump (the cauterization boundary). Callers map this
+// to a domain message (figaro: "cannot promote into a loadout").
+var ErrAtStump = errors.New("xwal: trunk is rooted at a stump; cannot promote further")
 
 // genesisMarker is the root node's first main entry, so the trunk is
 // immediately forkable and its prefix is never empty.
@@ -67,18 +83,21 @@ const genesisMarker = `{"genesis":true}`
 func mainTail(x *XWAL) uint64 { return x.chans[x.main].log.LastIndex() }
 
 // CreateTrunks initializes a fresh trunk store at dir (creating the xwal
-// from cfg), seeds the genesis root trunk, and returns it plus the root
-// trunk id.
-func CreateTrunks(dir string, cfg Config) (*Trunks, string, error) {
+// from cfg) and seeds the genesis at the root. The root is the channel
+// directory itself: it carries NO .trunk marker (it is addressed by being
+// the root, not by an id) and holds the genesis every trunk inherits.
+// Stumps (CreateStump) and trunks live below it.
+func CreateTrunks(dir string, cfg Config) (*Trunks, error) {
 	if cfg.Main == "" {
-		return nil, "", fmt.Errorf("xwal: CreateTrunks needs cfg.Main")
-	}
-	if _, err := os.Stat(filepath.Join(dir, cfg.Main, trunkMarker)); err == nil {
-		return nil, "", fmt.Errorf("xwal: trunks already initialized at %s", dir)
+		return nil, fmt.Errorf("xwal: CreateTrunks needs cfg.Main")
 	}
 	x, err := Open(dir, cfg)
 	if err != nil {
-		return nil, "", err
+		return nil, err
+	}
+	if mainTail(x) > 0 {
+		x.Close()
+		return nil, fmt.Errorf("xwal: trunks already initialized at %s", dir)
 	}
 	gen := cfg.Genesis
 	if len(gen) == 0 {
@@ -87,30 +106,23 @@ func CreateTrunks(dir string, cfg Config) (*Trunks, string, error) {
 	glt, err := x.AppendMain(gen, nil)
 	if err != nil {
 		x.Close()
-		return nil, "", err
+		return nil, err
 	}
 	for _, c := range x.Channels() {
 		if c.Kind == ChannelReducible {
 			if _, err := x.Append(c.Name, glt, []byte("{}"), nil); err != nil {
 				x.Close()
-				return nil, "", err
+				return nil, err
 			}
 		}
 	}
 	x.Close()
 
-	rootTrunk := "t0"
-	if cfg.MintTrunkID != nil {
-		rootTrunk = cfg.MintTrunkID()
-	}
-	if err := writeTrunkID(filepath.Join(dir, cfg.Main), rootTrunk); err != nil {
-		return nil, "", err
-	}
 	t := &Trunks{root: dir, cfg: cfg, main: cfg.Main}
 	if err := t.rebuild(); err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	return t, rootTrunk, nil
+	return t, nil
 }
 
 // OpenTrunks opens an existing trunk store, rebuilding its cache from disk.
@@ -149,9 +161,15 @@ func (t *Trunks) walk(dir string, branch []string, parentKey string, isRoot bool
 			kids = append(kids, e.Name())
 		}
 	}
+	// Node class is positional + marker-based: the root is the channel dir
+	// itself (depth 0, no marker); a stump is a markerless depth-1 child of
+	// the root (named <loadout>@<hash>); everything with a .trunk marker is a
+	// trunk. A markerless node deeper than depth-1 is treated as part of its
+	// parent's trunk's plumbing (shouldn't arise in the new layout).
 	n := &tnode{
 		branch: append([]string(nil), branch...),
 		trunk:  trunkID, frozen: len(kids) > 0, parent: parentKey, isRoot: isRoot,
+		isStump: !isRoot && trunkID == "" && len(branch) == 1,
 	}
 	for _, k := range kids {
 		n.children = append(n.children, joinKey(branch, k))
@@ -499,12 +517,14 @@ func (t *Trunks) Remove(trunk string, recursive bool) error {
 	return t.rebuild()
 }
 
-// SpawnChild adds a new child trunk under a "ceremonial" parent WITHOUT a
-// continuation: the parent's node becomes (or stays) a frozen branch point
-// that only hosts children. This is for nodes that don't continue and only
-// spawn N children — e.g. a null root, or a loadout that many conversations
-// fork from. (ForkTail, by contrast, gives the parent a continuation.)
-// Returns the new child trunk id.
+// SpawnChild adds a new child trunk under a "ceremonial" parent trunk
+// WITHOUT a continuation: the parent's node becomes (or stays) a frozen
+// branch point that only hosts children. (ForkTail, by contrast, gives the
+// parent a continuation.) Returns the new child trunk id.
+//
+// In the root/stumps layout the ceremonial parents are the root and the
+// stumps, addressed with SpawnUnderRoot / SpawnUnderStump. SpawnChild
+// remains for spawning a fresh child under an existing trunk.
 func (t *Trunks) SpawnChild(parent TrunkID) (TrunkID, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -512,31 +532,100 @@ func (t *Trunks) SpawnChild(parent TrunkID) (TrunkID, error) {
 	if !ok {
 		return "", fmt.Errorf("xwal: unknown trunk %q", parent)
 	}
-	node := t.nodes[nodeKey]
-	x, err := Open(t.root, t.cfg, node.branch...)
+	return t.spawnTrunkAt(t.nodes[nodeKey].branch)
+}
+
+// CreateStump mints a markerless, named depth-1 child of the root — the
+// cauterization boundary. A stump holds its own birth content (write it via
+// StumpHead) and hosts top-level trunks as children (SpawnUnderStump). It
+// carries NO .trunk marker: its name + depth-1 position IS its identity
+// (figaro names them <loadout>@<hash>). Idempotent callers should check
+// Stumps() first; a duplicate name is an error.
+func (t *Trunks) CreateStump(name string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) || strings.HasPrefix(name, ".") {
+		return fmt.Errorf("xwal: invalid stump name %q", name)
+	}
+	if n := t.nodes[name]; n != nil {
+		return fmt.Errorf("xwal: stump %q already exists", name)
+	}
+	// Fork the root at its tail (N-ary add-one), naming the child `name`,
+	// with no continuation and no trunk marker.
+	if _, err := t.forkChild(nil, name); err != nil {
+		return fmt.Errorf("xwal: create-stump %q: %w", name, err)
+	}
+	return t.rebuild()
+}
+
+// StumpHead opens a stump's branch for appending its birth content (IR +
+// related channels), before it gains trunk children. Caller closes it.
+func (t *Trunks) StumpHead(name string) (*XWAL, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	n := t.nodes[name]
+	if n == nil || !n.isStump {
+		return nil, fmt.Errorf("xwal: no stump %q", name)
+	}
+	return Open(t.root, t.cfg, name)
+}
+
+// SpawnUnderStump mints a new trunk (a top-level aria) as a child of a stump.
+func (t *Trunks) SpawnUnderStump(name string) (TrunkID, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	n := t.nodes[name]
+	if n == nil || !n.isStump {
+		return "", fmt.Errorf("xwal: no stump %q", name)
+	}
+	return t.spawnTrunkAt(n.branch)
+}
+
+// SpawnUnderRoot mints a new trunk directly under the root (a top-level
+// trunk with no stump — e.g. a loadoutless conversation).
+func (t *Trunks) SpawnUnderRoot() (TrunkID, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.spawnTrunkAt(nil)
+}
+
+// spawnTrunkAt forks the node at parentBranch at its tail (N-ary add-one),
+// mints a fresh trunk id for the child, and writes its .trunk marker. Caller
+// holds t.mu.
+func (t *Trunks) spawnTrunkAt(parentBranch []string) (TrunkID, error) {
+	childDir := t.mintNode()
+	childBranch, err := t.forkChild(parentBranch, childDir)
 	if err != nil {
+		return "", fmt.Errorf("xwal: spawn: %w", err)
+	}
+	childTrunk := t.mintTrunk()
+	if err := writeTrunkID(t.irDir(childBranch), childTrunk); err != nil {
 		return "", err
+	}
+	return childTrunk, t.rebuild()
+}
+
+// forkChild forks the node at parentBranch at its tail (N-ary add-one, no
+// continuation), creating an empty child dir named childDir in every channel.
+// Returns the child's branch. Caller holds t.mu and must rebuild afterwards.
+func (t *Trunks) forkChild(parentBranch []string, childDir string) ([]string, error) {
+	x, err := Open(t.root, t.cfg, parentBranch...)
+	if err != nil {
+		return nil, err
 	}
 	tail := mainTail(x)
 	x.Close()
-
-	childDir := t.mintNode()
-	fx, err := Open(t.root, t.cfg, node.branch...)
+	fx, err := Open(t.root, t.cfg, parentBranch...)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	c, ferr := fx.Fork(tail+1, childDir, "") // N-ary add-one at the tail; no continuation
 	fx.Close()
 	if ferr != nil {
-		return "", fmt.Errorf("spawn-child: %w", ferr)
+		return nil, ferr
 	}
 	c.Close()
-
-	childTrunk := t.mintTrunk()
-	if err := writeTrunkID(t.irDir(append(append([]string(nil), node.branch...), childDir)), childTrunk); err != nil {
-		return "", err
-	}
-	return childTrunk, t.rebuild()
+	return append(append([]string(nil), parentBranch...), childDir), nil
 }
 
 // OwnerTrunk returns the trunk id of the node that OWNS atMainLT along the
@@ -559,6 +648,131 @@ func (t *Trunks) OwnerTrunk(trunk string, atMainLT uint64) (string, error) {
 		return "", fmt.Errorf("xwal: no owner node for main-LT %d on trunk %q", atMainLT, trunk)
 	}
 	return n.trunk, nil
+}
+
+// Owner describes which node owns a main-LT along a trunk's lineage: a
+// trunk (Trunk set), a stump (Stump set), or the root (IsRoot). Callers
+// layer policy on this — e.g. an LT owned by the root or a stump is
+// ceremonial, so a "fork there" spawns a fresh child rather than re-splitting.
+type Owner struct {
+	Trunk  TrunkID // "" if the owner is the root or a stump
+	Stump  string  // the stump name, if the owner is a stump
+	IsRoot bool
+}
+
+// Owner resolves which node owns atMainLT along the given trunk's lineage.
+func (t *Trunks) Owner(trunk TrunkID, atMainLT uint64) (Owner, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	branch, err := t.headBranch(trunk)
+	if err != nil {
+		return Owner{}, err
+	}
+	ob, err := t.ownerOf(branch, atMainLT)
+	if err != nil {
+		return Owner{}, err
+	}
+	n := t.nodes[strings.Join(ob, "/")]
+	if n == nil {
+		return Owner{}, fmt.Errorf("xwal: no owner node for main-LT %d on trunk %q", atMainLT, trunk)
+	}
+	return Owner{Trunk: n.trunk, Stump: n.stumpName(), IsRoot: n.isRoot}, nil
+}
+
+// Promote climbs a trunk up `levels` stump-bounded levels by relabeling the
+// main channel's .trunk markers: the trunk absorbs its parent trunk's run
+// (the consecutive same-id ancestors above its divergence point), repeated
+// once per level. No data moves — only markers are rewritten, so the other
+// channels follow the unchanged node tree. The climb stops at a stump (the
+// cauterization boundary): if it cannot move at all, Promote returns
+// ErrAtStump; excess levels past the stump are a no-op. Returns the number
+// of levels actually climbed.
+func (t *Trunks) Promote(trunk TrunkID, levels int) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if levels <= 0 {
+		levels = 1
+	}
+	foundKey, ok := t.foundingNode(trunk)
+	if !ok {
+		return 0, fmt.Errorf("xwal: unknown trunk %q", trunk)
+	}
+	climbed := 0
+	for climbed < levels {
+		f := t.nodes[foundKey]
+		p := t.nodes[f.parent]
+		if f.isRoot || p == nil || p.isRoot || p.isStump {
+			break // ceremonial boundary above — cannot climb further
+		}
+		parentID := p.trunk
+		// Walk up from p (toward the root) through the consecutive same-id run,
+		// stopping when the node above has a different id (or is a stump/root).
+		runTop := f.parent
+		for {
+			up := t.nodes[t.nodes[runTop].parent]
+			if up == nil || up.isRoot || up.isStump || up.trunk != parentID {
+				break
+			}
+			runTop = t.nodes[runTop].parent
+		}
+		// Relabel the run [runTop .. p] to the promoted id on disk.
+		for cur := f.parent; ; cur = t.nodes[cur].parent {
+			if err := writeTrunkID(t.irDir(t.nodes[cur].branch), trunk); err != nil {
+				return climbed, err
+			}
+			if cur == runTop {
+				break
+			}
+		}
+		foundKey = runTop
+		climbed++
+	}
+	if climbed == 0 {
+		return 0, ErrAtStump
+	}
+	return climbed, t.rebuild()
+}
+
+// foundingNode returns the shallowest node carrying a trunk id (its parent is
+// in another trunk, a stump, or the root). One exists per live trunk.
+func (t *Trunks) foundingNode(trunk TrunkID) (string, bool) {
+	for key, n := range t.nodes {
+		if n.trunk != trunk {
+			continue
+		}
+		if p := t.nodes[n.parent]; p == nil || p.trunk != trunk {
+			return key, true
+		}
+	}
+	return "", false
+}
+
+// StumpInfo is a read-only view of a stump.
+type StumpInfo struct {
+	Name     string
+	Children []TrunkID // trunk ids of its immediate trunk children
+}
+
+// Stumps returns every stump, sorted by name.
+func (t *Trunks) Stumps() []StumpInfo {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var out []StumpInfo
+	for _, n := range t.nodes {
+		if !n.isStump {
+			continue
+		}
+		si := StumpInfo{Name: n.stumpName()}
+		for _, ck := range n.children {
+			if c := t.nodes[ck]; c != nil && c.trunk != "" {
+				si.Children = append(si.Children, c.trunk)
+			}
+		}
+		sort.Strings(si.Children)
+		out = append(out, si)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // anchorOf returns the node where children of a trunk attach: its live
@@ -617,7 +831,8 @@ func (t *Trunks) AppendChannel(trunk, channel string, mainLT uint64, payload, me
 type TrunkInfo struct {
 	ID         string
 	Head       []string // head node branch
-	Parent     string   // parent trunk id
+	Parent     string   // parent trunk id ("" if rooted at a stump or the root)
+	Stump      string   // stump name, if the trunk is rooted directly at a stump
 	BranchedLT uint64
 	Tip        uint64
 }
@@ -646,7 +861,7 @@ func (t *Trunks) List() []TrunkInfo {
 	for _, id := range ids {
 		key := t.heads[id]
 		ti := TrunkInfo{ID: id, Head: t.nodes[key].branch}
-		ti.Parent, ti.BranchedLT = t.lineage(id)
+		ti.Parent, ti.Stump, ti.BranchedLT = t.lineage(id)
 		if x, err := Open(t.root, t.cfg, t.nodes[key].branch...); err == nil {
 			ti.Tip = mainTail(x)
 			x.Close()
@@ -657,25 +872,25 @@ func (t *Trunks) List() []TrunkInfo {
 }
 
 // lineage finds a trunk's founding node (shallowest node carrying the
-// trunk), returning its parent trunk id and the LT it branched at.
-func (t *Trunks) lineage(trunk string) (string, uint64) {
+// trunk), returning its parent trunk id, the stump it is rooted at (if its
+// parent is a stump), and the LT it branched at.
+func (t *Trunks) lineage(trunk string) (parent, stump string, bl uint64) {
 	n := t.nodes[t.heads[trunk]]
 	for {
 		if n.isRoot {
-			return "", 0 // root trunk has no parent
+			return "", "", 0
 		}
 		p := t.nodes[n.parent]
 		if p == nil {
-			return "", 0
+			return "", "", 0
 		}
 		if p.trunk != trunk {
-			// n is the founding node; p is in the parent trunk.
-			var bl uint64
+			// n is the founding node; p is its parent (trunk, stump, or root).
 			if x, err := Open(t.root, t.cfg, n.branch...); err == nil {
 				bl = mainForkBase(x)
 				x.Close()
 			}
-			return p.trunk, bl
+			return p.trunk, p.stumpName(), bl
 		}
 		n = p
 	}
