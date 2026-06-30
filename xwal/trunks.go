@@ -36,10 +36,11 @@ type Trunks struct {
 	main string
 
 	mu       sync.Mutex
-	nodes    map[string]*tnode // key = branch joined by "/" ("" = root)
-	heads    map[string]string // trunk id -> head node key (the one live leaf)
-	nodeSeq  int               // next "n<N>" dir name
-	trunkSeq int               // next "t<N>" trunk id
+	nodes    map[string]*tnode   // key = branch joined by "/" ("" = root)
+	heads    map[string]string   // trunk id -> head node key (the one live leaf)
+	leaves   map[string][]string // trunk id -> all live (unfrozen) leaf keys carrying it; >1 = damaged
+	nodeSeq  int                 // next "n<N>" dir name
+	trunkSeq int                 // next "t<N>" trunk id
 }
 
 // NodeID and TrunkID are string ids (a node id is a branch dir name; a
@@ -126,6 +127,9 @@ func CreateTrunks(dir string, cfg Config) (*Trunks, error) {
 }
 
 // OpenTrunks opens an existing trunk store, rebuilding its cache from disk.
+// Before serving, it heals any legacy multi-head damage: a single trunk id
+// stamped on several sibling leaves (the single-leaf invariant violated). The
+// heal is idempotent and crash-safe; a clean store passes through untouched.
 func OpenTrunks(dir string, cfg Config) (*Trunks, error) {
 	main, err := mainChannelName(dir)
 	if err != nil {
@@ -133,6 +137,9 @@ func OpenTrunks(dir string, cfg Config) (*Trunks, error) {
 	}
 	t := &Trunks{root: dir, cfg: cfg, main: main}
 	if err := t.rebuild(); err != nil {
+		return nil, err
+	}
+	if err := t.healMultiHead(); err != nil {
 		return nil, err
 	}
 	return t, nil
@@ -143,9 +150,46 @@ func OpenTrunks(dir string, cfg Config) (*Trunks, error) {
 func (t *Trunks) rebuild() error {
 	t.nodes = map[string]*tnode{}
 	t.heads = map[string]string{}
+	t.leaves = map[string][]string{}
 	t.nodeSeq, t.trunkSeq = 0, 0
 	base := filepath.Join(t.root, t.main)
-	return t.walk(base, nil, "", true)
+	if err := t.walk(base, nil, "", true); err != nil {
+		return err
+	}
+	// Resolve one head per trunk DETERMINISTICALLY. In a well-formed store
+	// each trunk has exactly one live leaf. A legacy multi-head store has
+	// several sibling leaves sharing the id; rather than let map-iteration
+	// order decide (which flips the head, and thus the conversation a caller
+	// sees, between opens), pick the most-advanced leaf — the one whose own
+	// timeline reaches furthest — with the node key as a stable tiebreak.
+	// healMultiHead (run on open) collapses the duplicates for good.
+	for trunk, keys := range t.leaves {
+		t.heads[trunk] = t.pickHead(keys)
+	}
+	return nil
+}
+
+// pickHead chooses the surviving head among several live leaves carrying the
+// same trunk id: the most-advanced (highest own tail), tie-broken by the
+// lexicographically greatest node key (newest "n<N>"). Deterministic.
+func (t *Trunks) pickHead(keys []string) string {
+	best, bestTail := "", int64(-1)
+	for _, k := range keys {
+		tail := int64(-1)
+		if x, err := Open(t.root, t.cfg, t.nodes[k].branch...); err == nil {
+			// Own tail: 0 for an empty-own leaf, else its last own index.
+			if mainForkBase(x) > 0 && mainTail(x) >= mainForkBase(x) {
+				tail = int64(mainTail(x))
+			} else {
+				tail = 0
+			}
+			x.Close()
+		}
+		if tail > bestTail || (tail == bestTail && k > best) {
+			best, bestTail = k, tail
+		}
+	}
+	return best
 }
 
 func (t *Trunks) walk(dir string, branch []string, parentKey string, isRoot bool) error {
@@ -177,7 +221,7 @@ func (t *Trunks) walk(dir string, branch []string, parentKey string, isRoot bool
 	t.nodes[key] = n
 	t.bumpSeqs(branch, trunkID)
 	if !n.frozen && trunkID != "" {
-		t.heads[trunkID] = key
+		t.leaves[trunkID] = append(t.leaves[trunkID], key)
 	}
 	for _, k := range kids {
 		if err := t.walk(filepath.Join(dir, k), append(append([]string(nil), branch...), k), key, false); err != nil {
@@ -185,6 +229,82 @@ func (t *Trunks) walk(dir string, branch []string, parentKey string, isRoot bool
 		}
 	}
 	return nil
+}
+
+// healMultiHead repairs a legacy single-leaf-invariant violation: a trunk id
+// stamped on several live (unfrozen) leaves at once. This arose from an older
+// fork path that re-forked a frozen branch point, minting same-id sibling
+// continuations (e.g. n4/{n6,n8,n10,n12} all carrying one id, only one with
+// own content). Such a store reads a head-order-dependent message count.
+//
+// The heal keeps the most-advanced leaf (pickHead — own content / highest
+// tail) as the sole head and removes the spurious EMPTY duplicate leaves in
+// EVERY channel (ir + chalkboard + translations). It only ever deletes a leaf
+// that is a true leaf (no children) AND empty-own (no content of its own), so
+// no IR is lost; the most-advanced leaf is never touched. Idempotent (a clean
+// or already-healed store finds nothing to do) and crash-safe (each duplicate
+// is an independent RemoveAll across channels; a re-run completes a partial).
+// Caller holds nothing (run from OpenTrunks before the store is served).
+func (t *Trunks) healMultiHead() error {
+	t.mu.Lock()
+	// Snapshot the damaged trunks under the lock; mutate disk after.
+	type dup struct {
+		trunk  string
+		branch []string
+	}
+	var dups []dup
+	for trunk, keys := range t.leaves {
+		if len(keys) <= 1 {
+			continue
+		}
+		keep := t.heads[trunk] // pickHead already chose the survivor
+		for _, k := range keys {
+			if k == keep {
+				continue
+			}
+			n := t.nodes[k]
+			if n == nil || len(n.children) > 0 {
+				// Not a leaf (shouldn't happen for a live leaf) — leave it.
+				continue
+			}
+			if !t.leafEmptyOwn(n.branch) {
+				// Has its own content — refuse to delete (would lose IR). Leave
+				// it as a same-id sibling; pickHead still resolves a stable head.
+				continue
+			}
+			dups = append(dups, dup{trunk: trunk, branch: n.branch})
+		}
+	}
+	t.mu.Unlock()
+	if len(dups) == 0 {
+		return nil
+	}
+	names, err := channelNames(t.root)
+	if err != nil {
+		return err
+	}
+	for _, d := range dups {
+		for _, ch := range names {
+			p := filepath.Join(append([]string{t.root, ch}, d.branch...)...)
+			if err := os.RemoveAll(p); err != nil {
+				return fmt.Errorf("xwal: heal multi-head %q: remove %s: %w", d.trunk, p, err)
+			}
+		}
+	}
+	// Re-derive the cache from the healed disk.
+	return t.rebuild()
+}
+
+// leafEmptyOwn reports whether the main-channel node at branch has no own
+// entries (its content is wholly inherited from its parent). A safe-to-prune
+// duplicate continuation leaf is exactly this.
+func (t *Trunks) leafEmptyOwn(branch []string) bool {
+	x, err := Open(t.root, t.cfg, branch...)
+	if err != nil {
+		return false
+	}
+	defer x.Close()
+	return isEmptyHead(x)
 }
 
 func (t *Trunks) bumpSeqs(branch []string, trunkID string) {

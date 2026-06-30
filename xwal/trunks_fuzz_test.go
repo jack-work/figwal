@@ -71,6 +71,22 @@ func TestForest_FuzzSequential(t *testing.T) {
 		// Global invariant after every op.
 		for _, tk := range trunks {
 			assertTrunkReadable(t, f, tk)
+			// Single-leaf invariant: exactly one live (unfrozen) leaf carries
+			// each trunk id, and it is the head. (Guards against the multi-head
+			// regression where a frozen branch point was re-forked into same-id
+			// sibling continuations.)
+			n := 0
+			for k, nd := range f.nodes {
+				if nd.trunk == tk && !nd.frozen {
+					n++
+					if f.heads[tk] != k {
+						t.Fatalf("trunk %s: live leaf %s is not the head (%s)", tk, k, f.heads[tk])
+					}
+				}
+			}
+			if n != 1 {
+				t.Fatalf("trunk %s has %d live leaves (want 1)", tk, n)
+			}
 		}
 	}
 
