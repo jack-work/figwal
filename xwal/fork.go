@@ -104,7 +104,15 @@ func (x *XWAL) buildForkPlan(atMainLT uint64, childName, oldFutureName string) (
 			return forkPlan{}, err
 		}
 		for name, base := range bases {
-			if base > atMainLT {
+			// Re-home every child whose divergence is at OR after the split
+			// point. A fork at index k shares [1..k-1] and moves own content
+			// [k..] to the continuation; a child forking at base == k diverges
+			// exactly at the split, so it belongs to the future side too. Using
+			// a strict `>` here left such a child stranded under the old branch
+			// point — and when that child carried the owner's trunk id (the
+			// owner's own continuation chain), the continuation re-stamped the
+			// id onto a fresh node, producing two live leaves for one trunk.
+			if base >= atMainLT {
 				plan.Rehome = append(plan.Rehome, name)
 			}
 		}
