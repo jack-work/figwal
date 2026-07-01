@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Trunks is the trunk-addressed view of a joint xwal. A trunk is one
@@ -41,6 +42,15 @@ type Trunks struct {
 	leaves   map[string][]string // trunk id -> all live (unfrozen) leaf keys carrying it; >1 = damaged
 	nodeSeq  int                 // next "n<N>" dir name
 	trunkSeq int                 // next "t<N>" trunk id
+
+	// version is bumped every time rebuild() runs, giving consumers a
+	// cheap probe for "has the trunk topology changed since I last
+	// looked?" without a directory walk. Modeled on SQLite's schema
+	// cookie: mutations bump it internally, readers can compare against
+	// their last-seen value, and Refresh() reconciles on demand for the
+	// cross-process case. In-process this is invariably in sync with
+	// disk because every mutating public method ends in rebuild().
+	version atomic.Uint64
 }
 
 // NodeID and TrunkID are string ids (a node id is a branch dir name; a
@@ -147,6 +157,8 @@ func OpenTrunks(dir string, cfg Config) (*Trunks, error) {
 
 // rebuild walks the main channel's directory tree and reconstructs the
 // node + trunk cache from disk (dirs + .trunk markers). Source of truth.
+// Every completed rebuild bumps the version counter so external
+// consumers can probe for topology changes without a walk of their own.
 func (t *Trunks) rebuild() error {
 	t.nodes = map[string]*tnode{}
 	t.heads = map[string]string{}
@@ -166,7 +178,30 @@ func (t *Trunks) rebuild() error {
 	for trunk, keys := range t.leaves {
 		t.heads[trunk] = t.pickHead(keys)
 	}
+	t.version.Add(1)
 	return nil
+}
+
+// Version returns the current topology version. It increases (never
+// resets) every time the in-memory index is rebuilt from disk, which
+// happens after every mutating public call (Fork, ForkAt, Promote,
+// Remove, SpawnChild, CreateStump…) and at Open / Refresh time.
+//
+// Consumers cache derived state (e.g. head-of-trunk lookups, node
+// listings) against the version they last observed; if Version()
+// changes, the cache is stale. Cheap: one atomic load, no lock.
+func (t *Trunks) Version() uint64 { return t.version.Load() }
+
+// Refresh re-scans the on-disk trunk marker layout and re-derives the
+// in-memory index. In single-process land it is redundant — every
+// mutating call already rebuilds — but it is the escape hatch for a
+// future cross-process story where another writer may have relabeled
+// markers under our feet. Bumps Version() by one if anything changes
+// (and even if nothing did, because rebuild is unconditional).
+func (t *Trunks) Refresh() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.rebuild()
 }
 
 // pickHead chooses the surviving head among several live leaves carrying the
