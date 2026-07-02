@@ -996,22 +996,7 @@ type TrunkInfo struct {
 func (t *Trunks) List() []TrunkInfo {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	// Default (sequential "t<N>") ids list in numeric order. With a custom
-	// minter the ids are opaque, so list the heads sorted by id (callers
-	// re-sort for display anyway).
-	var ids []string
-	if t.cfg.MintTrunkID != nil {
-		for id := range t.heads {
-			ids = append(ids, id)
-		}
-		sort.Strings(ids)
-	} else {
-		for i := 0; i < t.trunkSeq; i++ {
-			if id := "t" + strconv.Itoa(i); t.heads[id] != "" {
-				ids = append(ids, id)
-			}
-		}
-	}
+	ids := t.orderedTrunkIDsLocked()
 	out := make([]TrunkInfo, 0, len(ids))
 	for _, id := range ids {
 		key := t.heads[id]
@@ -1041,14 +1026,67 @@ func (t *Trunks) lineage(trunk string) (parent, stump string, bl uint64) {
 		}
 		if p.trunk != trunk {
 			// n is the founding node; p is its parent (trunk, stump, or root).
-			if x, err := Open(t.root, t.cfg, n.branch...); err == nil {
-				bl = mainForkBase(x)
-				x.Close()
-			}
-			return p.trunk, p.stumpName(), bl
+			// BranchedLT is n's fork base — read the tiny .fork marker directly
+			// instead of opening the log (which would scan the segment). Equal
+			// to mainForkBase(open(n)), but O(1) file read, not O(entries).
+			return p.trunk, p.stumpName(), t.forkBaseOf(n.branch)
 		}
 		n = p
 	}
+}
+
+// forkBaseOf reads a node's main-channel .fork base (the LT it forked at)
+// directly from the marker file — cheap, no log open / segment scan.
+func (t *Trunks) forkBaseOf(branch []string) uint64 {
+	b, err := os.ReadFile(filepath.Join(t.irDir(branch), ".fork"))
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "base="); ok {
+			n, _ := strconv.ParseUint(strings.TrimSpace(v), 10, 64)
+			return n
+		}
+	}
+	return 0
+}
+
+// ListLight is List without Tip (the head's tail index). Tip requires opening
+// the head's log (a segment scan); most callers (figaro's aria listing) never
+// use it. ListLight opens no logs — ids, parent/stump lineage, and BranchedLT
+// all come from the in-memory node tree + the cheap .fork marker read — so it
+// is O(trunks) with no per-trunk disk scan. Tip is left zero; use Head/List
+// when you actually need it.
+func (t *Trunks) ListLight() []TrunkInfo {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]TrunkInfo, 0, len(t.heads))
+	for _, id := range t.orderedTrunkIDsLocked() {
+		key := t.heads[id]
+		ti := TrunkInfo{ID: id, Head: t.nodes[key].branch}
+		ti.Parent, ti.Stump, ti.BranchedLT = t.lineage(id)
+		out = append(out, ti)
+	}
+	return out
+}
+
+// orderedTrunkIDsLocked returns live trunk ids in stable display order.
+// Caller holds t.mu.
+func (t *Trunks) orderedTrunkIDsLocked() []string {
+	var ids []string
+	if t.cfg.MintTrunkID != nil {
+		for id := range t.heads {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+	} else {
+		for i := 0; i < t.trunkSeq; i++ {
+			if id := "t" + strconv.Itoa(i); t.heads[id] != "" {
+				ids = append(ids, id)
+			}
+		}
+	}
+	return ids
 }
 
 // NodeInfo is a read-only view of a node (debug).
