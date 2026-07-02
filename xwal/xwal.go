@@ -101,6 +101,24 @@ type channel struct {
 	reduce  ReduceFunc
 	initial []byte
 	fk      map[uint64]uint64 // main-LT -> channel-LT (last wins)
+	fkBuilt bool              // fk populated? built lazily on first Lookup
+}
+
+// ensureFK builds the main-LT -> channel-LT index on demand. It scans the
+// whole channel, so it is deferred until the first Lookup that needs it —
+// most opens (append, StateAt, main-channel Read) never touch it, and paying
+// an O(entries) JSON scan on every open dominated cost when the xwal is opened
+// per operation. The main channel is identity (main-LT == channel-LT), so its
+// callers bypass fk entirely (see Lookup) and never build it.
+func (ch *channel) ensureFK() error {
+	if ch.fkBuilt {
+		return nil
+	}
+	if err := ch.buildFK(); err != nil {
+		return err
+	}
+	ch.fkBuilt = true
+	return nil
 }
 
 // buildFK scans the channel to populate its main-LT -> channel-LT index.
@@ -197,10 +215,10 @@ func Open(dir string, cfg Config, branch ...string) (*XWAL, error) {
 		}
 		ch.dir = cdir
 		ch.log = l
-		if err := ch.buildFK(); err != nil {
-			x.Close()
-			return nil, fmt.Errorf("xwal: index channel %q: %w", mc.Name, err)
-		}
+		// fk is built lazily on first Lookup (ensureFK) — not here. Scanning
+		// every channel's entries on every open is the dominant cost when the
+		// xwal is opened per operation; most opens never Lookup.
+		ch.fk = map[uint64]uint64{}
 		x.chans[mc.Name] = ch
 		x.order = append(x.order, mc.Name)
 	}
@@ -357,6 +375,7 @@ func (x *XWAL) Clear(channelName string) error {
 	}
 	ch.log = l
 	ch.fk = map[uint64]uint64{}
+	ch.fkBuilt = true // wiped channel: the empty index is current
 	return nil
 }
 
@@ -412,11 +431,7 @@ func (x *XWAL) AddChannel(spec ChannelSpec) error {
 	}
 	ch.dir = cdir
 	ch.log = l
-	ch.fk = map[uint64]uint64{}
-	if err := ch.buildFK(); err != nil {
-		l.Close()
-		return err
-	}
+	ch.fk = map[uint64]uint64{} // built lazily on first Lookup (ensureFK)
 	x.chans[spec.Name] = ch
 	x.order = append(x.order, spec.Name)
 	return nil
@@ -513,7 +528,9 @@ func (x *XWAL) AppendMain(payload, meta []byte) (uint64, error) {
 	if err := ch.log.Write(next, encodeFrame(next, payload, meta)); err != nil {
 		return 0, err
 	}
-	ch.fk[next] = next
+	if ch.fkBuilt { // keep a built index current; a lazy build later sees this write on disk
+		ch.fk[next] = next
+	}
 	return next, nil
 }
 
@@ -539,7 +556,9 @@ func (x *XWAL) Append(channelName string, mainLT uint64, payload, meta []byte) (
 	if err := ch.log.Write(next, encodeFrame(mainLT, payload, meta)); err != nil {
 		return 0, err
 	}
-	ch.fk[mainLT] = next
+	if ch.fkBuilt {
+		ch.fk[mainLT] = next
+	}
 	return next, nil
 }
 
@@ -571,6 +590,23 @@ func (x *XWAL) Lookup(channelName string, mainLT uint64) (Record, bool, error) {
 	ch := x.chans[channelName]
 	if ch == nil {
 		return Record{}, false, fmt.Errorf("xwal: no channel %q", channelName)
+	}
+	// The main channel is identity (main-LT == channel-LT), so it needs no fk
+	// index: read directly at mainLT, treating out-of-range as "not found".
+	if channelName == x.main {
+		first, last := ch.log.FirstIndex(), ch.log.LastIndex()
+		if first == 0 || mainLT < first || mainLT > last {
+			return Record{}, false, nil
+		}
+		r, err := x.ReadAt(channelName, mainLT)
+		if err != nil {
+			return Record{}, false, err
+		}
+		return r, true, nil
+	}
+	// Related channel: build the fk index on first use.
+	if err := ch.ensureFK(); err != nil {
+		return Record{}, false, err
 	}
 	lt, ok := ch.fk[mainLT]
 	if !ok {
