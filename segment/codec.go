@@ -265,10 +265,23 @@ func decodeJSONLLine(line []byte, verify bool) ([]byte, error) {
 	if n := len(line); n > 0 && line[n-1] == '\n' {
 		line = line[:n-1]
 	}
-	if !verify {
-		if payload, ok := fastDecodeCanonicalLine(line); ok {
-			return payload, nil
+	// Fast path for the canonical on-disk form Frame emits: extract the
+	// payload as a slice with no JSON parse. When verifying, the stored
+	// `_hash` covers exactly this canonical payload, so we hash the slice
+	// directly (a single SHA over already-canonical bytes) instead of
+	// parsing + re-marshaling (marshalCanonical) to recompute it. That
+	// re-canonicalization dominated recovery-scan cost when a segment is
+	// opened per operation. Only non-canonical (hand-edited) lines fall to
+	// the slow parse path.
+	var stored string
+	if verify && len(line) >= len(hashPrefix)+hashHexLen && bytes.HasPrefix(line, []byte(hashPrefix)) {
+		stored = string(line[len(hashPrefix) : len(hashPrefix)+hashHexLen])
+	}
+	if payload, ok := fastDecodeCanonicalLine(line); ok {
+		if verify && hashCanonical(payload) != stored {
+			return nil, ErrCorrupt
 		}
+		return payload, nil
 	}
 	return slowDecodeJSONLLine(line, verify)
 }
