@@ -3,6 +3,8 @@ package xwal
 import (
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -644,5 +646,70 @@ func TestVersion_ExternalRewriteBumpsAfterRefresh(t *testing.T) {
 	// Head still works after the refresh.
 	if _, err := f.Head(c); err != nil {
 		t.Fatalf("head c after refresh: %v", err)
+	}
+}
+
+// TestConcurrentAppendAndFork proves the trunk write primitives are safe
+// under concurrent Fork on the same trunk. Trunks.Append and
+// Trunks.AppendChannel both take t.mu for the whole open→write→close, so
+// a Fork race can only appear at the boundaries between calls — and at
+// each boundary the winner leaves the topology consistent for the next
+// caller. Under no ordering should either goroutine see a corrupt tree
+// or write to a frozen segment.
+func TestConcurrentAppendAndFork(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "f")
+	f, tr := seedTrunkBirth(t, dir, "cfg@d880")
+	for _, m := range []string{`"m1"`, `"m2"`, `"m3"`, `"m4"`} {
+		if _, _, err := f.Append(tr, 0, []byte(m), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	const N = 30
+	var wg sync.WaitGroup
+	var appendErr atomic.Value // holds error
+	var forkErr atomic.Value
+
+	// Writer: hammer tail appends on tr.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < N; i++ {
+			if _, _, err := f.Append(tr, 0, []byte(`"w"`), nil); err != nil {
+				appendErr.Store(err)
+				return
+			}
+		}
+	}()
+	// Forker: mint N alternatives off the same trunk (tail forks).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < N; i++ {
+			if _, err := f.ForkTail(tr); err != nil {
+				forkErr.Store(err)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	if err, _ := appendErr.Load().(error); err != nil {
+		t.Fatalf("concurrent append: %v", err)
+	}
+	if err, _ := forkErr.Load().(error); err != nil {
+		t.Fatalf("concurrent fork: %v", err)
+	}
+
+	// Post-condition: tr's head still opens, reads end-to-end.
+	x, err := f.Head(tr)
+	if err != nil {
+		t.Fatalf("post head: %v", err)
+	}
+	defer x.Close()
+	last := mainTail(x)
+	for lt := uint64(1); lt <= last; lt++ {
+		if _, _, err := x.Read("ir", lt); err != nil {
+			t.Fatalf("post read %d: %v", lt, err)
+		}
 	}
 }

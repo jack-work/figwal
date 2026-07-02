@@ -175,6 +175,18 @@ func (l *Log) Write(idx uint64, payload []byte) error {
 	if l.readOnly {
 		return fmt.Errorf("%w: %s", ErrReadOnly, l.dir)
 	}
+	// Recheck on disk: another process (or another goroutine, since Fork
+	// applies its plan then Opens a new child) may have just made this
+	// dir a branch point. Without this recheck a live handle would keep
+	// happily writing to a now-frozen parent segment, corrupting the
+	// single-leaf-per-trunk invariant. One ReadDir per write is cheap
+	// compared to the fsync that follows.
+	if kids, err := hasSubdirs(l.dir); err != nil {
+		return err
+	} else if kids {
+		l.readOnly = true
+		return fmt.Errorf("%w: %s", ErrReadOnly, l.dir)
+	}
 
 	expected := l.lastIndexLocked() + 1
 	if l.isEmptyLocked() {
