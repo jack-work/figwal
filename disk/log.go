@@ -2,8 +2,8 @@ package disk
 
 import (
 	"errors"
-	"github.com/jack-work/figwal/segment"
 	"fmt"
+	"github.com/jack-work/figwal/segment"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -63,16 +63,17 @@ type Options struct {
 }
 
 type Log struct {
-	mu       sync.RWMutex
-	dir      string
-	opts     Options
-	codec    segment.SegmentCodec
-	ext      string
-	sealed   []*segment.Segment
-	active   *segment.Segment
-	parent   *Log   // nil for root logs
-	forkBase uint64 // first index this log owns; 0 if not a fork
-	readOnly bool   // true when the dir has child subdirs (branch point)
+	mu         sync.RWMutex
+	dir        string
+	opts       Options
+	codec      segment.SegmentCodec
+	ext        string
+	sealed     []*segment.Segment
+	active     *segment.Segment
+	parent     *Log // nil for root logs
+	ownsParent bool
+	forkBase   uint64 // first index this log owns; 0 if not a fork
+	readOnly   bool   // true when the dir has child subdirs (branch point)
 }
 
 func Open(dir string, opts Options) (*Log, error) {
@@ -107,6 +108,7 @@ func Open(dir string, opts Options) (*Log, error) {
 		return nil, err
 	}
 	parent := opts.Parent
+	ownsParent := false
 	if parent == nil && base > 0 {
 		// Auto-walk `..` for the parent. Inherit codec/segment options
 		// so the parent reads its own files consistently. Plain Open
@@ -119,21 +121,27 @@ func Open(dir string, opts Options) (*Log, error) {
 			return nil, fmt.Errorf("auto-open parent %q: %w", parentDir, err)
 		}
 		parent = p
+		ownsParent = true
 	}
 	hasKids, err := hasSubdirs(dir)
 	if err != nil {
+		if ownsParent {
+			_ = parent.Close()
+		}
 		return nil, err
 	}
 	l := &Log{
-		dir:      dir,
-		opts:     opts,
-		codec:    opts.Codec,
-		ext:      opts.Codec.FileExt(),
-		parent:   parent,
-		forkBase: base,
-		readOnly: hasKids,
+		dir:        dir,
+		opts:       opts,
+		codec:      opts.Codec,
+		ext:        opts.Codec.FileExt(),
+		parent:     parent,
+		ownsParent: ownsParent,
+		forkBase:   base,
+		readOnly:   hasKids,
 	}
 	if err := l.loadSegments(); err != nil {
+		_ = l.Close()
 		return nil, err
 	}
 	if base > 0 && len(l.sealed)+boolToInt(l.active != nil) > 0 {
@@ -145,6 +153,7 @@ func Open(dir string, opts Options) (*Log, error) {
 			firstBase = l.active.FirstIndex()
 		}
 		if firstBase != base {
+			_ = l.Close()
 			return nil, fmt.Errorf("%w: marker=%d firstSegment=%d",
 				ErrForkMismatch, base, firstBase)
 		}
@@ -521,6 +530,13 @@ func (l *Log) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	if l.ownsParent && l.parent != nil {
+		if err := l.parent.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		l.parent = nil
+		l.ownsParent = false
+	}
 	return errors.Join(errs...)
 }
 
@@ -728,7 +744,6 @@ func (l *Log) loadSegments() error {
 	}
 	return nil
 }
-
 
 func (l *Log) segName(base uint64) string {
 	return fmt.Sprintf("%0*d%s", segNameWidth, base, l.ext)
