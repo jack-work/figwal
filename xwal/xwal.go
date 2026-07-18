@@ -365,12 +365,6 @@ func writeManifest(dir string, m manifest) error {
 	return os.Rename(tmp, path)
 }
 
-// fullChannelDir is the channel dir at this exact branch (no ancestor
-// fallback) — used when creating a brand-new channel on this branch.
-func (x *XWAL) fullChannelDir(name string) string {
-	return filepath.Join(append([]string{x.root, name}, x.branch...)...)
-}
-
 func (x *XWAL) channelOpts(ch *channel) disk.Options {
 	opts := disk.Options{Codec: x.codec, SegmentSize: x.cfg.SegmentSize}
 	if ch.kind == ChannelReducible {
