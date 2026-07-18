@@ -159,4 +159,5 @@ Writes always fsync (default mode); throughput on a write-heavy workload is boun
 
 - `segment/` per-file framing (Binary, JSONL), recovery scan, torn-tail handling.
 - `log/` multi-segment log with rotation, range iteration, prefix truncation, fork primitive.
+- `log/typed/` thin generics wrapper for typed entries (`Log[T]`).
 - `cmd/logctl/` `cmd/segctl/` CLIs.
