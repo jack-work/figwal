@@ -32,6 +32,7 @@ func TestAddChannel_RootAndBackfill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupTrunks(t, f)
 	// A stump + 2 trunks + 1 branch.
 	if err := f.CreateStump("cfg@d880"); err != nil {
 		t.Fatal(err)
@@ -260,6 +261,7 @@ func TestStumps_OwnerAndBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	r2, _ := OpenTrunks(dir, trunksCfg())
+	cleanupTrunks(t, r2)
 	if ti := findTrunk(r2.List(), rootTrunk); ti == nil || ti.Stump != "" {
 		t.Fatalf("loadoutless trunk should have no stump: %+v", ti)
 	}
@@ -364,6 +366,7 @@ func TestPromote_ClimbsAndStopsAtStump(t *testing.T) {
 	}
 	checkReads(f)
 	r2, _ := OpenTrunks(dir, trunksCfg())
+	cleanupTrunks(t, r2)
 	checkReads(r2)
 	if _, isStump := parentRun(t, r2, a); !isStump {
 		t.Fatal("after reopen: A should still be rooted at the stump")

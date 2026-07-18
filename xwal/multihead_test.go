@@ -157,6 +157,7 @@ func TestForest_HealCollapsesMultiHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open+heal: %v", err)
 	}
+	cleanupTrunks(t, f)
 	if got := liveLeaves(f, conv); len(got) != 1 {
 		t.Fatalf("after heal trunk %s has %d live leaves (want 1): %v", conv, len(got), got)
 	}
@@ -190,6 +191,7 @@ func TestForest_HealCollapsesMultiHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupTrunks(t, f2)
 	if len(liveLeaves(f2, conv)) != 1 || f2.heads[conv] != f.heads[conv] {
 		t.Fatalf("heal not idempotent: head %s -> %s", f.heads[conv], f2.heads[conv])
 	}

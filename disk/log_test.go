@@ -3,8 +3,8 @@ package disk
 import (
 	"bytes"
 	"errors"
-	"github.com/jack-work/figwal/segment"
 	"fmt"
+	"github.com/jack-work/figwal/segment"
 	"os"
 	"path/filepath"
 	"testing"
@@ -68,6 +68,54 @@ func TestWriteRead(t *testing.T) {
 		if !bytes.Equal(got, []byte{byte(i)}) {
 			t.Fatalf("idx %d: %v", i, got)
 		}
+	}
+}
+
+func TestScanFromEndAcrossFork(t *testing.T) {
+	root, err := Open(t.TempDir(), Options{SyncMode: SyncManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := uint64(1); i <= 5; i++ {
+		if err := root.Write(i, []byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	child, err := root.Fork(4, "alternative", "continuation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	defer child.Close()
+	for i := uint64(4); i <= 6; i++ {
+		if err := child.Write(i, []byte{byte(i + 10)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var got []uint64
+	if err := child.ScanFromEnd(99, func(idx uint64, _ []byte) error {
+		got = append(got, idx)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []uint64{6, 5, 4, 3, 2, 1}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("indexes = %v, want %v", got, want)
+	}
+
+	stop := errors.New("stop")
+	got = got[:0]
+	err = child.ScanFromEnd(5, func(idx uint64, _ []byte) error {
+		got = append(got, idx)
+		if idx == 3 {
+			return stop
+		}
+		return nil
+	})
+	if !errors.Is(err, stop) || fmt.Sprint(got) != "[5 4 3]" {
+		t.Fatalf("stopped scan = %v, %v", got, err)
 	}
 }
 

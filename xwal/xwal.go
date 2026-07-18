@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/jack-work/figwal/disk"
 	"github.com/jack-work/figwal/segment"
@@ -90,6 +91,12 @@ type XWAL struct {
 	chans  map[string]*channel
 	cfg    Config
 	codec  segment.SegmentCodec
+	shared bool
+
+	closeOnce sync.Once
+	closeErr  error
+	release   func() error
+	retire    func()
 }
 
 type channel struct {
@@ -101,41 +108,50 @@ type channel struct {
 	reduce  ReduceFunc
 	initial []byte
 	fk      map[uint64]uint64 // main-LT -> channel-LT (last wins)
-	fkBuilt bool              // fk populated? built lazily on first Lookup
+	fkBuilt bool              // all entries indexed?
+	fkNext  uint64            // highest channel-LT not yet indexed
+	fkFloor uint64            // lowest main-LT seen in the indexed suffix
+	fkScan  bool
 }
 
-// ensureFK builds the main-LT -> channel-LT index on demand. It scans the
-// whole channel, so it is deferred until the first Lookup that needs it —
-// most opens (append, StateAt, main-channel Read) never touch it, and paying
-// an O(entries) JSON scan on every open dominated cost when the xwal is opened
-// per operation. The main channel is identity (main-LT == channel-LT), so its
-// callers bypass fk entirely (see Lookup) and never build it.
-func (ch *channel) ensureFK() error {
-	if ch.fkBuilt {
-		return nil
+func (ch *channel) lookup(mainLT uint64) (uint64, bool, error) {
+	if lt, ok := ch.fk[mainLT]; ok {
+		return lt, true, nil
 	}
-	if err := ch.buildFK(); err != nil {
-		return err
+	if ch.fkBuilt || (ch.fkScan && mainLT >= ch.fkFloor) {
+		return 0, false, nil
 	}
-	ch.fkBuilt = true
-	return nil
-}
-
-// buildFK scans the channel to populate its main-LT -> channel-LT index.
-func (ch *channel) buildFK() error {
-	ch.fk = map[uint64]uint64{}
-	first := ch.log.FirstIndex()
-	if first == 0 {
-		return nil
+	if !ch.fkScan {
+		ch.fkNext = ch.log.LastIndex()
+		ch.fkScan = true
 	}
-	return ch.log.Range(first, func(idx uint64, payload []byte) error {
-		m, _, err := decodeFrame(payload)
+	stopped := false
+	err := ch.log.ScanFromEnd(ch.fkNext, func(idx uint64, payload []byte) error {
+		m, err := decodeMainLT(payload)
 		if err != nil {
 			return err
 		}
-		ch.fk[m] = idx
+		if _, exists := ch.fk[m]; !exists {
+			ch.fk[m] = idx
+		}
+		ch.fkFloor = m
+		if idx > 0 {
+			ch.fkNext = idx - 1
+		}
+		if m <= mainLT {
+			stopped = true
+			return errStopRange
+		}
 		return nil
 	})
+	if err != nil && err != errStopRange {
+		return 0, false, err
+	}
+	if !stopped {
+		ch.fkBuilt = true
+	}
+	lt, ok := ch.fk[mainLT]
+	return lt, ok, nil
 }
 
 const manifestName = "xwal.json"
@@ -155,6 +171,10 @@ type manifestChannel struct {
 // Open opens (creating if absent) the xwal rooted at dir. branch selects
 // a forked sub-branch by its chain of fork names (empty = the trunk).
 func Open(dir string, cfg Config, branch ...string) (*XWAL, error) {
+	return open(dir, cfg, nil, branch...)
+}
+
+func open(dir string, cfg Config, store *disk.Store, branch ...string) (*XWAL, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("xwal: empty dir")
 	}
@@ -188,6 +208,7 @@ func Open(dir string, cfg Config, branch ...string) (*XWAL, error) {
 		chans:  make(map[string]*channel, len(man.Channels)),
 		cfg:    cfg,
 		codec:  codec,
+		shared: store != nil,
 	}
 	for _, mc := range man.Channels {
 		ch := &channel{name: mc.Name, rname: mc.Reducer}
@@ -208,16 +229,20 @@ func Open(dir string, cfg Config, branch ...string) (*XWAL, error) {
 			opts.OnSegmentOpen = reducibleFold(ch.reduce, ch.initial)
 		}
 		cdir := x.channelDir(mc.Name)
-		l, err := disk.Open(cdir, opts)
+		var l *disk.Log
+		if store == nil {
+			l, err = disk.Open(cdir, opts)
+		} else {
+			l, err = store.Open(cdir, opts)
+		}
 		if err != nil {
 			x.Close()
 			return nil, fmt.Errorf("xwal: open channel %q: %w", mc.Name, err)
 		}
 		ch.dir = cdir
 		ch.log = l
-		// fk is built lazily on first Lookup (ensureFK) — not here. Scanning
-		// every channel's entries on every open is the dominant cost when the
-		// xwal is opened per operation; most opens never Lookup.
+		// Lookup indexes related channels lazily from the tail. Most opens
+		// never need a foreign-key index at all.
 		ch.fk = map[uint64]uint64{}
 		x.chans[mc.Name] = ch
 		x.order = append(x.order, mc.Name)
@@ -356,6 +381,9 @@ func (x *XWAL) channelOpts(ch *channel) disk.Options {
 // drift). NOTE: on a forked branch this also drops the branch's link to
 // its parent for that channel; intended for trunk-level cache resets.
 func (x *XWAL) Clear(channelName string) error {
+	if err := x.ensurePrivate(); err != nil {
+		return err
+	}
 	ch := x.chans[channelName]
 	if ch == nil {
 		return fmt.Errorf("xwal: no channel %q", channelName)
@@ -394,6 +422,9 @@ func (x *XWAL) Clear(channelName string) error {
 // channel's own first index), never copied from the main channel — the index
 // spaces differ. Reducible channels must name a registered reducer.
 func (x *XWAL) AddChannel(spec ChannelSpec) error {
+	if err := x.ensurePrivate(); err != nil {
+		return err
+	}
 	if _, exists := x.chans[spec.Name]; exists {
 		return fmt.Errorf("xwal: channel %q already exists", spec.Name)
 	}
@@ -431,7 +462,7 @@ func (x *XWAL) AddChannel(spec ChannelSpec) error {
 	}
 	ch.dir = cdir
 	ch.log = l
-	ch.fk = map[uint64]uint64{} // built lazily on first Lookup (ensureFK)
+	ch.fk = map[uint64]uint64{} // indexed lazily from the tail on Lookup
 	x.chans[spec.Name] = ch
 	x.order = append(x.order, spec.Name)
 	return nil
@@ -528,7 +559,7 @@ func (x *XWAL) AppendMain(payload, meta []byte) (uint64, error) {
 	if err := ch.log.Write(next, encodeFrame(next, payload, meta)); err != nil {
 		return 0, err
 	}
-	if ch.fkBuilt { // keep a built index current; a lazy build later sees this write on disk
+	if ch.fkScan || ch.fkBuilt {
 		ch.fk[next] = next
 	}
 	return next, nil
@@ -556,7 +587,7 @@ func (x *XWAL) Append(channelName string, mainLT uint64, payload, meta []byte) (
 	if err := ch.log.Write(next, encodeFrame(mainLT, payload, meta)); err != nil {
 		return 0, err
 	}
-	if ch.fkBuilt {
+	if ch.fkScan || ch.fkBuilt {
 		ch.fk[mainLT] = next
 	}
 	return next, nil
@@ -604,11 +635,10 @@ func (x *XWAL) Lookup(channelName string, mainLT uint64) (Record, bool, error) {
 		}
 		return r, true, nil
 	}
-	// Related channel: build the fk index on first use.
-	if err := ch.ensureFK(); err != nil {
+	lt, ok, err := ch.lookup(mainLT)
+	if err != nil {
 		return Record{}, false, err
 	}
-	lt, ok := ch.fk[mainLT]
 	if !ok {
 		return Record{}, false, nil
 	}
@@ -642,7 +672,7 @@ func (x *XWAL) tailMain(ch *channel) (uint64, bool, error) {
 	if err != nil {
 		return 0, false, err
 	}
-	m, _, err := decodeFrame(f)
+	m, err := decodeMainLT(f)
 	return m, true, err
 }
 
@@ -681,15 +711,48 @@ func (x *XWAL) Branch() []string { return append([]string(nil), x.branch...) }
 
 // Close closes every channel.
 func (x *XWAL) Close() error {
-	var first error
-	for _, ch := range x.chans {
-		if ch.log != nil {
-			if err := ch.log.Close(); err != nil && first == nil {
-				first = err
+	x.closeOnce.Do(func() {
+		if x.release != nil {
+			x.closeErr = x.release()
+			return
+		}
+		if x.shared {
+			return
+		}
+		for _, ch := range x.chans {
+			if ch.log != nil {
+				if err := ch.log.Close(); err != nil && x.closeErr == nil {
+					x.closeErr = err
+				}
 			}
 		}
+	})
+	return x.closeErr
+}
+
+func (x *XWAL) ensurePrivate() error {
+	if !x.shared {
+		return nil
 	}
-	return first
+	if x.retire != nil {
+		x.retire()
+	}
+	private, err := Open(x.root, x.cfg, x.branch...)
+	if err != nil {
+		return err
+	}
+	var releaseErr error
+	if x.release != nil {
+		releaseErr = x.release()
+	}
+	x.main = private.main
+	x.order = private.order
+	x.chans = private.chans
+	x.codec = private.codec
+	x.shared = false
+	x.release = nil
+	x.retire = nil
+	return releaseErr
 }
 
 // A channel entry is stored as a JSON object so it round-trips through
@@ -737,6 +800,9 @@ func encodeFrame(mainLT uint64, payload, meta []byte) []byte {
 // decodeFrame returns the main-LT and payload, ignoring meta. Used by the
 // fold and fork-boundary paths that don't care about meta.
 func decodeFrame(f []byte) (uint64, []byte, error) {
+	if m, p, _, ok := fastDecodeFrame(f); ok {
+		return m, p, nil
+	}
 	var o frameObj
 	if err := json.Unmarshal(f, &o); err != nil {
 		return 0, nil, fmt.Errorf("xwal: decode frame: %w", err)
@@ -745,9 +811,116 @@ func decodeFrame(f []byte) (uint64, []byte, error) {
 }
 
 func decodeRecord(channelLT uint64, f []byte) (Record, error) {
+	if m, p, x, ok := fastDecodeFrame(f); ok {
+		return Record{ChannelLT: channelLT, MainLT: m, Payload: p, Meta: x}, nil
+	}
 	var o frameObj
 	if err := json.Unmarshal(f, &o); err != nil {
 		return Record{}, fmt.Errorf("xwal: decode frame: %w", err)
 	}
 	return Record{ChannelLT: channelLT, MainLT: o.M, Payload: o.P, Meta: o.X}, nil
+}
+
+func decodeMainLT(f []byte) (uint64, error) {
+	if m, _, _, ok := fastDecodeFrame(f); ok {
+		return m, nil
+	}
+	var o struct {
+		M uint64 `json:"m"`
+	}
+	if err := json.Unmarshal(f, &o); err != nil {
+		return 0, fmt.Errorf("xwal: decode frame: %w", err)
+	}
+	return o.M, nil
+}
+
+func fastDecodeFrame(f []byte) (uint64, []byte, []byte, bool) {
+	const prefix = `{"m":`
+	if len(f) <= len(prefix) || string(f[:len(prefix)]) != prefix || !json.Valid(f) {
+		return 0, nil, nil, false
+	}
+	i := len(prefix)
+	var mainLT uint64
+	start := i
+	for i < len(f) && f[i] >= '0' && f[i] <= '9' {
+		d := uint64(f[i] - '0')
+		if mainLT > (^uint64(0)-d)/10 {
+			return 0, nil, nil, false
+		}
+		mainLT = mainLT*10 + d
+		i++
+	}
+	if i == start || i+5 > len(f) || string(f[i:i+5]) != `,"p":` {
+		return 0, nil, nil, false
+	}
+	i += 5
+	end, ok := jsonValueEnd(f, i)
+	if !ok {
+		return 0, nil, nil, false
+	}
+	payload := f[i:end]
+	if end+1 == len(f) && f[end] == '}' {
+		return mainLT, payload, nil, true
+	}
+	const metaPrefix = `,"x":`
+	if end+len(metaPrefix) >= len(f) || string(f[end:end+len(metaPrefix)]) != metaPrefix {
+		return 0, nil, nil, false
+	}
+	i = end + len(metaPrefix)
+	end, ok = jsonValueEnd(f, i)
+	if !ok || end+1 != len(f) || f[end] != '}' {
+		return 0, nil, nil, false
+	}
+	return mainLT, payload, f[i:end], true
+}
+
+func jsonValueEnd(b []byte, start int) (int, bool) {
+	if start >= len(b) {
+		return 0, false
+	}
+	switch b[start] {
+	case '"':
+		for i := start + 1; i < len(b); i++ {
+			switch b[i] {
+			case '\\':
+				i++
+			case '"':
+				return i + 1, true
+			}
+		}
+		return 0, false
+	case '{', '[':
+		depth := 0
+		inString := false
+		for i := start; i < len(b); i++ {
+			if inString {
+				switch b[i] {
+				case '\\':
+					i++
+				case '"':
+					inString = false
+				}
+				continue
+			}
+			switch b[i] {
+			case '"':
+				inString = true
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+				if depth == 0 {
+					return i + 1, true
+				}
+			}
+		}
+		return 0, false
+	default:
+		for i := start; i < len(b); i++ {
+			if b[i] == ',' || b[i] == '}' {
+				return i, i > start
+			}
+		}
+		return 0, false
+	}
 }

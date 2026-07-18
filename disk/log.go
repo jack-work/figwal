@@ -297,6 +297,55 @@ func (l *Log) Range(from uint64, fn func(idx uint64, payload []byte) error) erro
 	return nil
 }
 
+// ScanFromEnd iterates entries in descending index order, starting at from
+// (or the current tail when from is past it). Fork prefixes continue through
+// the parent chain. A callback error stops the scan and is returned.
+func (l *Log) ScanFromEnd(from uint64, fn func(idx uint64, payload []byte) error) error {
+	l.mu.RLock()
+	if l.parent != nil && from < l.forkBase {
+		parent := l.parent
+		l.mu.RUnlock()
+		return parent.ScanFromEnd(from, fn)
+	}
+	if !l.isEmptyLocked() {
+		first := l.firstIndexLocked()
+		idx := l.lastIndexLocked()
+		if from < idx {
+			idx = from
+		}
+		for idx >= first {
+			s := l.findSegmentLocked(idx)
+			if s == nil {
+				l.mu.RUnlock()
+				return ErrNotFound
+			}
+			payload, err := s.ReadIndex(idx - s.BaseIndex())
+			if err != nil {
+				l.mu.RUnlock()
+				return err
+			}
+			if err := fn(idx, payload); err != nil {
+				l.mu.RUnlock()
+				return err
+			}
+			if idx == first {
+				break
+			}
+			idx--
+		}
+	}
+	parent := l.parent
+	parentFrom := uint64(0)
+	if parent != nil && l.forkBase > 0 {
+		parentFrom = l.forkBase - 1
+	}
+	l.mu.RUnlock()
+	if parent != nil {
+		return parent.ScanFromEnd(parentFrom, fn)
+	}
+	return nil
+}
+
 // TruncateFront removes whole sealed segments whose LastIndex is below
 // beforeIdx. Partial segments (those containing entries on both sides
 // of beforeIdx) and the active segment are left intact; callers should
@@ -635,10 +684,11 @@ func (l *Log) lastIndexLocked() uint64 {
 }
 
 func (l *Log) findSegmentLocked(idx uint64) *segment.Segment {
-	for _, s := range l.sealed {
-		if idx >= s.FirstIndex() && idx <= s.LastIndex() {
-			return s
-		}
+	i := sort.Search(len(l.sealed), func(i int) bool {
+		return l.sealed[i].LastIndex() >= idx
+	})
+	if i < len(l.sealed) && idx >= l.sealed[i].FirstIndex() {
+		return l.sealed[i]
 	}
 	if l.active != nil && l.active.Count() > 0 &&
 		idx >= l.active.FirstIndex() && idx <= l.active.LastIndex() {

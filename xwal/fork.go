@@ -50,6 +50,9 @@ type forkPlanEntry struct {
 // before any channel diverges and removed only once all have, and Open
 // rolls a partial fork forward to completion.
 func (x *XWAL) Fork(atMainLT uint64, childName, oldFutureName string) (*XWAL, error) {
+	if err := x.ensurePrivate(); err != nil {
+		return nil, err
+	}
 	plan, err := x.buildForkPlan(atMainLT, childName, oldFutureName)
 	if err != nil {
 		return nil, err
@@ -279,7 +282,7 @@ func (x *XWAL) boundaryFor(ch *channel, atMainLT uint64) (uint64, error) {
 	}
 	found := uint64(0)
 	err := ch.log.RangeOwn(ownFirst, func(idx uint64, payload []byte) error {
-		m, _, derr := decodeFrame(payload)
+		m, derr := decodeMainLT(payload)
 		if derr != nil {
 			return derr
 		}

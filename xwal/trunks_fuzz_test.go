@@ -96,6 +96,7 @@ func TestForest_FuzzSequential(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupTrunks(t, f2)
 	after := snapshotTrunks(t, f2, trunks)
 	for tr, b := range before {
 		if after[tr] != b {

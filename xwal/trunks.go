@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/jack-work/figwal/disk"
 )
 
 // Trunks is the trunk-addressed view of a joint xwal. A trunk is one
@@ -36,6 +38,8 @@ type Trunks struct {
 	cfg  Config
 	main string
 
+	registryRoot string
+
 	mu       sync.Mutex
 	nodes    map[string]*tnode   // key = branch joined by "/" ("" = root)
 	heads    map[string]string   // trunk id -> head node key (the one live leaf)
@@ -51,7 +55,21 @@ type Trunks struct {
 	// cross-process case. In-process this is invariably in sync with
 	// disk because every mutating public method ends in rebuild().
 	version atomic.Uint64
+
+	hotMu sync.Mutex
+	hot   *trunkStore
 }
+
+type trunkStore struct {
+	store   *disk.Store
+	refs    int
+	retired bool
+}
+
+var trunkRegistry = struct {
+	sync.Mutex
+	roots map[string]map[*Trunks]struct{}
+}{roots: map[string]map[*Trunks]struct{}{}}
 
 // NodeID and TrunkID are string ids (a node id is a branch dir name; a
 // trunk id is "t<N>").
@@ -133,6 +151,9 @@ func CreateTrunks(dir string, cfg Config) (*Trunks, error) {
 	if err := t.rebuild(); err != nil {
 		return nil, err
 	}
+	if err := t.register(); err != nil {
+		return nil, err
+	}
 	return t, nil
 }
 
@@ -149,7 +170,11 @@ func OpenTrunks(dir string, cfg Config) (*Trunks, error) {
 	if err := t.rebuild(); err != nil {
 		return nil, err
 	}
+	if err := t.register(); err != nil {
+		return nil, err
+	}
 	if err := t.healMultiHead(); err != nil {
+		_ = t.Close()
 		return nil, err
 	}
 	return t, nil
@@ -160,6 +185,7 @@ func OpenTrunks(dir string, cfg Config) (*Trunks, error) {
 // Every completed rebuild bumps the version counter so external
 // consumers can probe for topology changes without a walk of their own.
 func (t *Trunks) rebuild() error {
+	t.retireRootHot()
 	t.nodes = map[string]*tnode{}
 	t.heads = map[string]string{}
 	t.leaves = map[string][]string{}
@@ -176,7 +202,11 @@ func (t *Trunks) rebuild() error {
 	// timeline reaches furthest — with the node key as a stable tiebreak.
 	// healMultiHead (run on open) collapses the duplicates for good.
 	for trunk, keys := range t.leaves {
-		t.heads[trunk] = t.pickHead(keys)
+		if len(keys) == 1 {
+			t.heads[trunk] = keys[0]
+		} else {
+			t.heads[trunk] = t.pickHead(keys)
+		}
 	}
 	t.version.Add(1)
 	return nil
@@ -363,6 +393,114 @@ func (t *Trunks) headBranch(trunk string) ([]string, error) {
 	return t.nodes[key].branch, nil
 }
 
+func (t *Trunks) openHot(branch []string) (*XWAL, error) {
+	t.hotMu.Lock()
+	h := t.hot
+	if h == nil {
+		h = &trunkStore{store: disk.NewStore()}
+		t.hot = h
+	}
+	h.refs++
+	t.hotMu.Unlock()
+
+	x, err := open(t.root, t.cfg, h.store, branch...)
+	if err != nil {
+		t.releaseHot(h)
+		return nil, err
+	}
+	x.release = func() error {
+		return t.releaseHot(h)
+	}
+	x.retire = t.retireRootHot
+	return x, nil
+}
+
+func (t *Trunks) releaseHot(h *trunkStore) error {
+	t.hotMu.Lock()
+	h.refs--
+	closeStore := h.retired && h.refs == 0
+	t.hotMu.Unlock()
+	if closeStore {
+		return h.store.Close()
+	}
+	return nil
+}
+
+func (t *Trunks) retireHot() {
+	t.hotMu.Lock()
+	h := t.hot
+	t.hot = nil
+	if h != nil {
+		h.retired = true
+	}
+	closeStore := h != nil && h.refs == 0
+	t.hotMu.Unlock()
+	if closeStore {
+		_ = h.store.Close()
+	}
+}
+
+func (t *Trunks) register() error {
+	root, err := filepath.Abs(t.root)
+	if err != nil {
+		return err
+	}
+	t.registryRoot = filepath.Clean(root)
+	trunkRegistry.Lock()
+	peers := trunkRegistry.roots[t.registryRoot]
+	if peers == nil {
+		peers = map[*Trunks]struct{}{}
+		trunkRegistry.roots[t.registryRoot] = peers
+	}
+	peers[t] = struct{}{}
+	trunkRegistry.Unlock()
+	return nil
+}
+
+func (t *Trunks) retireRootHot() {
+	trunkRegistry.Lock()
+	peers := make([]*Trunks, 0, len(trunkRegistry.roots[t.registryRoot]))
+	for peer := range trunkRegistry.roots[t.registryRoot] {
+		peers = append(peers, peer)
+	}
+	trunkRegistry.Unlock()
+	if len(peers) == 0 {
+		t.retireHot()
+		return
+	}
+	for _, peer := range peers {
+		peer.retireHot()
+	}
+}
+
+// Close releases cached segment handles. Any Head or StumpHead handles must
+// be closed first. The topology cache remains usable and opens a fresh
+// segment generation on the next disk-backed operation.
+func (t *Trunks) Close() error {
+	trunkRegistry.Lock()
+	if peers := trunkRegistry.roots[t.registryRoot]; peers != nil {
+		delete(peers, t)
+		if len(peers) == 0 {
+			delete(trunkRegistry.roots, t.registryRoot)
+		}
+	}
+	trunkRegistry.Unlock()
+	t.hotMu.Lock()
+	h := t.hot
+	t.hot = nil
+	if h == nil {
+		t.hotMu.Unlock()
+		return nil
+	}
+	h.retired = true
+	if h.refs != 0 {
+		t.hotMu.Unlock()
+		return fmt.Errorf("xwal: close trunks with %d open head(s)", h.refs)
+	}
+	t.hotMu.Unlock()
+	return h.store.Close()
+}
+
 // Head opens the live head node of a trunk. Caller closes it.
 func (t *Trunks) Head(trunk string) (*XWAL, error) {
 	t.mu.Lock()
@@ -371,7 +509,7 @@ func (t *Trunks) Head(trunk string) (*XWAL, error) {
 	if err != nil {
 		return nil, err
 	}
-	return Open(t.root, t.cfg, branch...)
+	return t.openHot(branch)
 }
 
 // Append adds a main-timeline entry to a trunk.
@@ -390,7 +528,7 @@ func (t *Trunks) Append(trunk string, atMainLT uint64, payload, meta []byte) (st
 	if err != nil {
 		return "", 0, err
 	}
-	x, err := Open(t.root, t.cfg, branch...)
+	x, err := t.openHot(branch)
 	if err != nil {
 		return "", 0, err
 	}
@@ -410,13 +548,20 @@ func (t *Trunks) Append(trunk string, atMainLT uint64, payload, meta []byte) (st
 		// ancestor node that owns it (re-homing its suffix + children into
 		// the continuation) and append to the new alternative.
 		x.Close()
+		t.retireRootHot()
 		return t.resplitBelow(branch, atMainLT, payload, meta, true)
 	}
+	x.Close()
+	t.retireRootHot()
 	// Interior fork: share [1..atMainLT], diverge at atMainLT+1.
 	altDir := t.mintNode()
 	contDir := t.mintNode()
-	child, ferr := x.Fork(atMainLT+1, altDir, contDir) // child = alt; old-future = cont
-	x.Close()
+	fx, err := Open(t.root, t.cfg, branch...)
+	if err != nil {
+		return "", 0, err
+	}
+	child, ferr := fx.Fork(atMainLT+1, altDir, contDir) // child = alt; old-future = cont
+	fx.Close()
 	if ferr != nil {
 		return "", 0, ferr
 	}
@@ -441,6 +586,7 @@ func (t *Trunks) Append(trunk string, atMainLT uint64, payload, meta []byte) (st
 // alternative. Caller holds t.mu. This is how a fork at an inherited LT (a
 // turn shared with ancestors) produces a sibling branch.
 func (t *Trunks) resplitBelow(branch []string, atMainLT uint64, payload, meta []byte, doAppend bool) (string, uint64, error) {
+	t.retireRootHot()
 	ownerBranch, err := t.ownerOf(branch, atMainLT)
 	if err != nil {
 		return "", 0, err
@@ -479,12 +625,10 @@ func (t *Trunks) ownerOf(branch []string, atMainLT uint64) ([]string, error) {
 	owner := []string(nil) // root owns [1..]
 	for i := 1; i <= len(branch); i++ {
 		sub := branch[:i]
-		x, err := Open(t.root, t.cfg, sub...)
+		fb, err := t.readForkBase(sub)
 		if err != nil {
 			return nil, err
 		}
-		fb := mainForkBase(x)
-		x.Close()
 		if fb <= atMainLT {
 			owner = append([]string(nil), sub...)
 		} else {
@@ -492,6 +636,19 @@ func (t *Trunks) ownerOf(branch []string, atMainLT uint64) ([]string, error) {
 		}
 	}
 	return owner, nil
+}
+
+func (t *Trunks) readForkBase(branch []string) (uint64, error) {
+	b, err := os.ReadFile(filepath.Join(t.irDir(branch), ".fork"))
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "base="); ok {
+			return strconv.ParseUint(strings.TrimSpace(v), 10, 64)
+		}
+	}
+	return 0, fmt.Errorf("xwal: malformed fork marker for %q", strings.Join(branch, "/"))
 }
 
 // ForkTail bisects a trunk's present.
@@ -508,7 +665,7 @@ func (t *Trunks) ForkTail(trunk string) (string, error) {
 		return "", fmt.Errorf("xwal: unknown trunk %q", trunk)
 	}
 	head := t.nodes[headKey]
-	x, err := Open(t.root, t.cfg, head.branch...)
+	x, err := t.openHot(head.branch)
 	if err != nil {
 		return "", err
 	}
@@ -516,6 +673,7 @@ func (t *Trunks) ForkTail(trunk string) (string, error) {
 	empty := isEmptyHead(x)
 	fb := mainForkBase(x)
 	x.Close()
+	t.retireRootHot()
 
 	if empty {
 		// Redirect to an N-ary fork of the parent at the head's fork point.
@@ -571,7 +729,7 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 		t.mu.Unlock()
 		return "", err
 	}
-	x, err := Open(t.root, t.cfg, branch...)
+	x, err := t.openHot(branch)
 	if err != nil {
 		t.mu.Unlock()
 		return "", err
@@ -586,11 +744,13 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 	}
 	if atMainLT < ownFirst {
 		// Re-split-below: fork the ancestor that owns atMainLT (no append).
+		t.retireRootHot()
 		alt, _, rerr := t.resplitBelow(branch, atMainLT, nil, nil, false)
 		t.mu.Unlock()
 		return alt, rerr
 	}
 
+	t.retireRootHot()
 	altDir := t.mintNode()
 	contDir := t.mintNode()
 	fx, err := Open(t.root, t.cfg, branch...)
@@ -617,6 +777,7 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 func (t *Trunks) Remove(trunk string, recursive bool) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.retireRootHot()
 
 	// The founding node is the shallowest node carrying this trunk (its
 	// parent is in another trunk, or it is the root).
@@ -722,7 +883,7 @@ func (t *Trunks) StumpHead(name string) (*XWAL, error) {
 	if n == nil || !n.isStump {
 		return nil, fmt.Errorf("xwal: no stump %q", name)
 	}
-	return Open(t.root, t.cfg, name)
+	return t.openHot([]string{name})
 }
 
 // SpawnUnderStump mints a new trunk (a top-level aria) as a child of a stump.
@@ -764,12 +925,13 @@ func (t *Trunks) spawnTrunkAt(parentBranch []string) (TrunkID, error) {
 // continuation), creating an empty child dir named childDir in every channel.
 // Returns the child's branch. Caller holds t.mu and must rebuild afterwards.
 func (t *Trunks) forkChild(parentBranch []string, childDir string) ([]string, error) {
-	x, err := Open(t.root, t.cfg, parentBranch...)
+	x, err := t.openHot(parentBranch)
 	if err != nil {
 		return nil, err
 	}
 	tail := mainTail(x)
 	x.Close()
+	t.retireRootHot()
 	fx, err := Open(t.root, t.cfg, parentBranch...)
 	if err != nil {
 		return nil, err
@@ -845,6 +1007,7 @@ func (t *Trunks) Owner(trunk TrunkID, atMainLT uint64) (Owner, error) {
 func (t *Trunks) Promote(trunk TrunkID, levels int) (int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.retireRootHot()
 	if levels <= 0 {
 		levels = 1
 	}
@@ -969,7 +1132,7 @@ func (t *Trunks) AppendChannel(trunk, channel string, mainLT uint64, payload, me
 	if err != nil {
 		return 0, err
 	}
-	x, err := Open(t.root, t.cfg, branch...)
+	x, err := t.openHot(branch)
 	if err != nil {
 		return 0, err
 	}
@@ -1002,7 +1165,7 @@ func (t *Trunks) List() []TrunkInfo {
 		key := t.heads[id]
 		ti := TrunkInfo{ID: id, Head: t.nodes[key].branch}
 		ti.Parent, ti.Stump, ti.BranchedLT = t.lineage(id)
-		if x, err := Open(t.root, t.cfg, t.nodes[key].branch...); err == nil {
+		if x, err := t.openHot(t.nodes[key].branch); err == nil {
 			ti.Tip = mainTail(x)
 			x.Close()
 		}

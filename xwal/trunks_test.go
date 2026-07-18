@@ -31,6 +31,7 @@ func seedTrunk(t *testing.T, dir string) (*Trunks, TrunkID) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupTrunks(t, f)
 	if err := f.CreateStump("s"); err != nil {
 		t.Fatalf("create stump: %v", err)
 	}
@@ -218,6 +219,7 @@ func seedTrunkBirth(t *testing.T, dir, stump string) (*Trunks, TrunkID) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupTrunks(t, f)
 	if err := f.CreateStump(stump); err != nil {
 		t.Fatalf("create stump: %v", err)
 	}
@@ -242,6 +244,7 @@ func TestTrunks_Stumps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupTrunks(t, f)
 	// Two stumps (loadouts) under the markerless root.
 	if err := f.CreateStump("L1@aa"); err != nil {
 		t.Fatalf("stump L1: %v", err)
@@ -299,6 +302,7 @@ func TestTrunks_Stumps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupTrunks(t, r2)
 	if len(r2.Stumps()) != 2 {
 		t.Fatalf("want 2 stumps after reopen, got %d", len(r2.Stumps()))
 	}
@@ -377,6 +381,7 @@ func TestTrunks_ReSplitBelow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupTrunks(t, r2)
 	for _, tr := range []string{conv, alt2, sib} {
 		x, err := r2.Head(tr)
 		if err != nil {
@@ -438,16 +443,21 @@ func TestTrunks_Remove(t *testing.T) {
 	if err := f.Remove(alt, false); err != nil {
 		t.Fatalf("remove leaf branch: %v", err)
 	}
-	if _, err := f.Head(conv); err != nil {
+	if x, err := f.Head(conv); err != nil {
 		t.Fatalf("conv must survive removing its branch: %v", err)
+	} else {
+		x.Close()
 	}
 	if _, err := f.Head(alt); err == nil {
 		t.Fatal("alt should be gone")
 	}
 	// Reopen from disk: alt stays gone, conv resolves, stump intact.
 	r2, _ := OpenTrunks(dir, trunksCfg())
-	if _, err := r2.Head(conv); err != nil {
+	cleanupTrunks(t, r2)
+	if x, err := r2.Head(conv); err != nil {
 		t.Fatalf("conv missing after reopen: %v", err)
+	} else {
+		x.Close()
 	}
 	if _, err := r2.Head(alt); err == nil {
 		t.Fatal("alt resurrected after reopen")
@@ -491,6 +501,7 @@ func TestVersion_MonotonicOnOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupTrunks(t, r)
 	if v := r.Version(); v == 0 {
 		t.Fatal("Version after OpenTrunks should be > 0")
 	}
@@ -614,8 +625,10 @@ func TestPromote_HeadRemainsUsableWithoutClose(t *testing.T) {
 	}
 
 	// And c is still resolvable too (siblings undisturbed).
-	if _, err := f.Head(c); err != nil {
+	if x, err := f.Head(c); err != nil {
 		t.Fatalf("head c after promote(b): %v", err)
+	} else {
+		x.Close()
 	}
 }
 
@@ -644,8 +657,10 @@ func TestVersion_ExternalRewriteBumpsAfterRefresh(t *testing.T) {
 		t.Fatalf("Refresh should have bumped version (was %d, now %d)", beforeVer, f.Version())
 	}
 	// Head still works after the refresh.
-	if _, err := f.Head(c); err != nil {
+	if x, err := f.Head(c); err != nil {
 		t.Fatalf("head c after refresh: %v", err)
+	} else {
+		x.Close()
 	}
 }
 

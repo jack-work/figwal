@@ -216,33 +216,33 @@ func decodeJSONObject(b []byte) (map[string]any, error) {
 }
 
 func (JSONLCodec) ScanFrames(r io.Reader, fn func(off int64, frameLen int) error) error {
-	// Wrap with a buffered reader so the byte-at-a-time loop does not
-	// fault into a syscall per byte. *os.File does not implement
-	// io.ByteReader; bufio.Reader does.
-	var reader io.ByteReader
-	if br, ok := r.(io.ByteReader); ok {
-		reader = br
-	} else {
+	reader, ok := r.(*bufio.Reader)
+	if !ok {
 		reader = bufio.NewReaderSize(r, 64<<10)
 	}
 	off := int64(0)
 	var line []byte
 	for {
-		b, err := reader.ReadByte()
+		part, err := reader.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			line = append(line, part...)
+			continue
+		}
 		if err == io.EOF {
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		line = append(line, b)
-		if b != '\n' {
-			continue
+		frame := part
+		if len(line) > 0 {
+			line = append(line, part...)
+			frame = line
 		}
-		if _, err := decodeJSONLLine(line, true); err != nil {
+		if _, err := decodeJSONLLine(frame, true); err != nil {
 			return nil // torn tail or corruption
 		}
-		frameLen := len(line)
+		frameLen := len(frame)
 		if err := fn(off, frameLen); err != nil {
 			return err
 		}
@@ -370,4 +370,3 @@ func slowDecodeJSONLLine(line []byte, verify bool) ([]byte, error) {
 	}
 	return payload, nil
 }
-

@@ -89,6 +89,11 @@ Reducible (header-mode) logs additionally carry a per-segment watermark
 header computed by `OnSegmentOpen`; `StateAt(idx)` folds the segment's
 watermark with its entries up to `idx`.
 
+`ScanFromEnd` walks the same visible history in descending index order,
+including inherited parent prefixes. It holds one log read lock per node
+rather than reacquiring it per record and is the primitive used by xwal's
+suffix-oriented foreign-key lookup.
+
 **`Fork` / `ForkRehome` / `ChildForkBases`** (`fork.go`):
 
 - `Fork(atIdx, childName, oldFutureName?)` splits the log at `atIdx`: the
@@ -143,6 +148,11 @@ A `Config` describes the join at creation:
 After first open the on-disk `xwal.json` manifest is authoritative; the
 creation-time `Main`/`Channels`/`Codec` fields are ignored thereafter.
 
+Related-channel `Lookup` indexes lazily from the tail. Main LTs are
+non-decreasing, so a lookup near the active end reads only the suffix needed
+to prove the answer; later lookups extend that same reverse-built index.
+Repeated and last-wins lookups remain O(1) once their suffix is indexed.
+
 **Forks all channels as a unit** (`fork.go`). `XWAL.Fork(atMainLT,
 child, oldFuture)` builds a `forkPlan`: the main channel forks at
 `atMainLT`, each related channel forks at its own boundary
@@ -173,6 +183,16 @@ alongside `.fork`. The in-memory structure (`nodes`, `heads`, sequence
 counters) is a derived cache that `rebuild()` reconstructs by one walk of
 the tree on open; it cannot diverge from disk because it is read from
 disk.
+
+Open segment handles and their recovered offset indexes are also retained in
+a generation-scoped `disk.Store`. `Head`, append, state folds, and full
+listing therefore reuse hot recovery state instead of rescanning every
+segment. A topology rebuild retires the generation; existing borrowers keep
+it alive until `XWAL.Close`, while new opens use a fresh store. A shared
+`XWAL` detaches to private handles before `Fork`, `Clear`, or `AddChannel`,
+so filesystem mutation never runs through a stale shared generation.
+`Trunks.Close` releases the current hot generation; callers should use it
+when a trunk store has a shorter lifetime than the process.
 
 Provides the trunk-level operations: `CreateTrunks` / `OpenTrunks`,
 `Head`, `Append`, `ForkAt` / `ForkTail`, `SpawnChild`, `Remove`,

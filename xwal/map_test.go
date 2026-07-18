@@ -96,6 +96,7 @@ func seedMapTrunk(t *testing.T, dir string) (*Trunks, TrunkID) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupTrunks(t, f)
 	if err := f.CreateStump("s"); err != nil {
 		t.Fatal(err)
 	}
