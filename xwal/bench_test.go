@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jack-work/figwal/disk"
@@ -426,6 +427,36 @@ func BenchmarkTrunksLongAria(b *testing.B) {
 						b.Fatalf("ListLight = %+v", got)
 					}
 				}
+			})
+
+			other, err := trunks.ForkTail(trunk)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Run("Append", func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					if _, _, err := trunks.Append(trunk, 0, []byte(`{"kind":"event"}`), nil); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+
+			b.Run("AppendTwoTrunks", func(b *testing.B) {
+				var next atomic.Uint64
+				b.ReportAllocs()
+				b.RunParallel(func(pb *testing.PB) {
+					for pb.Next() {
+						target := trunk
+						if next.Add(1)&1 == 0 {
+							target = other
+						}
+						if _, _, err := trunks.Append(target, 0, []byte(`{"kind":"event"}`), nil); err != nil {
+							b.Error(err)
+							return
+						}
+					}
+				})
 			})
 		})
 	}

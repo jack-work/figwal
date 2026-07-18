@@ -100,6 +100,7 @@ type XWAL struct {
 }
 
 type channel struct {
+	mu      sync.Mutex
 	name    string
 	kind    Kind
 	rname   string
@@ -115,6 +116,8 @@ type channel struct {
 }
 
 func (ch *channel) lookup(mainLT uint64) (uint64, bool, error) {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
 	if lt, ok := ch.fk[mainLT]; ok {
 		return lt, true, nil
 	}
@@ -555,6 +558,8 @@ func seedWatermark(chDir string, baseIndex uint64, codec segment.SegmentCodec, i
 // related-channel entries reference it.
 func (x *XWAL) AppendMain(payload, meta []byte) (uint64, error) {
 	ch := x.chans[x.main]
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
 	next := ch.log.LastIndex() + 1
 	if err := ch.log.Write(next, encodeFrame(next, payload, meta)); err != nil {
 		return 0, err
@@ -577,6 +582,8 @@ func (x *XWAL) Append(channelName string, mainLT uint64, payload, meta []byte) (
 	if channelName == x.main {
 		return 0, fmt.Errorf("xwal: use AppendMain for the main channel")
 	}
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
 	if lastMain, ok, err := x.tailMain(ch); err != nil {
 		return 0, err
 	} else if ok && mainLT < lastMain {
@@ -709,6 +716,21 @@ func (x *XWAL) Main() string { return x.main }
 // Branch returns this branch's fork chain (empty for the trunk).
 func (x *XWAL) Branch() []string { return append([]string(nil), x.branch...) }
 
+func (x *XWAL) sharedView(release func() error, retire func()) *XWAL {
+	return &XWAL{
+		root:    x.root,
+		branch:  append([]string(nil), x.branch...),
+		main:    x.main,
+		order:   x.order,
+		chans:   x.chans,
+		cfg:     x.cfg,
+		codec:   x.codec,
+		shared:  true,
+		release: release,
+		retire:  retire,
+	}
+}
+
 // Close closes every channel.
 func (x *XWAL) Close() error {
 	x.closeOnce.Do(func() {
@@ -731,11 +753,13 @@ func (x *XWAL) Close() error {
 }
 
 func (x *XWAL) ensurePrivate() error {
-	if !x.shared {
-		return nil
-	}
 	if x.retire != nil {
 		x.retire()
+	} else {
+		retireTrunkStores(x.root)
+	}
+	if !x.shared {
+		return nil
 	}
 	private, err := Open(x.root, x.cfg, x.branch...)
 	if err != nil {

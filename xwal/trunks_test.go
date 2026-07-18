@@ -664,13 +664,104 @@ func TestVersion_ExternalRewriteBumpsAfterRefresh(t *testing.T) {
 	}
 }
 
-// TestConcurrentAppendAndFork proves the trunk write primitives are safe
-// under concurrent Fork on the same trunk. Trunks.Append and
-// Trunks.AppendChannel both take t.mu for the whole open→write→close, so
-// a Fork race can only appear at the boundaries between calls — and at
-// each boundary the winner leaves the topology consistent for the next
-// caller. Under no ordering should either goroutine see a corrupt tree
-// or write to a frozen segment.
+func TestConcurrentAppendsUseLineageSerialization(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "f")
+	f, first := seedTrunk(t, dir)
+	second, err := f.SpawnUnderStump("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const writers = 4
+	const writes = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, writers*2)
+	for _, trunk := range []string{first, second} {
+		for range writers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for range writes {
+					if _, _, err := f.Append(trunk, 0, []byte(`"w"`), nil); err != nil {
+						errs <- err
+						return
+					}
+				}
+			}()
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	for _, trunk := range []string{first, second} {
+		x, err := f.Head(trunk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := mainTail(x), uint64(1+writers*writes); got != want {
+			x.Close()
+			t.Fatalf("%s tail = %d, want %d", trunk, got, want)
+		}
+		x.Close()
+	}
+}
+
+func TestTopologyMutationRefusesOpenHead(t *testing.T) {
+	f, trunk := seedTrunk(t, filepath.Join(t.TempDir(), "f"))
+	if _, _, err := f.Append(trunk, 0, []byte(`"m1"`), nil); err != nil {
+		t.Fatal(err)
+	}
+	x, err := f.Head(trunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.ForkTail(trunk); err == nil {
+		x.Close()
+		t.Fatal("ForkTail succeeded with an open head")
+	}
+	if err := x.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.ForkTail(trunk); err != nil {
+		t.Fatalf("ForkTail after close: %v", err)
+	}
+}
+
+func TestTopologyMutationSeesRetiredOpenHead(t *testing.T) {
+	f, trunk := seedTrunk(t, filepath.Join(t.TempDir(), "f"))
+	if _, _, err := f.Append(trunk, 0, []byte(`"m1"`), nil); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := f.Head(trunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutator, err := f.Head(trunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mutator.AddChannel(ChannelSpec{Name: "scratch", Kind: ChannelLog}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mutator.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.ForkTail(trunk); err == nil {
+		stale.Close()
+		t.Fatal("ForkTail succeeded with an open head from a retired generation")
+	}
+	if err := stale.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.ForkTail(trunk); err != nil {
+		t.Fatalf("ForkTail after retired head close: %v", err)
+	}
+}
+
+// TestConcurrentAppendAndFork proves that a topology writer waits for an
+// in-flight lineage append before changing the branch beneath it.
 func TestConcurrentAppendAndFork(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	f, tr := seedTrunkBirth(t, dir, "cfg@d880")

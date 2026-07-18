@@ -184,15 +184,27 @@ counters) is a derived cache that `rebuild()` reconstructs by one walk of
 the tree on open; it cannot diverge from disk because it is read from
 disk.
 
-Open segment handles and their recovered offset indexes are also retained in
-a generation-scoped `disk.Store`. `Head`, append, state folds, and full
-listing therefore reuse hot recovery state instead of rescanning every
-segment. A topology rebuild retires the generation; existing borrowers keep
-it alive until `XWAL.Close`, while new opens use a fresh store. A shared
-`XWAL` detaches to private handles before `Fork`, `Clear`, or `AddChannel`,
-so filesystem mutation never runs through a stale shared generation.
-`Trunks.Close` releases the current hot generation; callers should use it
-when a trunk store has a shorter lifetime than the process.
+Open XWAL heads, channel state, segment handles, and recovered offset indexes
+are retained in a generation-scoped `disk.Store`. `Head`, append, state folds,
+and full listing therefore borrow shared channel views instead of reopening
+the manifest or rescanning segments. Foreign-key suffix indexes live on the
+shared channels, so repeated head views continue the same O(delta) lookup
+rather than rebuilding it. A topology rebuild or XWAL filesystem mutation
+retires the generation; existing borrowers keep it alive until `XWAL.Close`,
+while new opens use a fresh store. A shared `XWAL` detaches to private handles
+before `Fork`, `Clear`, or `AddChannel`, so filesystem mutation never runs
+through a stale shared generation. `Trunks.Close` releases the current hot
+generation; callers should use it when a trunk store has a shorter lifetime
+than the process.
+
+Ordinary appends take a per-trunk lineage mutex and a shared topology lock.
+Appends to unrelated trunks can therefore write concurrently, while appends
+within one lineage remain ordered. Forks and other filesystem topology
+changes retain the exclusive topology lock; xwal does not attempt concurrent
+directory mutation that the disk layer cannot safely provide. Callers must
+close borrowed `Head`/`StumpHead` views before a topology mutation; the
+mutation returns an error rather than risking a partial rename or removal
+while Windows still has segment handles open.
 
 Provides the trunk-level operations: `CreateTrunks` / `OpenTrunks`,
 `Head`, `Append`, `ForkAt` / `ForkTail`, `SpawnChild`, `Remove`,
