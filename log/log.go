@@ -211,7 +211,9 @@ func (l *Log) Fork(atIdx uint64, name string, oldFutureNameOpt ...string) (*Log,
 	}
 	truncated := &cacheSnapshot{
 		firstIdx: old.firstIdx,
-		entries:  old.entries[:keep],
+		// Clamp capacity so a future append cannot overwrite suffix slots
+		// still visible through a pre-fork snapshot.
+		entries:  old.entries[:keep:keep],
 		parent:   old.parent,
 		forkBase: old.forkBase,
 	}

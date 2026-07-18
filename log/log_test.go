@@ -3,8 +3,8 @@ package log
 import (
 	"bytes"
 	"errors"
-	"github.com/jack-work/figwal/segment"
 	"fmt"
+	"github.com/jack-work/figwal/segment"
 	"sync"
 	"testing"
 )
@@ -190,6 +190,77 @@ func TestCachedForkSplitsCache(t *testing.T) {
 	got, _ := child.Read(4)
 	if string(got) != `{"alt":4}` {
 		t.Fatalf("child[4]=%q", got)
+	}
+}
+
+func TestCachedForkSnapshotOwnsTruncatedArray(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Open(dir, Options{Codec: segment.JSONLCodec{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for i := uint64(1); i <= 8; i++ {
+		if err := c.Write(i, []byte(fmt.Sprintf(`{"i":%d}`, i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := c.Snapshot()
+	child, err := c.Fork(4, "alt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Close()
+
+	truncated := c.snap.Load()
+	readOnce := make(chan struct{})
+	stop := make(chan struct{})
+	changed := make(chan string, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		first := true
+		for {
+			got, err := before.Read(4)
+			if err != nil {
+				return
+			}
+			if first {
+				close(readOnce)
+				first = false
+			}
+			if string(got) != `{"i":4}` {
+				select {
+				case changed <- string(got):
+				default:
+				}
+			}
+			select {
+			case <-stop:
+				return
+			default:
+			}
+		}
+	}()
+	<-readOnce
+	next := append(truncated.entries, []byte(`{"replacement":4}`))
+	if string(next[len(truncated.entries)]) != `{"replacement":4}` {
+		t.Fatal("synthetic post-fork append was not retained")
+	}
+	close(stop)
+	wg.Wait()
+	select {
+	case got := <-changed:
+		t.Fatalf("concurrent pre-fork snapshot changed after truncated append: %s", got)
+	default:
+	}
+	got, err := before.Read(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != `{"i":4}` {
+		t.Fatalf("pre-fork snapshot changed after truncated append: %s", got)
 	}
 }
 
