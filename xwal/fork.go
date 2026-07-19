@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/jack-work/figwal/disk"
+	"github.com/jack-work/figwal/log"
 )
 
 // forkPendingName, in the xwal root, records a joint fork that began but
@@ -62,10 +63,10 @@ func (x *XWAL) Fork(atMainLT uint64, childName, oldFutureName string) (*XWAL, er
 	}
 	// Apply through the already-open channel handles; each Fork makes its
 	// log a read-only branch point.
-	getLog := func(e forkPlanEntry) (*disk.Log, func(), error) {
+	getLog := func(e forkPlanEntry) (*log.Log, func(), error) {
 		return x.chans[e.Name].log, func() {}, nil
 	}
-	if err := applyForkPlan(x.root, plan, getLog); err != nil {
+	if err := applyCachedForkPlan(x.root, plan, getLog); err != nil {
 		return nil, err
 	}
 	if err := removeForkPlan(x.root); err != nil {
@@ -161,6 +162,30 @@ func (x *XWAL) buildForkPlan(atMainLT uint64, childName, oldFutureName string) (
 		plan.Channels = append(plan.Channels, *mainEntry)
 	}
 	return plan, nil
+}
+
+func applyCachedForkPlan(root string, plan forkPlan, getLog func(forkPlanEntry) (*log.Log, func(), error)) error {
+	for _, e := range plan.Channels {
+		childPath := filepath.Join(root, e.Dir, plan.Child)
+		if pathExists(childPath) {
+			continue
+		}
+		l, done, err := getLog(e)
+		if err != nil {
+			return fmt.Errorf("xwal: fork %q: open: %w", e.Name, err)
+		}
+		child, ferr := l.ForkRehome(e.AtIdx, plan.Child, plan.OldFuture, plan.Rehome)
+		if ferr != nil {
+			done()
+			return fmt.Errorf("xwal: fork channel %q at %d: %w", e.Name, e.AtIdx, ferr)
+		}
+		if err := child.Close(); err != nil {
+			done()
+			return fmt.Errorf("xwal: close forked channel %q: %w", e.Name, err)
+		}
+		done()
+	}
+	return nil
 }
 
 // applyForkPlan forks each planned channel that has not been forked yet.

@@ -118,15 +118,12 @@ func BenchmarkXWALLongAria(b *testing.B) {
 				}
 				b.ReportAllocs()
 				for i := 0; i < b.N; i++ {
-					seen := 0
-					if err := x.chans["ir"].log.Range(from, func(uint64, []byte) error {
-						seen++
-						return nil
-					}); err != nil {
+					got, err := x.RecordsFrom("ir", from, 0)
+					if err != nil {
 						b.Fatal(err)
 					}
-					if seen != records-int(from)+1 {
-						b.Fatalf("read %d records, want %d", seen, records-int(from)+1)
+					if len(got) != records-int(from)+1 {
+						b.Fatalf("read %d records, want %d", len(got), records-int(from)+1)
 					}
 				}
 			})
@@ -285,10 +282,12 @@ func BenchmarkXWALDeepAria(b *testing.B) {
 				from := tail - 15
 				b.ReportAllocs()
 				for i := 0; i < b.N; i++ {
-					if err := x.chans["ir"].log.Range(from, func(uint64, []byte) error {
-						return nil
-					}); err != nil {
+					got, err := x.RecordsFrom("ir", from, 0)
+					if err != nil {
 						b.Fatal(err)
+					}
+					if len(got) != 16 {
+						b.Fatalf("read %d records, want 16", len(got))
 					}
 				}
 			})

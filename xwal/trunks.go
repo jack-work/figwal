@@ -12,7 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/jack-work/figwal/disk"
+	"github.com/jack-work/figwal/log"
 )
 
 // Trunks is the trunk-addressed view of a joint xwal. A trunk is one
@@ -64,7 +64,7 @@ type Trunks struct {
 }
 
 type trunkStore struct {
-	store   *disk.Store
+	store   *log.Store
 	heads   map[string]*hotHead
 	refs    int
 	retired bool
@@ -320,7 +320,7 @@ func (t *Trunks) borrowHot(branch []string) (*XWAL, func() error, error) {
 	t.hotMu.Lock()
 	h := t.hot
 	if h == nil {
-		h = &trunkStore{store: disk.NewStore(), heads: map[string]*hotHead{}}
+		h = &trunkStore{store: log.NewStore(), heads: map[string]*hotHead{}}
 		t.hot = h
 	}
 	h.refs++

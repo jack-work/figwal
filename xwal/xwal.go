@@ -16,6 +16,7 @@ import (
 	"sync"
 
 	"github.com/jack-work/figwal/disk"
+	"github.com/jack-work/figwal/log"
 	"github.com/jack-work/figwal/segment"
 )
 
@@ -105,7 +106,7 @@ type channel struct {
 	kind    Kind
 	rname   string
 	dir     string
-	log     *disk.Log
+	log     *log.Log
 	reduce  ReduceFunc
 	initial []byte
 	fk      map[uint64]uint64 // main-LT -> channel-LT (last wins)
@@ -177,7 +178,7 @@ func Open(dir string, cfg Config, branch ...string) (*XWAL, error) {
 	return open(dir, cfg, nil, branch...)
 }
 
-func open(dir string, cfg Config, store *disk.Store, branch ...string) (*XWAL, error) {
+func open(dir string, cfg Config, store *log.Store, branch ...string) (*XWAL, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("xwal: empty dir")
 	}
@@ -232,9 +233,9 @@ func open(dir string, cfg Config, store *disk.Store, branch ...string) (*XWAL, e
 			opts.OnSegmentOpen = reducibleFold(ch.reduce, ch.initial)
 		}
 		cdir := x.channelDir(mc.Name)
-		var l *disk.Log
+		var l *log.Log
 		if store == nil {
-			l, err = disk.Open(cdir, opts)
+			l, err = log.Open(cdir, opts)
 		} else {
 			l, err = store.Open(cdir, opts)
 		}
@@ -394,7 +395,7 @@ func (x *XWAL) Clear(channelName string) error {
 	if err := os.MkdirAll(ch.dir, 0o755); err != nil {
 		return err
 	}
-	l, err := disk.Open(ch.dir, x.channelOpts(ch))
+	l, err := log.Open(ch.dir, x.channelOpts(ch))
 	if err != nil {
 		return err
 	}
@@ -453,7 +454,7 @@ func (x *XWAL) AddChannel(spec ChannelSpec) error {
 	}
 	// Open the handle for THIS branch (now that the structure exists).
 	cdir := x.channelDir(spec.Name)
-	l, err := disk.Open(cdir, x.channelOpts(ch))
+	l, err := log.Open(cdir, x.channelOpts(ch))
 	if err != nil {
 		return err
 	}
@@ -648,6 +649,61 @@ func (x *XWAL) Lookup(channelName string, mainLT uint64) (Record, bool, error) {
 		return Record{}, false, err
 	}
 	return r, true, nil
+}
+
+// RecordsFrom returns channel records whose main timeline LT is at least
+// fromMainLT, ordered by channel LT. A non-zero limit caps the returned
+// prefix; zero returns every matching record. It walks the immutable channel
+// snapshot backward only to locate the boundary, then reads the requested
+// ascending delta without constructing a total-history foreign-key index.
+func (x *XWAL) RecordsFrom(channelName string, fromMainLT uint64, limit int) ([]Record, error) {
+	if limit < 0 {
+		return nil, fmt.Errorf("xwal: negative record limit %d", limit)
+	}
+	ch := x.chans[channelName]
+	if ch == nil {
+		return nil, fmt.Errorf("xwal: no channel %q", channelName)
+	}
+	snapshot := ch.log.Snapshot()
+
+	var first uint64
+	err := snapshot.ScanFromEnd(0, func(idx uint64, frame []byte) error {
+		mainLT, err := decodeMainLT(frame)
+		if err != nil {
+			return err
+		}
+		if mainLT < fromMainLT {
+			return errStopRange
+		}
+		first = idx
+		return nil
+	})
+	if err != nil && !errors.Is(err, errStopRange) {
+		return nil, err
+	}
+	if first == 0 {
+		return nil, nil
+	}
+
+	records := make([]Record, 0)
+	err = snapshot.Range(first, func(idx uint64, frame []byte) error {
+		record, err := decodeRecord(idx, frame)
+		if err != nil {
+			return err
+		}
+		if record.MainLT < fromMainLT {
+			return nil
+		}
+		records = append(records, record)
+		if limit > 0 && len(records) == limit {
+			return errStopRange
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errStopRange) {
+		return nil, err
+	}
+	return records, nil
 }
 
 // StateAt folds a reducible channel to channelLT (watermark + patches).

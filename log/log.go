@@ -6,6 +6,7 @@
 package log
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,10 @@ import (
 var (
 	ErrNotFound = disk.ErrNotFound
 	ErrReadOnly = disk.ErrReadOnly
+	// ErrSharedMutation rejects filesystem topology changes through a
+	// Store-owned log. Retire the shared generation and reopen privately
+	// before forking or truncating.
+	ErrSharedMutation = errors.New("log topology mutation requires a private log")
 )
 
 // Options aliases disk.Options so the caller-facing API is a single
@@ -46,9 +51,39 @@ const (
 // snapshot whose parent pointer is the truncated trunk. Sibling forks
 // share parent state by pointer.
 type Log struct {
-	inner *disk.Log
-	wmu   sync.Mutex
-	snap  atomic.Pointer[cacheSnapshot]
+	inner  *disk.Log
+	wmu    sync.Mutex
+	snap   atomic.Pointer[cacheSnapshot]
+	shared bool
+}
+
+func (s *cacheSnapshot) scanFromEnd(from uint64, fn func(idx uint64, payload []byte) error) error {
+	if len(s.entries) > 0 {
+		first := s.firstIdx
+		idx := first + uint64(len(s.entries)) - 1
+		if from != 0 && from < idx {
+			idx = from
+		}
+		if idx >= first {
+			for {
+				if err := fn(idx, s.entries[idx-first]); err != nil {
+					return err
+				}
+				if idx == first {
+					break
+				}
+				idx--
+			}
+		}
+	}
+	if s.parent != nil && s.forkBase > 0 {
+		parentFrom := s.forkBase - 1
+		if from != 0 && from < parentFrom {
+			parentFrom = from
+		}
+		return s.parent.scanFromEnd(parentFrom, fn)
+	}
+	return nil
 }
 
 // cacheSnapshot is an immutable view of a Log's entries. The entries
@@ -94,6 +129,10 @@ func buildSnapshotFromDisk(l *disk.Log) (*cacheSnapshot, error) {
 		}
 		parentSnap = ps
 	}
+	return buildOwnSnapshot(l, parentSnap)
+}
+
+func buildOwnSnapshot(l *disk.Log, parentSnap *cacheSnapshot) (*cacheSnapshot, error) {
 	snap := &cacheSnapshot{
 		parent:   parentSnap,
 		forkBase: l.ForkBase(),
@@ -124,6 +163,13 @@ func (l *Log) Read(idx uint64) ([]byte, error) {
 // parent chain for indices below the fork's forkBase.
 func (l *Log) Range(from uint64, fn func(idx uint64, payload []byte) error) error {
 	return l.snap.Load().rangeFromIdx(from, fn)
+}
+
+// ScanFromEnd iterates entries in descending index order from from (or the
+// current tail when from is past it). It reads the immutable cache snapshot,
+// including fork prefixes, instead of re-reading disk segments.
+func (l *Log) ScanFromEnd(from uint64, fn func(idx uint64, payload []byte) error) error {
+	return l.snap.Load().scanFromEnd(from, fn)
 }
 
 // FirstIndex returns the first index visible from this Log, walking
@@ -192,6 +238,9 @@ func (l *Log) Hash(idx uint64) (string, error) {
 // their in-memory parent pointer goes stale. Reopen affected
 // descendants (the on-disk layout is always correct).
 func (l *Log) Fork(atIdx uint64, name string, oldFutureNameOpt ...string) (*Log, error) {
+	if l.shared {
+		return nil, ErrSharedMutation
+	}
 	l.wmu.Lock()
 	defer l.wmu.Unlock()
 
@@ -199,10 +248,29 @@ func (l *Log) Fork(atIdx uint64, name string, oldFutureNameOpt ...string) (*Log,
 	if err != nil {
 		return nil, err
 	}
+	return l.forkCached(atIdx, childInner)
+}
 
+// ForkRehome forks with an explicit list of children to move into the old
+// future. It has the same cache semantics as Fork.
+func (l *Log) ForkRehome(atIdx uint64, name, oldFutureName string, rehome []string) (*Log, error) {
+	if l.shared {
+		return nil, ErrSharedMutation
+	}
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+
+	childInner, err := l.inner.ForkRehome(atIdx, name, oldFutureName, rehome)
+	if err != nil {
+		return nil, err
+	}
+	return l.forkCached(atIdx, childInner)
+}
+
+func (l *Log) forkCached(atIdx uint64, childInner *disk.Log) (*Log, error) {
 	old := l.snap.Load()
 	keep := uint64(0)
-	if atIdx > old.firstIdx {
+	if len(old.entries) > 0 && atIdx > old.firstIdx {
 		keep = atIdx - old.firstIdx
 	}
 	if keep > uint64(len(old.entries)) {
@@ -231,6 +299,9 @@ func (l *Log) Fork(atIdx uint64, name string, oldFutureNameOpt ...string) (*Log,
 // the cache. Only this Log's own entries are affected; parent
 // entries are untouched.
 func (l *Log) TruncateFront(beforeIdx uint64) error {
+	if l.shared {
+		return ErrSharedMutation
+	}
 	l.wmu.Lock()
 	defer l.wmu.Unlock()
 	if err := l.inner.TruncateFront(beforeIdx); err != nil {
@@ -258,10 +329,35 @@ func (l *Log) TruncateFront(beforeIdx uint64) error {
 // Log methods on the hot path.
 func (l *Log) Disk() *disk.Log { return l.inner }
 
+// ForkBase returns the first index this log owns, or zero for a root log.
+func (l *Log) ForkBase() uint64 { return l.inner.ForkBase() }
+
+// RangeOwn delegates an own-entry iteration for topology operations. Normal
+// reads should use Range so they stay on the immutable cache.
+func (l *Log) RangeOwn(from uint64, fn func(idx uint64, payload []byte) error) error {
+	return l.inner.RangeOwn(from, fn)
+}
+
+// ChildForkBases reports child fork boundaries for topology planning.
+func (l *Log) ChildForkBases() (map[string]uint64, error) {
+	return l.inner.ChildForkBases()
+}
+
+// StateAt reconstructs a header-mode state from the on-disk watermark.
+func (l *Log) StateAt(idx uint64) ([]byte, error) { return l.inner.StateAt(idx) }
+
+// SegmentBaseIndexes returns this log's own segment bases.
+func (l *Log) SegmentBaseIndexes() []uint64 { return l.inner.SegmentBaseIndexes() }
+
 // Close closes the underlying disk.Log. Parent logs auto-opened
 // during Open are not closed automatically; manage them via a Store
 // or explicit handles for shared lifetimes.
-func (l *Log) Close() error { return l.inner.Close() }
+func (l *Log) Close() error {
+	if l.shared {
+		return nil
+	}
+	return l.inner.Close()
+}
 
 // Snapshot exposes the current snapshot pointer for callers that
 // want a point-in-time consistent view across many operations
@@ -277,6 +373,9 @@ type Snapshot struct{ s *cacheSnapshot }
 func (s *Snapshot) Read(idx uint64) ([]byte, error) { return s.s.read(idx) }
 func (s *Snapshot) Range(from uint64, fn func(idx uint64, payload []byte) error) error {
 	return s.s.rangeFromIdx(from, fn)
+}
+func (s *Snapshot) ScanFromEnd(from uint64, fn func(idx uint64, payload []byte) error) error {
+	return s.s.scanFromEnd(from, fn)
 }
 func (s *Snapshot) FirstIndex() uint64 { return s.s.firstIndexRecursive() }
 func (s *Snapshot) LastIndex() uint64 {
