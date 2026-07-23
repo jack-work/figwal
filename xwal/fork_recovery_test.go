@@ -327,3 +327,51 @@ func TestForkFailureRollsBackAndDisarms(t *testing.T) {
 		t.Fatalf("phantom trunk materialized: %d trunks", got)
 	}
 }
+
+func TestRawForkFailureLeavesHandleUsable(t *testing.T) {
+	dir := t.TempDir()
+	tr, branch := seedForkStore(t, dir)
+	cfg := testStoreOptions().config()
+	x, err := Open(dir, cfg, branch...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer x.Close()
+
+	// Related channels fork first (main is the plan's last leg); an
+	// unwritable main dir fails the fork after chalkboard diverged.
+	mainDir := filepath.Join(append([]string{dir, "ir"}, branch...)...)
+	if err := os.Chmod(mainDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	restore := func() { os.Chmod(mainDir, 0o755) }
+	defer restore()
+	if _, err := x.Fork(3, "nA", "nC"); err == nil {
+		t.Fatal("fork with unwritable main dir succeeded")
+	}
+	restore()
+
+	lt, err := x.AppendMain([]byte(`{"after":1}`), nil)
+	if err != nil {
+		t.Fatalf("AppendMain on same handle after aborted fork: %v", err)
+	}
+	patch, _ := MapSetPatch([]string{"after"}, []byte(itoa(lt)))
+	if _, err := x.Append("chalkboard", lt, patch, nil); err != nil {
+		t.Fatalf("related append on refreshed handle: %v", err)
+	}
+	if err := x.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := OpenStore(dir, testStoreOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if got := len(s.ListLight()); got != 1 {
+		t.Fatalf("phantom trunk after aborted raw fork: %d trunks", got)
+	}
+	if _, payload, err := s.Read(tr, "ir", lt); err != nil || string(payload) != `{"after":1}` {
+		t.Fatalf("post-abort append lost: %s err=%v", payload, err)
+	}
+}

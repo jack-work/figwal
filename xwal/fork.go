@@ -125,8 +125,38 @@ func (x *XWAL) abortForkPlan(plan forkPlan, cause error) error {
 	if len(errs) > 0 {
 		return errors.Join(append([]error{cause}, errs...)...)
 	}
+	// The live handle's channels that forked before the failing leg hold
+	// read-only inner logs and truncated snapshots; reopen them against
+	// the rolled-back layout so the handle stays usable.
+	var refreshErrs []error
+	for _, e := range plan.Channels {
+		ch := x.chans[e.Name]
+		if ch == nil {
+			continue
+		}
+		if err := ch.log.Close(); err != nil {
+			refreshErrs = append(refreshErrs, fmt.Errorf("refresh %q: %w", e.Name, err))
+			continue
+		}
+		l, err := log.Open(ch.dir, x.channelOpts(ch))
+		if err != nil {
+			refreshErrs = append(refreshErrs, fmt.Errorf("refresh %q: %w", e.Name, err))
+			continue
+		}
+		ch.mu.Lock()
+		ch.log = l
+		ch.fk = map[uint64]uint64{}
+		ch.fkBuilt, ch.fkScan = false, false
+		ch.fkNext, ch.fkFloor = 0, 0
+		ch.mu.Unlock()
+	}
 	if err := removeForkPlan(x.root); err != nil {
-		return errors.Join(cause, err)
+		refreshErrs = append(refreshErrs, err)
+	}
+	if len(refreshErrs) > 0 {
+		return errors.Join(append([]error{
+			fmt.Errorf("xwal: fork aborted and rolled back; handle stale, reopen required: %w", cause),
+		}, refreshErrs...)...)
 	}
 	return fmt.Errorf("xwal: fork aborted and rolled back: %w", cause)
 }
