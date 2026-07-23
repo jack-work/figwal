@@ -833,17 +833,45 @@ func (t *Trunks) releaseHot(h *trunkStore) error {
 	return nil
 }
 
+// flushHot flushes every loaded head lineage-coherently (main first,
+// related channels capped at durable main referents), so the stray
+// sweep can never push a related record ahead of its main entry.
 func (t *Trunks) flushHot() error {
 	t.hotMu.Lock()
 	h := t.hot
 	if h != nil {
 		h.refs++
 	}
+	var heads []*hotHead
+	if h != nil {
+		for _, head := range h.heads {
+			heads = append(heads, head)
+			head.refs++
+		}
+	}
 	t.hotMu.Unlock()
 	if h == nil {
 		return nil
 	}
-	err := h.store.FlushAll()
+	var err error
+	for _, head := range heads {
+		select {
+		case <-head.ready:
+		default:
+			continue
+		}
+		if head.x == nil || head.err != nil {
+			continue
+		}
+		if ferr := head.x.flushCoherent(); ferr != nil && err == nil {
+			err = ferr
+		}
+	}
+	t.hotMu.Lock()
+	for _, head := range heads {
+		head.refs--
+	}
+	t.hotMu.Unlock()
 	if rerr := t.releaseHot(h); rerr != nil && err == nil {
 		err = rerr
 	}
