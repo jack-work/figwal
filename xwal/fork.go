@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/jack-work/figwal/disk"
 	"github.com/jack-work/figwal/log"
+	"github.com/jack-work/figwal/segment"
 )
 
 // forkPendingName, in the xwal root, records a joint fork that began but
@@ -18,15 +20,27 @@ import (
 const forkPendingName = ".xwal-fork-pending"
 
 // forkPlan is the durable description of a joint fork: where to split,
-// what to name the branches, and the exact per-channel boundary indexes
-// (recorded so recovery never has to recompute them from partial state).
-// Channels are listed in apply order — the main channel last.
+// what to name the branches, the exact per-channel boundary indexes
+// (recorded so recovery never has to recompute them from partial state),
+// and the trunk-marker commit. Channels are listed in apply order — the
+// main channel last.
 type forkPlan struct {
 	AtMainLT  uint64          `json:"atMainLT"`
 	Child     string          `json:"child"`
 	OldFuture string          `json:"oldFuture"`
+	Main      string          `json:"main"`
 	Rehome    []string        `json:"rehome,omitempty"` // child node dirs to re-home into the old-future (joint, by name)
 	Channels  []forkPlanEntry `json:"channels"`
+	Commit    *forkCommit     `json:"commit,omitempty"`
+}
+
+// forkCommit is the trunk-marker phase of a joint fork, journaled in the
+// plan so a crash between the channel forks and the marker writes can
+// never lose the source trunk id (the old-future inherits it) or the
+// minted child id.
+type forkCommit struct {
+	SourceTrunk string `json:"sourceTrunk,omitempty"`
+	ChildTrunk  string `json:"childTrunk,omitempty"`
 }
 
 type forkPlanEntry struct {
@@ -52,6 +66,10 @@ type forkPlanEntry struct {
 // before any channel diverges and removed only once all have, and Open
 // rolls a partial fork forward to completion.
 func (x *XWAL) Fork(atMainLT uint64, childName, oldFutureName string) (*XWAL, error) {
+	return x.forkJoint(atMainLT, childName, oldFutureName, nil)
+}
+
+func (x *XWAL) forkJoint(atMainLT uint64, childName, oldFutureName string, commit *forkCommit) (*XWAL, error) {
 	if err := x.ensurePrivate(); err != nil {
 		return nil, err
 	}
@@ -65,6 +83,7 @@ func (x *XWAL) Fork(atMainLT uint64, childName, oldFutureName string) (*XWAL, er
 	if err != nil {
 		return nil, err
 	}
+	plan.Commit = commit
 	if err := writeForkPlan(x.root, plan); err != nil {
 		return nil, err
 	}
@@ -76,11 +95,43 @@ func (x *XWAL) Fork(atMainLT uint64, childName, oldFutureName string) (*XWAL, er
 	if err := applyCachedForkPlan(x.root, plan, getLog); err != nil {
 		return nil, err
 	}
+	if err := applyForkCommit(x.root, plan); err != nil {
+		return nil, err
+	}
 	if err := removeForkPlan(x.root); err != nil {
 		return nil, err
 	}
 	childBranch := append(append([]string(nil), x.branch...), childName)
 	return Open(x.root, x.cfg, childBranch...)
+}
+
+// applyForkCommit writes the trunk markers recorded in the plan:
+// the old-future inherits the source trunk id, the child gets the
+// minted id. Idempotent; runs both on the live path and in recovery.
+func applyForkCommit(root string, plan forkPlan) error {
+	if plan.Commit == nil {
+		return nil
+	}
+	mainDir := ""
+	for _, e := range plan.Channels {
+		if e.Name == plan.Main {
+			mainDir = e.Dir
+		}
+	}
+	if mainDir == "" {
+		return fmt.Errorf("xwal: fork plan has no main channel entry")
+	}
+	if plan.OldFuture != "" && plan.Commit.SourceTrunk != "" {
+		if err := writeTrunkID(filepath.Join(root, mainDir, plan.OldFuture), plan.Commit.SourceTrunk); err != nil {
+			return err
+		}
+	}
+	if plan.Commit.ChildTrunk != "" {
+		if err := writeTrunkID(filepath.Join(root, mainDir, plan.Child), plan.Commit.ChildTrunk); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ErrTopologyIncomplete reports a manifest channel whose logical branch tree
@@ -143,7 +194,7 @@ func (x *XWAL) buildForkPlan(atMainLT uint64, childName, oldFutureName string) (
 	if oldFutureName != "" && oldFutureName == childName {
 		return forkPlan{}, fmt.Errorf("xwal: fork child and old-future names must differ")
 	}
-	plan := forkPlan{AtMainLT: atMainLT, Child: childName, OldFuture: oldFutureName}
+	plan := forkPlan{AtMainLT: atMainLT, Child: childName, OldFuture: oldFutureName, Main: x.main}
 	// Joint re-home: decided ONCE from the main channel — every child fork
 	// whose divergence (.fork base) is past the split point moves into the
 	// continuation, and the SAME set moves in every channel (by name). This
@@ -265,9 +316,13 @@ func applyForkPlan(root string, plan forkPlan, getLog func(forkPlanEntry) (*disk
 	return nil
 }
 
-// recoverFork completes a fork that a sentinel says was interrupted. It
-// opens each channel fresh (the parent xwal is not open during recovery)
-// using the manifest to pick the codec and reducible fold.
+// recoverFork completes a fork that a sentinel says was interrupted.
+// Each planned channel is rolled BACK to its pre-fork layout (every
+// mutation up to the marker phase is a rename or a derivable file, so
+// the union of the dir and its old-future always holds the full data),
+// then re-forked through the normal machinery, then the trunk-marker
+// commit is replayed. Idempotent; never refuses a dir-level sentinel —
+// the rollback consumes it.
 func recoverFork(root string, cfg Config, man manifest, plan forkPlan) error {
 	codec, err := codecByName(man.Codec)
 	if err != nil {
@@ -276,6 +331,24 @@ func recoverFork(root string, cfg Config, man manifest, plan forkPlan) error {
 	kinds := map[string]manifestChannel{}
 	for _, mc := range man.Channels {
 		kinds[mc.Name] = mc
+	}
+	for _, e := range plan.Channels {
+		mc, ok := kinds[e.Name]
+		if !ok {
+			return fmt.Errorf("channel %q not in manifest", e.Name)
+		}
+		dir := filepath.Join(root, e.Dir)
+		complete, err := channelForkComplete(dir, plan)
+		if err != nil {
+			return err
+		}
+		if complete {
+			continue
+		}
+		headered := mc.Kind == ChannelReducible.String()
+		if err := rollbackChannelFork(dir, plan, e.AtIdx, codec, headered); err != nil {
+			return fmt.Errorf("xwal: roll back fork of %q: %w", e.Name, err)
+		}
 	}
 	getLog := func(e forkPlanEntry) (*disk.Log, func(), error) {
 		mc, ok := kinds[e.Name]
@@ -299,7 +372,156 @@ func recoverFork(root string, cfg Config, man manifest, plan forkPlan) error {
 		}
 		return l, func() { l.Close() }, nil
 	}
-	return applyForkPlan(root, plan, getLog)
+	if err := applyForkPlan(root, plan, getLog); err != nil {
+		return err
+	}
+	return applyForkCommit(root, plan)
+}
+
+// channelForkComplete reports whether a channel already finished its
+// joint-fork leg: the in-dir sentinel is gone and the child carries its
+// .fork marker (the marker is the last mutation before sentinel removal).
+func channelForkComplete(dir string, plan forkPlan) (bool, error) {
+	if pathExists(filepath.Join(dir, disk.ForkPendingName)) {
+		return false, nil
+	}
+	_, err := readForkBaseFile(filepath.Join(dir, plan.Child, ".fork"))
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
+}
+
+// rollbackChannelFork restores a channel dir to its pre-fork layout.
+// The fork only ever (a) creates the child dir with derivable seeds,
+// (b) renames whole segments and re-homed child dirs into the
+// old-future, and (c) splits the boundary segment — writing the durable
+// suffix into the old-future BEFORE swapping the prefix in place. So:
+// the child dir is deleted, old-future subdirs and segments are renamed
+// back (a boundary suffix whose entries still live in the unsplit dir
+// segment is a copy and is deleted instead), derivable watermark seeds
+// are deleted, and the sentinel is consumed.
+func rollbackChannelFork(dir string, plan forkPlan, atIdx uint64, codec segment.SegmentCodec, headered bool) (err error) {
+	if err := os.RemoveAll(filepath.Join(dir, plan.Child)); err != nil {
+		return err
+	}
+	if plan.OldFuture != "" {
+		oldDir := filepath.Join(dir, plan.OldFuture)
+		if pathExists(oldDir) {
+			if err := rollbackOldFuture(dir, oldDir, atIdx, codec, headered); err != nil {
+				return err
+			}
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), codec.FileExt()+".tmp") {
+			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	if err := os.Remove(filepath.Join(dir, disk.ForkPendingName)); err != nil &&
+		!errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return disk.SyncDir(dir)
+}
+
+func rollbackOldFuture(dir, oldDir string, atIdx uint64, codec segment.SegmentCodec, headered bool) error {
+	entries, err := os.ReadDir(oldDir)
+	if err != nil {
+		return err
+	}
+	spanning, err := dirSegmentSpans(dir, atIdx, codec, headered)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		src := filepath.Join(oldDir, e.Name())
+		if e.IsDir() {
+			if strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
+			if err := os.Rename(src, filepath.Join(dir, e.Name())); err != nil {
+				return err
+			}
+			continue
+		}
+		if !strings.HasSuffix(e.Name(), codec.FileExt()) {
+			if err := os.Remove(src); err != nil {
+				return err
+			}
+			continue
+		}
+		base, perr := strconv.ParseUint(strings.TrimSuffix(e.Name(), codec.FileExt()), 10, 64)
+		if perr != nil {
+			return fmt.Errorf("xwal: unexpected old-future file %q", src)
+		}
+		count, cerr := segmentEntryCount(src, codec, headered)
+		if cerr != nil {
+			return cerr
+		}
+		if base == atIdx && (spanning || count == 0) {
+			// A boundary-suffix copy (the data still lives in the unsplit
+			// dir segment) or a derivable watermark seed.
+			if err := os.Remove(src); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.Rename(src, filepath.Join(dir, e.Name())); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(filepath.Join(oldDir, ".fork")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Remove(filepath.Join(oldDir, disk.ForkPendingName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.Remove(oldDir)
+}
+
+func segmentEntryCount(path string, codec segment.SegmentCodec, headered bool) (int, error) {
+	spans, err := scanSegmentFrames(path, codec)
+	if err != nil {
+		return 0, err
+	}
+	n := len(spans)
+	if headered && n > 0 {
+		n--
+	}
+	return n, nil
+}
+
+// dirSegmentSpans reports whether a segment in dir still covers atIdx
+// (base < atIdx and entries reaching at least atIdx) — i.e. the
+// boundary split never swapped the prefix in.
+func dirSegmentSpans(dir string, atIdx uint64, codec segment.SegmentCodec, headered bool) (bool, error) {
+	bases, err := segmentBases(dir, codec)
+	if err != nil {
+		return false, err
+	}
+	for _, base := range bases {
+		if base >= atIdx {
+			continue
+		}
+		count, err := segmentEntryCount(filepath.Join(dir, segFileName(base, codec)), codec, headered)
+		if err != nil {
+			return false, err
+		}
+		if count > 0 && base+uint64(count)-1 >= atIdx {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func writeForkPlan(root string, plan forkPlan) error {
@@ -309,10 +531,13 @@ func writeForkPlan(root string, plan forkPlan) error {
 	}
 	final := filepath.Join(root, forkPendingName)
 	tmp := final + ".tmp"
-	if err := os.WriteFile(tmp, body, 0o644); err != nil {
+	if err := writeSyncedFile(tmp, body); err != nil {
 		return err
 	}
-	return os.Rename(tmp, final)
+	if err := os.Rename(tmp, final); err != nil {
+		return err
+	}
+	return disk.SyncDir(root)
 }
 
 func readForkPlan(root string) (forkPlan, bool, error) {
@@ -331,7 +556,11 @@ func readForkPlan(root string) (forkPlan, bool, error) {
 }
 
 func removeForkPlan(root string) error {
-	return os.Remove(filepath.Join(root, forkPendingName))
+	if err := os.Remove(filepath.Join(root, forkPendingName)); err != nil &&
+		!errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return disk.SyncDir(root)
 }
 
 // relDir returns a channel log dir relative to the xwal root.

@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jack-work/figwal/disk"
 	"github.com/jack-work/figwal/log"
 )
 
@@ -219,6 +220,18 @@ func openTrunks(dir string, cfg Config) (*Trunks, error) {
 	man, err = recoverChannelPending(dir, cfg, man)
 	if err != nil {
 		return nil, err
+	}
+	// Complete any interrupted joint fork FIRST: later repair passes open
+	// channel dirs and must never trip on mid-fork state.
+	if plan, pending, perr := readForkPlan(dir); perr != nil {
+		return nil, perr
+	} else if pending {
+		if err := recoverFork(dir, cfg, man, plan); err != nil {
+			return nil, fmt.Errorf("xwal: recover interrupted fork: %w", err)
+		}
+		if err := removeForkPlan(dir); err != nil {
+			return nil, err
+		}
 	}
 	if _, err := recoverManifestTopology(dir, cfg, man); err != nil {
 		return nil, err
@@ -1158,18 +1171,26 @@ func (t *Trunks) resplitBelow(branch []string, atMainLT uint64) (string, error) 
 	}
 	altDir := t.mintNode()
 	contDir := t.mintNode()
+	altTrunk := t.mintTrunk()
+	owner := t.nodes[strings.Join(ownerBranch, "/")]
+	sourceTrunk := ""
+	if owner != nil {
+		sourceTrunk = owner.trunk
+	}
 	ox, err := t.openForkSource(ownerBranch)
 	if err != nil {
 		return "", err
 	}
-	child, ferr := ox.Fork(atMainLT+1, altDir, contDir) // child = alt; old-future = cont (re-homes children)
+	// child = alt; old-future = cont (re-homes children).
+	child, ferr := ox.forkJoint(atMainLT+1, altDir, contDir,
+		&forkCommit{SourceTrunk: sourceTrunk, ChildTrunk: altTrunk})
 	ox.Close()
 	if ferr != nil {
 		return "", fmt.Errorf("re-split-below: %w", ferr)
 	}
 	t.markForkResultValidated(ownerBranch, altDir, contDir)
 	child.Close()
-	return t.commitFork(ownerBranch, contDir, altDir)
+	return altTrunk, t.rebuild()
 }
 
 // ownerOf returns the branch of the deepest node along `branch` whose own
@@ -1249,21 +1270,19 @@ func (t *Trunks) forkTailLocked(trunk string) (string, error) {
 		}
 		pbranch := t.nodes[head.parent].branch
 		altDir := t.mintNode()
+		altTrunk := t.mintTrunk()
 		px, err := t.openForkSource(pbranch)
 		if err != nil {
 			return "", err
 		}
-		altX, ferr := px.Fork(fb, altDir, "") // N-ary add-one at the parent's fork point (no old-future)
+		// N-ary add-one at the parent's fork point (no old-future).
+		altX, ferr := px.forkJoint(fb, altDir, "", &forkCommit{ChildTrunk: altTrunk})
 		px.Close()
 		if ferr != nil {
 			return "", fmt.Errorf("fork-tail (empty head, via parent): %w", ferr)
 		}
 		t.markForkResultValidated(pbranch, altDir)
 		altX.Close()
-		altTrunk := t.mintTrunk()
-		if err := writeTrunkID(t.irDir(append(append([]string(nil), pbranch...), altDir)), altTrunk); err != nil {
-			return "", err
-		}
 		return altTrunk, t.rebuild()
 	}
 
@@ -1272,18 +1291,20 @@ func (t *Trunks) forkTailLocked(trunk string) (string, error) {
 	// prefix in every channel (always-materialize → write isolation).
 	altDir := t.mintNode()
 	contDir := t.mintNode()
+	altTrunk := t.mintTrunk()
 	fx, err := t.openForkSource(head.branch)
 	if err != nil {
 		return "", err
 	}
-	child, ferr := fx.Fork(tail+1, altDir, contDir)
+	child, ferr := fx.forkJoint(tail+1, altDir, contDir,
+		&forkCommit{SourceTrunk: head.trunk, ChildTrunk: altTrunk})
 	fx.Close()
 	if ferr != nil {
 		return "", fmt.Errorf("fork-tail: %w", ferr)
 	}
 	t.markForkResultValidated(head.branch, altDir, contDir)
 	child.Close()
-	return t.commitFork(head.branch, contDir, altDir)
+	return altTrunk, t.rebuild()
 }
 
 // ForkAt forks a trunk at an interior main-LT WITHOUT appending: it shares
@@ -1325,19 +1346,21 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 
 	altDir := t.mintNode()
 	contDir := t.mintNode()
+	altTrunk := t.mintTrunk()
 	fx, err := t.openForkSource(branch)
 	if err != nil {
 		return "", err
 	}
-	child, ferr := fx.Fork(atMainLT+1, altDir, contDir) // child = alt; old-future = cont
+	// child = alt; old-future = cont.
+	child, ferr := fx.forkJoint(atMainLT+1, altDir, contDir,
+		&forkCommit{SourceTrunk: trunk, ChildTrunk: altTrunk})
 	fx.Close()
 	if ferr != nil {
 		return "", ferr
 	}
 	t.markForkResultValidated(branch, altDir, contDir)
 	child.Close()
-	alt, cerr := t.commitFork(branch, contDir, altDir)
-	return alt, cerr
+	return altTrunk, t.rebuild()
 }
 
 // Remove deletes a trunk: its founding node's entire subtree, in every
@@ -1456,7 +1479,7 @@ func (t *Trunks) CreateStump(name string) error {
 	}
 	// Fork the root at its tail (N-ary add-one), naming the child `name`,
 	// with no continuation and no trunk marker.
-	if _, err := t.forkChild(nil, name); err != nil {
+	if _, err := t.forkChild(nil, name, nil); err != nil {
 		return fmt.Errorf("xwal: create-stump %q: %w", name, err)
 	}
 	return t.rebuild()
@@ -1535,13 +1558,9 @@ func (t *Trunks) SpawnUnderRoot() (TrunkID, error) {
 // holds t.mu.
 func (t *Trunks) spawnTrunkAt(parentBranch []string) (TrunkID, error) {
 	childDir := t.mintNode()
-	childBranch, err := t.forkChild(parentBranch, childDir)
-	if err != nil {
-		return "", fmt.Errorf("xwal: spawn: %w", err)
-	}
 	childTrunk := t.mintTrunk()
-	if err := writeTrunkID(t.irDir(childBranch), childTrunk); err != nil {
-		return "", err
+	if _, err := t.forkChild(parentBranch, childDir, &forkCommit{ChildTrunk: childTrunk}); err != nil {
+		return "", fmt.Errorf("xwal: spawn: %w", err)
 	}
 	return childTrunk, t.rebuild()
 }
@@ -1549,7 +1568,7 @@ func (t *Trunks) spawnTrunkAt(parentBranch []string) (TrunkID, error) {
 // forkChild forks the node at parentBranch at its tail (N-ary add-one, no
 // continuation), creating an empty child dir named childDir in every channel.
 // Returns the child's branch. Caller holds t.mu and must rebuild afterwards.
-func (t *Trunks) forkChild(parentBranch []string, childDir string) ([]string, error) {
+func (t *Trunks) forkChild(parentBranch []string, childDir string, commit *forkCommit) ([]string, error) {
 	x, err := t.openHotTopology(parentBranch)
 	if err != nil {
 		return nil, err
@@ -1560,7 +1579,7 @@ func (t *Trunks) forkChild(parentBranch []string, childDir string) ([]string, er
 	if err != nil {
 		return nil, err
 	}
-	c, ferr := fx.Fork(tail+1, childDir, "") // N-ary add-one at the tail; no continuation
+	c, ferr := fx.forkJoint(tail+1, childDir, "", commit) // N-ary add-one at the tail; no continuation
 	fx.Close()
 	if ferr != nil {
 		return nil, ferr
@@ -1745,23 +1764,6 @@ func (t *Trunks) anchorOf(trunk TrunkID) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-// commitFork writes the trunk markers for a freeze+two-children fork: the
-// continuation inherits the (frozen) head's trunk, the alternative founds
-// a new one. Then it rebuilds the cache from disk. Returns the new alt
-// trunk id.
-func (t *Trunks) commitFork(headBranch []string, contDir, altDir string) (string, error) {
-	headKey := strings.Join(headBranch, "/")
-	headTrunk := t.nodes[headKey].trunk
-	if err := writeTrunkID(t.irDir(append(append([]string(nil), headBranch...), contDir)), headTrunk); err != nil {
-		return "", err
-	}
-	altTrunk := t.mintTrunk()
-	if err := writeTrunkID(t.irDir(append(append([]string(nil), headBranch...), altDir)), altTrunk); err != nil {
-		return "", err
-	}
-	return altTrunk, t.rebuild()
 }
 
 // AppendChannel appends to a related channel of a trunk's head.
@@ -1991,7 +1993,10 @@ func joinKey(branch []string, child string) string {
 }
 
 func writeTrunkID(nodeDir, trunkID string) error {
-	return os.WriteFile(filepath.Join(nodeDir, trunkMarker), []byte(trunkID+"\n"), 0o644)
+	if err := writeSyncedFile(filepath.Join(nodeDir, trunkMarker), []byte(trunkID+"\n")); err != nil {
+		return err
+	}
+	return disk.SyncDir(nodeDir)
 }
 
 func readTrunkID(nodeDir string) (string, bool) {

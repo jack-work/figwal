@@ -18,8 +18,12 @@ const forkMarkerName = ".fork"
 
 // forkPendingName, when present in a log directory, signals that a
 // previous fork operation crashed before completing. Open refuses to
-// proceed; the operator must resolve manually.
+// proceed; the xwal joint-fork recovery consumes it by rolling the
+// channel back to its pre-fork layout and re-forking from the plan.
 const forkPendingName = ".fork-pending"
+
+// ForkPendingName exposes the sentinel name to the recovery layer.
+const ForkPendingName = forkPendingName
 
 var (
 	ErrForkPending     = errors.New("fork in progress: dir contains .fork-pending sentinel")
@@ -68,10 +72,25 @@ func writeForkMarker(dir string, base uint64) error {
 	final := filepath.Join(dir, forkMarkerName)
 	tmp := final + ".tmp"
 	body := fmt.Sprintf("base=%d\n", base)
-	if err := os.WriteFile(tmp, []byte(body), 0644); err != nil {
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, final)
+	if _, err := f.Write([]byte(body)); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		return err
+	}
+	return syncDir(dir)
 }
 
 // hasForkPending checks for the in-progress sentinel.
@@ -368,6 +387,10 @@ func (l *Log) forkImpl(atIdx uint64, childName, oldFutureName string, oldFutureE
 	pendingBody := fmt.Sprintf("at=%d\nchild=%s\nold=%s\n",
 		atIdx, childName, oldFutureName)
 	if err := os.WriteFile(pendingPath, []byte(pendingBody), 0644); err != nil {
+		return nil, err
+	}
+	if err := syncDir(l.dir); err != nil {
+		_ = os.Remove(pendingPath)
 		return nil, err
 	}
 	rollbackPending := func(err error) error {
