@@ -11,6 +11,7 @@ MaxUnflushedBytes; the over-cap append performs an inline bounded flush.
 s, err := xwal.OpenStore(root, xwal.StoreOptions{
     FlushInterval:     time.Second,            // loss window; 0 = default 1s
     MaxUnflushedBytes: 64 << 20,               // lag bound per channel; 0 = default 64MB
+    IdleUnload:        5 * time.Minute,        // evict idle heads; 0 = default 5m, <0 = never
     Reducers:          map[string]Reducer{…},  // reducible channels only
 })
 
