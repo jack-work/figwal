@@ -1646,6 +1646,12 @@ func (x *XWAL) flushAll() error {
 	return nil
 }
 
+// FlushCoherent synchronously persists this handle's channels as one
+// lineage-coherent cut. It is the ONLY sanctioned durability call for
+// raw XWAL handles (StumpHead birth writes and other ceremonial appends
+// are invisible to the store flusher until Close without it).
+func (x *XWAL) FlushCoherent() error { return x.flushCoherent() }
+
 // flushCoherent persists this lineage's channels as one cut: the main
 // channel first, then each related channel only up to the last record
 // whose main-LT referent is already durable.

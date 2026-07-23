@@ -31,12 +31,12 @@ type Store struct {
 	opts     StoreOptions
 	lockFile *os.File
 
-	mu         sync.Mutex
-	dirty      map[string]struct{}
-	touch      map[string]time.Time
-	flushFails int
-	flushErr   error
-	kick       chan struct{}
+	mu           sync.Mutex
+	dirty        map[string]struct{}
+	touch        map[string]time.Time
+	lineageFails map[string]int
+	lineageErr   map[string]error
+	kick         chan struct{}
 	stop       chan struct{}
 	done       chan struct{}
 
@@ -95,14 +95,16 @@ func OpenStore(root string, opts StoreOptions) (*Store, error) {
 		opts.IdleUnload = defaultIdleUnload
 	}
 	s := &Store{
-		Trunks:   t,
-		opts:     opts,
-		lockFile: lockFile,
-		dirty:    map[string]struct{}{},
-		touch:    map[string]time.Time{},
-		kick:     make(chan struct{}, 1),
-		stop:     make(chan struct{}),
-		done:     make(chan struct{}),
+		Trunks:       t,
+		opts:         opts,
+		lockFile:     lockFile,
+		dirty:        map[string]struct{}{},
+		touch:        map[string]time.Time{},
+		lineageFails: map[string]int{},
+		lineageErr:   map[string]error{},
+		kick:         make(chan struct{}, 1),
+		stop:         make(chan struct{}),
+		done:         make(chan struct{}),
 	}
 	go s.run()
 	return s, nil
@@ -147,27 +149,94 @@ func (s *Store) markTouched(trunk string) {
 	s.mu.Unlock()
 }
 
-func (s *Store) noteFlushFailure(err error) {
+func (s *Store) noteFlushFailure(trunk string, err error) {
 	s.mu.Lock()
-	s.flushFails++
-	s.flushErr = err
+	s.lineageFails[trunk]++
+	s.lineageErr[trunk] = err
 	s.mu.Unlock()
 }
 
-func (s *Store) noteFlushSuccess() {
+func (s *Store) noteFlushSuccess(trunk string) {
 	s.mu.Lock()
-	s.flushFails = 0
-	s.flushErr = nil
+	delete(s.lineageFails, trunk)
+	delete(s.lineageErr, trunk)
 	s.mu.Unlock()
 }
 
-func (s *Store) poisoned() error {
+func (s *Store) poisoned(trunk string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.flushFails >= storePoisonThreshold {
-		return fmt.Errorf("xwal: store flushes failing (%d consecutive): %w", s.flushFails, s.flushErr)
+	if n := s.lineageFails[trunk]; n >= storePoisonThreshold {
+		return fmt.Errorf("xwal: lineage %s flushes failing (%d consecutive): %w", trunk, n, s.lineageErr[trunk])
 	}
 	return nil
+}
+
+// purgeLineage drops all flusher bookkeeping for trunk ids that ceased
+// to exist (Remove) or were relabeled away (Promote).
+func (s *Store) purgeLineage(ids ...string) {
+	s.mu.Lock()
+	for _, id := range ids {
+		delete(s.dirty, id)
+		delete(s.touch, id)
+		delete(s.lineageFails, id)
+		delete(s.lineageErr, id)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Store) purgeVanished() {
+	s.mu.Lock()
+	var stale []string
+	for id := range s.dirty {
+		stale = append(stale, id)
+	}
+	for id := range s.touch {
+		stale = append(stale, id)
+	}
+	for id := range s.lineageFails {
+		stale = append(stale, id)
+	}
+	s.mu.Unlock()
+	for _, id := range stale {
+		if !s.Trunks.hasHead(id) {
+			s.purgeLineage(id)
+		}
+	}
+}
+
+// Remove deletes a trunk (and, recursively, its branches) and clears
+// their flusher bookkeeping so a dirty-at-removal lineage cannot poison
+// the store. Unflushed appends on the removed trunks are flushed first
+// (best effort; they are deleted either way).
+func (s *Store) Remove(trunk string, recursive bool) error {
+	s.flushDirty()
+	removed, err := s.Trunks.remove(trunk, recursive)
+	if len(removed) > 0 {
+		s.purgeLineage(removed...)
+	}
+	return err
+}
+
+// Promote relabels trunk markers; the absorbed parent id may cease to
+// exist, so its bookkeeping is drained first and purged after.
+func (s *Store) Promote(trunk TrunkID, levels int) (int, error) {
+	s.flushDirty()
+	n, err := s.Trunks.Promote(trunk, levels)
+	s.purgeVanished()
+	return n, err
+}
+
+// FlushStump synchronously persists a stump's birth records, lineage-
+// coherently. Raw StumpHead writes are invisible to the flusher; call
+// this before spawning children under a freshly written stump.
+func (s *Store) FlushStump(name string) error {
+	sx, err := s.Trunks.StumpHead(name)
+	if err != nil {
+		return err
+	}
+	defer sx.Close()
+	return sx.flushCoherent()
 }
 
 func (s *Store) flushDirty() {
@@ -180,17 +249,21 @@ func (s *Store) flushDirty() {
 	s.mu.Unlock()
 	sort.Strings(trunks)
 	for _, tr := range trunks {
-		if err := s.flushLineage(tr); err != nil {
+		err := s.flushLineage(tr)
+		switch {
+		case err == nil:
+			s.noteFlushSuccess(tr)
+		case errors.Is(err, ErrUnknownTrunk):
+			slog.Info("xwal: dropping flush bookkeeping for vanished trunk", "trunk", tr)
+			s.purgeLineage(tr)
+		default:
 			slog.Warn("xwal: lineage flush failed", "trunk", tr, "err", err)
 			s.markDirty(tr)
-			s.noteFlushFailure(err)
-		} else {
-			s.noteFlushSuccess()
+			s.noteFlushFailure(tr, err)
 		}
 	}
 	if err := s.Trunks.flushHot(); err != nil {
 		slog.Warn("xwal: stray flush failed", "err", err)
-		s.noteFlushFailure(err)
 	}
 }
 
@@ -291,7 +364,7 @@ func (o StoreOptions) config() Config {
 }
 
 func (s *Store) Append(trunk, channel string, mainLT uint64, payload, meta []byte) (uint64, error) {
-	if err := s.poisoned(); err != nil {
+	if err := s.poisoned(trunk); err != nil {
 		return 0, err
 	}
 	if channel == s.Trunks.main {

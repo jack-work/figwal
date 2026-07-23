@@ -112,6 +112,10 @@ var rootTopologyRegistry = struct {
 // pending flushes and open heads before giving up.
 var topologyWaitTimeout = 3 * time.Second
 
+// ErrUnknownTrunk reports an operation addressed to a trunk id with no
+// live head (never existed, removed, or relabeled away by Promote).
+var ErrUnknownTrunk = errors.New("xwal: unknown trunk")
+
 // NodeID and TrunkID are string ids (a node id is a branch dir name; a
 // trunk id is "t<N>").
 type (
@@ -362,10 +366,17 @@ func (t *Trunks) bumpSeqs(branch []string, trunkID string) {
 
 // --- accessors ---
 
+func (t *Trunks) hasHead(trunk string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	_, ok := t.heads[trunk]
+	return ok
+}
+
 func (t *Trunks) headBranch(trunk string) ([]string, error) {
 	key, ok := t.heads[trunk]
 	if !ok {
-		return nil, fmt.Errorf("xwal: unknown trunk %q", trunk)
+		return nil, fmt.Errorf("%w %q", ErrUnknownTrunk, trunk)
 	}
 	return t.nodes[key].branch, nil
 }
@@ -1278,7 +1289,7 @@ func (t *Trunks) forkTailLocked(trunk string) (string, error) {
 	}
 	headKey, ok := t.heads[trunk]
 	if !ok {
-		return "", fmt.Errorf("xwal: unknown trunk %q", trunk)
+		return "", fmt.Errorf("%w %q", ErrUnknownTrunk, trunk)
 	}
 	head := t.nodes[headKey]
 	x, err := t.openHotTopology(head.branch)
@@ -1396,13 +1407,20 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 // refuses a trunk that has live branches (descendant trunks branched off it)
 // unless recursive — in which case those branches go too.
 func (t *Trunks) Remove(trunk string, recursive bool) error {
+	_, err := t.remove(trunk, recursive)
+	return err
+}
+
+// remove deletes a trunk's founding subtree and reports every trunk id
+// that ceased to exist, so lifecycle bookkeeping above can purge them.
+func (t *Trunks) remove(trunk string, recursive bool) ([]TrunkID, error) {
 	endMutation, err := t.beginTopologyMutation()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer endMutation()
 	if err := t.ensureNoOpenHeads(); err != nil {
-		return err
+		return nil, err
 	}
 	t.retireRootHotPreservingValidation()
 
@@ -1414,7 +1432,7 @@ func (t *Trunks) Remove(trunk string, recursive bool) error {
 			continue
 		}
 		if n.isRoot {
-			return fmt.Errorf("xwal: cannot remove the root trunk %q", trunk)
+			return nil, fmt.Errorf("xwal: cannot remove the root trunk %q", trunk)
 		}
 		if p := t.nodes[n.parent]; p == nil || p.trunk != trunk {
 			foundKey, ok = key, true
@@ -1422,7 +1440,7 @@ func (t *Trunks) Remove(trunk string, recursive bool) error {
 		}
 	}
 	if !ok {
-		return fmt.Errorf("xwal: unknown trunk %q", trunk)
+		return nil, fmt.Errorf("%w %q", ErrUnknownTrunk, trunk)
 	}
 
 	// Collect the trunks living in the founding node's subtree.
@@ -1443,21 +1461,25 @@ func (t *Trunks) Remove(trunk string, recursive bool) error {
 	walk(foundKey)
 	delete(sub, trunk)
 	if len(sub) > 0 && !recursive {
-		return fmt.Errorf("xwal: trunk %q has %d live branch(es); remove recursively to take them too", trunk, len(sub))
+		return nil, fmt.Errorf("xwal: trunk %q has %d live branch(es); remove recursively to take them too", trunk, len(sub))
+	}
+	removed := []TrunkID{trunk}
+	for id := range sub {
+		removed = append(removed, id)
 	}
 
 	// Delete the founding node's subtree dir in every channel.
 	branch := t.nodes[foundKey].branch
 	names, err := channelNames(t.root)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, ch := range names {
 		if err := os.RemoveAll(filepath.Join(append([]string{t.root, ch}, branch...)...)); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return t.rebuild()
+	return removed, t.rebuild()
 }
 
 // SpawnChild adds a new child trunk under a "ceremonial" parent trunk
@@ -1479,7 +1501,7 @@ func (t *Trunks) SpawnChild(parent TrunkID) (TrunkID, error) {
 	}
 	nodeKey, ok := t.anchorOf(parent)
 	if !ok {
-		return "", fmt.Errorf("xwal: unknown trunk %q", parent)
+		return "", fmt.Errorf("%w %q", ErrUnknownTrunk, parent)
 	}
 	return t.spawnTrunkAt(t.nodes[nodeKey].branch)
 }
@@ -1697,7 +1719,7 @@ func (t *Trunks) Promote(trunk TrunkID, levels int) (int, error) {
 	}
 	foundKey, ok := t.foundingNode(trunk)
 	if !ok {
-		return 0, fmt.Errorf("xwal: unknown trunk %q", trunk)
+		return 0, fmt.Errorf("%w %q", ErrUnknownTrunk, trunk)
 	}
 	climbed := 0
 	for climbed < levels {

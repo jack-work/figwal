@@ -226,5 +226,5 @@ func TestFlushFailuresPoisonAppendsAndRecover(t *testing.T) {
 }
 
 func isStorePoisoned(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "store flushes failing")
+	return err != nil && strings.Contains(err.Error(), "flushes failing")
 }

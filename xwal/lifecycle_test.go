@@ -1,0 +1,242 @@
+package xwal
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestRemoveDirtyTrunkDoesNotPoisonStore(t *testing.T) {
+	dir := t.TempDir()
+	opts := testStoreOptions()
+	opts.FlushInterval = 20 * time.Millisecond
+	s, err := OpenStore(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	a, err := s.SpawnUnderRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.SpawnUnderRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(a, "ir", 0, []byte(`{"x":1}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(a, false); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, err := s.Append(b, "ir", 0, []byte(`{"y":2}`), nil); err != nil {
+		t.Fatalf("append to healthy trunk after removing dirty trunk: %v", err)
+	}
+	s.mu.Lock()
+	_, dirtyA := s.dirty[a]
+	failsA := s.lineageFails[a]
+	s.mu.Unlock()
+	if dirtyA || failsA != 0 {
+		t.Fatalf("removed trunk bookkeeping not purged: dirty=%v fails=%d", dirtyA, failsA)
+	}
+}
+
+func TestRawTrunksRemoveIsPurgedByFlusher(t *testing.T) {
+	dir := t.TempDir()
+	opts := testStoreOptions()
+	opts.FlushInterval = 20 * time.Millisecond
+	s, err := OpenStore(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	a, err := s.SpawnUnderRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.SpawnUnderRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(a, "ir", 0, []byte(`{"x":1}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	// Bypass the Store override (legacy embedded-call shape).
+	if err := s.Trunks.Remove(a, false); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, err := s.Append(b, "ir", 0, []byte(`{"y":2}`), nil); err != nil {
+		t.Fatalf("append to healthy trunk after raw remove: %v", err)
+	}
+}
+
+func TestPromoteDirtyTrunkDoesNotPoisonStore(t *testing.T) {
+	dir := t.TempDir()
+	opts := testStoreOptions()
+	opts.FlushInterval = 20 * time.Millisecond
+	s, err := OpenStore(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.CreateStump("cfg"); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := s.SpawnUnderStump("cfg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := s.Append(parent, "ir", 0, []byte(`{"p":1}`), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	child, err := s.Fork(parent, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(parent, "ir", 0, []byte(`{"p":2}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(child, "ir", 0, []byte(`{"c":1}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Promote(child, 5); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, err := s.Append(child, "ir", 0, []byte(`{"c":2}`), nil); err != nil {
+		t.Fatalf("append to promoted trunk: %v", err)
+	}
+}
+
+func TestPoisonIsPerLineage(t *testing.T) {
+	dir := t.TempDir()
+	opts := testStoreOptions()
+	opts.FlushInterval = 5 * time.Millisecond
+	opts.IdleUnload = -1
+	opts.SegmentSize = 256
+	s, err := OpenStore(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	bad, err := s.SpawnUnderRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := s.SpawnUnderRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(bad, "ir", 0, []byte(`{"warm":1}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "warm flush", func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return len(s.dirty) == 0
+	})
+	var badBranch []string
+	for _, ti := range s.ListLight() {
+		if ti.ID == bad {
+			badBranch = ti.Head
+		}
+	}
+	badDir := filepath.Join(append([]string{dir, "ir"}, badBranch...)...)
+	if err := os.Chmod(badDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(badDir, 0o755) })
+
+	big := `{"pad":"` + string(make([]byte, 0)) + `xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}`
+	deadline := time.Now().Add(10 * time.Second)
+	var badErr error
+	for {
+		if time.Now().After(deadline) {
+			t.Fatal("bad lineage never poisoned")
+		}
+		_, badErr = s.Append(bad, "ir", 0, []byte(big), nil)
+		if badErr != nil {
+			break
+		}
+		if _, err := s.Append(good, "ir", 0, []byte(`{"g":1}`), nil); err != nil {
+			t.Fatalf("healthy lineage affected while bad lineage degrades: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !isStorePoisoned(badErr) {
+		t.Fatalf("bad lineage append error = %v", badErr)
+	}
+	for i := 0; i < 10; i++ {
+		if _, err := s.Append(good, "ir", 0, []byte(`{"g":2}`), nil); err != nil {
+			t.Fatalf("healthy lineage poisoned by sibling failures: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	s.mu.Lock()
+	failsBad := s.lineageFails[bad]
+	s.mu.Unlock()
+	if failsBad < storePoisonThreshold {
+		t.Fatalf("good-lineage successes reset the bad lineage counter: %d", failsBad)
+	}
+}
+
+func TestFlushStumpMakesBirthDurable(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenStore(dir, testStoreOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.CreateStump("cfg"); err != nil {
+		t.Fatal(err)
+	}
+	sx, err := s.StumpHead("cfg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sx.AppendMain([]byte(`{"birth":"payload-sentinel"}`), nil); err != nil {
+		sx.Close()
+		t.Fatal(err)
+	}
+	if err := sx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FlushStump("cfg"); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	filepath.Walk(filepath.Join(dir, "ir", "cfg"), func(p string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			if b, rerr := os.ReadFile(p); rerr == nil && len(b) > 0 && string(b) != "" {
+				if containsBytes(b, []byte("payload-sentinel")) {
+					found = true
+				}
+			}
+		}
+		return nil
+	})
+	if !found {
+		t.Fatal("stump birth record not durable after FlushStump")
+	}
+}
+
+func containsBytes(haystack, needle []byte) bool {
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		match := true
+		for j := range needle {
+			if haystack[i+j] != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
