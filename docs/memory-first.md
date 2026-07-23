@@ -40,8 +40,13 @@ No sync modes. No EnsureChannel. No journal types. No per-channel policy.
   lineage-coherent prefix: a related-channel record never survives without
   the main-channel record it references, and a reducible watermark never
   runs ahead of its main channel.
-- Open repairs before serving: torn frames truncated per channel, then each
-  lineage trimmed to its coherent cut. Repair is idempotent and logged.
+- Open repairs before serving: crash artifacts are always repaired —
+  interrupted fork/channel plans are consumed (rolled back to the pre-fork
+  layout, then re-applied, trunk markers included), torn active-segment
+  tails are truncated per channel, and each lineage is trimmed to its
+  coherent cut. Repair is idempotent and logged. BYTE CORRUPTION of sealed
+  segments (bit flips, torn interiors, tampering outside the active tail)
+  is out of open-repair scope and deferred to an offline fsck.
 - Single writer: OpenStore takes an exclusive flock on root for its
   lifetime; a second writer fails immediately with a clear error.
 
