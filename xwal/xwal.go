@@ -1666,7 +1666,10 @@ func (x *XWAL) flushCoherent() error {
 	if err := main.log.Flush(); err != nil {
 		return err
 	}
-	mainTail := main.log.LastIndex()
+	// The cut is bounded by the DURABLE main tail: an append racing this
+	// pass may already sit in the memory snapshot, and admitting it would
+	// let related records reach disk ahead of their referent.
+	mainTail := main.log.Disk().LastIndex()
 	for _, name := range x.order {
 		if name == x.main {
 			continue
