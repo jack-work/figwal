@@ -818,6 +818,13 @@ func (t *Trunks) beginTopologyMutation() (func(), error) {
 			t.mu.Unlock()
 			return nil, err
 		}
+		// A failing flush must fail the topology op loudly: retiring the
+		// hot store would silently drop the unflushed (acked) tail.
+		if err := t.flushHot(); err != nil {
+			end()
+			t.mu.Unlock()
+			return nil, fmt.Errorf("xwal: refusing topology mutation, hot flush failing: %w", err)
+		}
 		if err := t.rebuild(); err != nil {
 			end()
 			t.mu.Unlock()

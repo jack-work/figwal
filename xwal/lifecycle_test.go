@@ -306,3 +306,77 @@ func TestStoreClearDoesNotResurrectPending(t *testing.T) {
 		t.Fatalf("post-clear record after reopen: %+v ok=%v err=%v", rec, ok, err)
 	}
 }
+
+func TestTopologyMutationRefusedWhileFlushFailing(t *testing.T) {
+	dir := t.TempDir()
+	opts := testStoreOptions()
+	opts.FlushInterval = time.Hour
+	opts.SegmentSize = 256
+	s, err := OpenStore(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	tr, err := s.SpawnUnderRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(tr, "ir", 0, []byte(`{"seed":1}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	s.Kick()
+	waitFor(t, 5*time.Second, "seed flush", func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return len(s.dirty) == 0
+	})
+	var branch []string
+	for _, ti := range s.ListLight() {
+		if ti.ID == tr {
+			branch = ti.Head
+		}
+	}
+	mainDir := filepath.Join(append([]string{dir, "ir"}, branch...)...)
+
+	// Fill past a segment so the next flush needs a rotation, then make
+	// the dir unwritable and append (pending only; FlushInterval is huge).
+	pad := make([]byte, 150)
+	for i := range pad {
+		pad[i] = 'x'
+	}
+	big := []byte(`{"pad":"` + string(pad) + `"}`)
+	acked := 0
+	for i := 0; i < 4; i++ {
+		if _, err := s.Append(tr, "ir", 0, big, nil); err != nil {
+			t.Fatal(err)
+		}
+		acked++
+	}
+	if err := os.Chmod(mainDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	restore := func() { os.Chmod(mainDir, 0o755) }
+	defer restore()
+
+	if _, err := s.Fork(tr, 2); err == nil {
+		t.Fatal("fork proceeded while flush failing (would truncate acked tail)")
+	}
+	restore()
+
+	alt, err := s.Fork(tr, 2)
+	if err != nil {
+		t.Fatalf("fork after restore: %v", err)
+	}
+	if alt == "" || alt == tr {
+		t.Fatalf("fork result: %q", alt)
+	}
+	chans, err := s.Channels(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range chans {
+		if c.Name == "ir" && c.Last != uint64(2+acked) {
+			t.Fatalf("acked tail truncated: last=%d want %d", c.Last, 2+acked)
+		}
+	}
+}
