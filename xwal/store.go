@@ -34,6 +34,8 @@ type Store struct {
 	mu         sync.Mutex
 	dirty      map[string]struct{}
 	touch      map[string]time.Time
+	flushFails int
+	flushErr   error
 	kick       chan struct{}
 	stop       chan struct{}
 	done       chan struct{}
@@ -45,6 +47,7 @@ type Store struct {
 const (
 	defaultFlushInterval = time.Second
 	defaultIdleUnload    = 5 * time.Minute
+	storePoisonThreshold = 3
 )
 
 func OpenStore(root string, opts StoreOptions) (*Store, error) {
@@ -144,6 +147,29 @@ func (s *Store) markTouched(trunk string) {
 	s.mu.Unlock()
 }
 
+func (s *Store) noteFlushFailure(err error) {
+	s.mu.Lock()
+	s.flushFails++
+	s.flushErr = err
+	s.mu.Unlock()
+}
+
+func (s *Store) noteFlushSuccess() {
+	s.mu.Lock()
+	s.flushFails = 0
+	s.flushErr = nil
+	s.mu.Unlock()
+}
+
+func (s *Store) poisoned() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.flushFails >= storePoisonThreshold {
+		return fmt.Errorf("xwal: store flushes failing (%d consecutive): %w", s.flushFails, s.flushErr)
+	}
+	return nil
+}
+
 func (s *Store) flushDirty() {
 	s.mu.Lock()
 	trunks := make([]string, 0, len(s.dirty))
@@ -157,10 +183,14 @@ func (s *Store) flushDirty() {
 		if err := s.flushLineage(tr); err != nil {
 			slog.Warn("xwal: lineage flush failed", "trunk", tr, "err", err)
 			s.markDirty(tr)
+			s.noteFlushFailure(err)
+		} else {
+			s.noteFlushSuccess()
 		}
 	}
 	if err := s.Trunks.flushHot(); err != nil {
 		slog.Warn("xwal: stray flush failed", "err", err)
+		s.noteFlushFailure(err)
 	}
 }
 
@@ -261,6 +291,9 @@ func (o StoreOptions) config() Config {
 }
 
 func (s *Store) Append(trunk, channel string, mainLT uint64, payload, meta []byte) (uint64, error) {
+	if err := s.poisoned(); err != nil {
+		return 0, err
+	}
 	if channel == s.Trunks.main {
 		_, lt, err := s.Trunks.Append(trunk, 0, payload, meta)
 		if err != nil {

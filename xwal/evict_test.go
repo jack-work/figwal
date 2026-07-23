@@ -1,7 +1,11 @@
 package xwal
 
 import (
+	"bytes"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -150,4 +154,77 @@ func TestBorrowedHeadIsNotEvicted(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, "eviction after release", func() bool { return s.LoadedHeads() == 0 })
+}
+
+func TestFlushFailuresPoisonAppendsAndRecover(t *testing.T) {
+	dir := t.TempDir()
+	opts := testStoreOptions()
+	opts.FlushInterval = 5 * time.Millisecond
+	opts.IdleUnload = -1
+	opts.SegmentSize = 256
+	s, err := OpenStore(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	tr, err := s.SpawnUnderRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(tr, "ir", 0, []byte(`{"warm":true}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "warm flush", func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return len(s.dirty) == 0
+	})
+
+	var headBranch []string
+	for _, ti := range s.ListLight() {
+		if ti.ID == tr {
+			headBranch = ti.Head
+		}
+	}
+	mainDir := filepath.Join(append([]string{dir, "ir"}, headBranch...)...)
+	if err := os.Chmod(mainDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	restore := func() {
+		if !restored {
+			restored = true
+			os.Chmod(mainDir, 0o755)
+		}
+	}
+	defer restore()
+
+	// Fill segments so every flush needs a rotation (a new file in the
+	// unwritable dir).
+	big := fmt.Sprintf(`{"pad":%q}`, bytes.Repeat([]byte("x"), 150))
+	deadline := time.Now().Add(10 * time.Second)
+	var appendErr error
+	for {
+		if time.Now().After(deadline) {
+			t.Fatal("store never poisoned")
+		}
+		_, appendErr = s.Append(tr, "ir", 0, []byte(big), nil)
+		if appendErr != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !isStorePoisoned(appendErr) {
+		t.Fatalf("append error = %v, want poisoned-store error", appendErr)
+	}
+
+	restore()
+	waitFor(t, 10*time.Second, "poison to clear", func() bool {
+		_, err := s.Append(tr, "ir", 0, []byte(`{"after":true}`), nil)
+		return err == nil
+	})
+}
+
+func isStorePoisoned(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "store flushes failing")
 }
