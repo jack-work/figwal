@@ -273,3 +273,57 @@ func TestForkRecoveryRollsBackSwappedBoundary(t *testing.T) {
 		t.Fatalf("child append: lt=%d err=%v", lt, err)
 	}
 }
+
+func TestForkFailureRollsBackAndDisarms(t *testing.T) {
+	dir := t.TempDir()
+	tr, branch := seedForkStore(t, dir)
+	s, err := OpenStore(dir, testStoreOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Make the MAIN channel branch dir unwritable: related channels fork
+	// first (main is the plan's last entry), then the main leg fails.
+	mainDir := filepath.Join(append([]string{dir, "ir"}, branch...)...)
+	if err := os.Chmod(mainDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	restore := func() { os.Chmod(mainDir, 0o755) }
+	defer restore()
+
+	if _, err := s.Fork(tr, 3); err == nil {
+		t.Fatal("fork with unwritable main dir succeeded")
+	}
+	restore()
+
+	if pathExists(filepath.Join(dir, forkPendingName)) {
+		t.Fatal("fork plan left armed after live failure")
+	}
+	chalkNode := filepath.Join(append([]string{dir, "chalkboard"}, branch...)...)
+	entries, err := os.ReadDir(chalkNode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			t.Fatalf("related channel child dir %q not rolled back", e.Name())
+		}
+	}
+	// Source keeps accepting appends in-process.
+	if _, err := s.Append(tr, "ir", 0, []byte(`{"after-abort":1}`), nil); err != nil {
+		t.Fatalf("append after aborted fork: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// No phantom trunk at the next open.
+	s2, err := OpenStore(dir, testStoreOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if got := len(s2.ListLight()); got != 1 {
+		t.Fatalf("phantom trunk materialized: %d trunks", got)
+	}
+}

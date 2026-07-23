@@ -93,16 +93,42 @@ func (x *XWAL) forkJoint(atMainLT uint64, childName, oldFutureName string, commi
 		return x.chans[e.Name].log, func() {}, nil
 	}
 	if err := applyCachedForkPlan(x.root, plan, getLog); err != nil {
-		return nil, err
+		return nil, x.abortForkPlan(plan, err)
 	}
 	if err := applyForkCommit(x.root, plan); err != nil {
-		return nil, err
+		return nil, x.abortForkPlan(plan, err)
 	}
 	if err := removeForkPlan(x.root); err != nil {
 		return nil, err
 	}
 	childBranch := append(append([]string(nil), x.branch...), childName)
 	return Open(x.root, x.cfg, childBranch...)
+}
+
+// abortForkPlan unwinds a joint fork that failed live: every channel is
+// rolled back to its pre-fork layout and the plan sentinel is removed,
+// so the source keeps accepting appends and no phantom fork materializes
+// at the next open. If the rollback itself fails the plan stays armed
+// for crash-style recovery and both errors surface.
+func (x *XWAL) abortForkPlan(plan forkPlan, cause error) error {
+	var errs []error
+	for _, e := range plan.Channels {
+		ch := x.chans[e.Name]
+		if ch == nil {
+			continue
+		}
+		dir := filepath.Join(x.root, e.Dir)
+		if err := rollbackChannelFork(dir, plan, e.AtIdx, x.codec, ch.kind == ChannelReducible); err != nil {
+			errs = append(errs, fmt.Errorf("roll back %q: %w", e.Name, err))
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(append([]error{cause}, errs...)...)
+	}
+	if err := removeForkPlan(x.root); err != nil {
+		return errors.Join(cause, err)
+	}
+	return fmt.Errorf("xwal: fork aborted and rolled back: %w", cause)
 }
 
 // applyForkCommit writes the trunk markers recorded in the plan:
@@ -480,11 +506,10 @@ func rollbackOldFuture(dir, oldDir string, atIdx uint64, codec segment.SegmentCo
 			return err
 		}
 	}
-	if err := os.Remove(filepath.Join(oldDir, ".fork")); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if err := os.Remove(filepath.Join(oldDir, disk.ForkPendingName)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	for _, name := range []string{".fork", ".trunk", disk.ForkPendingName} {
+		if err := os.Remove(filepath.Join(oldDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 	return os.Remove(oldDir)
 }
