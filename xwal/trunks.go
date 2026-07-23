@@ -370,6 +370,9 @@ func (t *Trunks) adoptLineage(lineage *rootLineageState) {
 	if lineage.owner == nil {
 		lineage.owner = t
 	} else if lineage.owner != t {
+		// The previous owner's buffered appends must reach disk before this
+		// peer opens the lineage from disk.
+		_ = lineage.owner.flushHot()
 		t.retireHot()
 		lineage.owner = t
 	}

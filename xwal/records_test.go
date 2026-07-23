@@ -85,6 +85,9 @@ func TestRecordsFromForkedMidLifeChannel(t *testing.T) {
 		t.Fatal("negative limit succeeded")
 	}
 
+	if err := child.flushAll(); err != nil {
+		t.Fatal(err)
+	}
 	reopened, err := Open(dir, cfg, "alt")
 	if err != nil {
 		t.Fatal(err)

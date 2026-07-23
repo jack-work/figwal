@@ -361,7 +361,7 @@ func (x *XWAL) boundaryFor(ch *channel, atMainLT uint64) (uint64, error) {
 		return ownFirst, nil // empty-own: fork at the own first index
 	}
 	found := uint64(0)
-	err := ch.log.RangeOwn(ownFirst, func(idx uint64, payload []byte) error {
+	err := ch.log.Range(ownFirst, func(idx uint64, payload []byte) error {
 		m, derr := decodeMainLT(payload)
 		if derr != nil {
 			return derr

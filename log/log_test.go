@@ -104,14 +104,14 @@ func TestCachedConcurrentReaders(t *testing.T) {
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
-		i := uint64(21)
-		for {
+		// Bounded: an unthrottled memory-speed writer makes the readers'
+		// full-log scans quadratic and the cache grow without limit.
+		for i := uint64(21); i <= 20_000; i++ {
 			select {
 			case <-stop:
 				return
 			default:
 				c.Write(i, []byte(fmt.Sprintf(`{"i":%d}`, i)))
-				i++
 			}
 		}
 	}()
