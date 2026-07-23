@@ -89,6 +89,10 @@ type Config struct {
 
 var errStopRange = errors.New("xwal: stop range")
 
+// ErrNoChannel reports an append or read addressed to a channel that
+// does not exist (yet). Store.Append reacts by auto-creating it.
+var ErrNoChannel = errors.New("xwal: no channel")
+
 // XWAL is an opened branch of a multi-channel log.
 type XWAL struct {
 	root   string // dir holding the manifest and the per-channel trees
@@ -169,6 +173,11 @@ func (ch *channel) lookup(mainLT uint64) (uint64, bool, error) {
 	return lt, ok, nil
 }
 
+// The manifest is kept (rather than deriving channels from directories)
+// because it is the only crash-safe enumeration of channels: names may be
+// nested paths ("translations/anthropic"), so directory position alone
+// cannot distinguish a channel dir from a grouping dir, and Remove/repair
+// must reliably visit every channel.
 const manifestName = "xwal.json"
 const channelPendingName = ".xwal-channel-pending"
 
@@ -1597,7 +1606,7 @@ func (x *XWAL) AppendMain(payload, meta []byte) (uint64, error) {
 func (x *XWAL) Append(channelName string, mainLT uint64, payload, meta []byte) (uint64, error) {
 	ch := x.chans[channelName]
 	if ch == nil {
-		return 0, fmt.Errorf("xwal: no channel %q", channelName)
+		return 0, fmt.Errorf("%w %q", ErrNoChannel, channelName)
 	}
 	if channelName == x.main {
 		return 0, fmt.Errorf("xwal: use AppendMain for the main channel")

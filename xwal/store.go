@@ -1,6 +1,7 @@
 package xwal
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -71,6 +72,11 @@ func OpenStore(root string, opts StoreOptions) (*Store, error) {
 			unlockRoot(lockFile)
 			return nil, err
 		}
+	}
+	if err := ensureDeclaredChannels(t, cfg); err != nil {
+		t.Close()
+		unlockRoot(lockFile)
+		return nil, err
 	}
 	if err := markUnclean(root); err != nil {
 		t.Close()
@@ -201,11 +207,51 @@ func (s *Store) Append(trunk, channel string, mainLT uint64, payload, meta []byt
 		return lt, nil
 	}
 	lt, err := s.Trunks.AppendChannel(trunk, channel, mainLT, payload, meta)
+	if errors.Is(err, ErrNoChannel) {
+		if cerr := s.autoCreateChannel(channel); cerr != nil {
+			return 0, cerr
+		}
+		lt, err = s.Trunks.AppendChannel(trunk, channel, mainLT, payload, meta)
+	}
 	if err != nil {
 		return 0, err
 	}
 	s.markDirty(trunk)
 	return lt, nil
+}
+
+func ensureDeclaredChannels(t *Trunks, cfg Config) error {
+	names, err := channelNames(t.root)
+	if err != nil {
+		return err
+	}
+	existing := make(map[string]bool, len(names))
+	for _, name := range names {
+		existing[name] = true
+	}
+	for _, spec := range cfg.Channels {
+		if existing[spec.Name] {
+			continue
+		}
+		if err := t.EnsureChannel(spec); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) autoCreateChannel(channel string) error {
+	spec := ChannelSpec{Name: channel, Kind: ChannelLog}
+	for _, name := range s.opts.Opaque {
+		if name == channel {
+			spec.Opaque = true
+		}
+	}
+	if _, ok := s.opts.Reducers[channel]; ok {
+		spec.Kind = ChannelReducible
+		spec.Reducer = channel
+	}
+	return s.Trunks.EnsureChannel(spec)
 }
 
 func (s *Store) Fork(trunk string, atMainLT uint64) (string, error) {
