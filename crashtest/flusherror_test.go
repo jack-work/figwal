@@ -5,9 +5,14 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func isPoisoned(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "flushes failing")
+}
 
 func chmodTree(t *testing.T, root string, mode os.FileMode) {
 	t.Helper()
@@ -41,11 +46,25 @@ func TestFlushErrorReadOnlyRecovers(t *testing.T) {
 	appended := 0
 	appendN := func(n int) {
 		for i := 0; i < n; i++ {
-			appended++
-			q := uint64(appended)
+			q := uint64(appended + 1)
 			if _, err := st.AppendMain(trunk, encodePayload(trunk, chanMain, q, q+1, salt)); err != nil {
-				t.Fatalf("append %d: %v", appended, err)
+				t.Fatalf("append %d: %v", appended+1, err)
 			}
+			appended++
+		}
+	}
+	// While flushes are failing the lineage poisons after a few ticks —
+	// Append then rejects by contract. Count only acked appends.
+	appendLossy := func(n int) {
+		for i := 0; i < n; i++ {
+			q := uint64(appended + 1)
+			if _, err := st.AppendMain(trunk, encodePayload(trunk, chanMain, q, q+1, salt)); err != nil {
+				if isPoisoned(err) {
+					return
+				}
+				t.Fatalf("append %d: %v", appended+1, err)
+			}
+			appended++
 		}
 	}
 	appendN(60)
@@ -67,11 +86,16 @@ func TestFlushErrorReadOnlyRecovers(t *testing.T) {
 
 	st.Kick()
 	time.Sleep(3 * flushInterval)
-	appendN(60)
+	appendLossy(60)
 	st.Kick()
 	time.Sleep(3 * flushInterval)
 
 	restore()
+	st.Kick()
+	time.Sleep(3 * flushInterval)
+	// Poison clears on the next successful flush of the lineage; appends
+	// must work again.
+	appendN(5)
 	st.Kick()
 	time.Sleep(3 * flushInterval)
 	if err := st.Close(); err != nil {
