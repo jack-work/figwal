@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/jack-work/figwal/log"
 )
@@ -105,7 +106,9 @@ var rootTopologyRegistry = struct {
 	states map[string]*rootTopologyState
 }{states: map[string]*rootTopologyState{}}
 
-var ErrTopologyBusy = errors.New("xwal: topology mutation blocked by active root users")
+// topologyWaitTimeout bounds how long topology mutations wait for
+// pending flushes and open heads before giving up.
+var topologyWaitTimeout = 3 * time.Second
 
 // NodeID and TrunkID are string ids (a node id is a branch dir name; a
 // trunk id is "t<N>").
@@ -424,7 +427,7 @@ func (t *Trunks) holdLineageHead(trunk string) func() {
 	}
 }
 
-func (t *Trunks) ensureNoOpenHeads() error {
+func (t *Trunks) openHeadRefs() int {
 	t.hotMu.Lock()
 	defer t.hotMu.Unlock()
 	refs := 0
@@ -434,10 +437,21 @@ func (t *Trunks) ensureNoOpenHeads() error {
 	for h := range t.retired {
 		refs += h.refs
 	}
-	if refs != 0 {
-		return fmt.Errorf("%w: %d open head(s)", ErrTopologyBusy, refs)
+	return refs
+}
+
+func (t *Trunks) ensureNoOpenHeads() error {
+	deadline := time.Now().Add(topologyWaitTimeout)
+	for {
+		refs := t.openHeadRefs()
+		if refs == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("xwal: topology mutation timed out waiting for %d open head(s)", refs)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
-	return nil
 }
 
 func (t *Trunks) borrowHotUntracked(branch []string) (*XWAL, func() error, error) {
@@ -527,18 +541,28 @@ func beginRootTopologyMutationFor(root string, owner *Trunks) (func(), string, e
 		return nil, "", err
 	}
 	state := rootTopologyStateFor(root)
+	deadline := time.Now().Add(topologyWaitTimeout)
 	state.mu.Lock()
-	for state.mutating {
-		state.ready.Wait()
-	}
-	if state.borrowers != 0 {
+	for {
+		for state.mutating {
+			state.ready.Wait()
+		}
+		if state.borrowers == 0 {
+			break
+		}
 		borrowers := state.borrowers
 		local := state.owners[owner]
-		state.mu.Unlock()
 		if owner != nil && local == borrowers {
+			state.mu.Unlock()
 			return nil, "", errLocalTopologyBorrowers
 		}
-		return nil, "", fmt.Errorf("%w: %d open head(s)", ErrTopologyBusy, borrowers)
+		if time.Now().After(deadline) {
+			state.mu.Unlock()
+			return nil, "", fmt.Errorf("xwal: topology mutation timed out waiting for %d open head(s)", borrowers)
+		}
+		state.mu.Unlock()
+		time.Sleep(2 * time.Millisecond)
+		state.mu.Lock()
 	}
 	state.mutating = true
 	state.mu.Unlock()
@@ -610,13 +634,22 @@ func transferRootBorrow(root string, from, to *Trunks) {
 	state.mu.Unlock()
 }
 
-func waitRootBorrowers(root string, owner *Trunks) {
+func waitRootBorrowers(root string, owner *Trunks) error {
 	state := rootTopologyStateFor(root)
+	deadline := time.Now().Add(topologyWaitTimeout)
 	state.mu.Lock()
 	for state.owners[owner] != 0 {
-		state.ready.Wait()
+		if time.Now().After(deadline) {
+			n := state.owners[owner]
+			state.mu.Unlock()
+			return fmt.Errorf("xwal: topology mutation timed out waiting for %d open head(s)", n)
+		}
+		state.mu.Unlock()
+		time.Sleep(2 * time.Millisecond)
+		state.mu.Lock()
 	}
 	state.mu.Unlock()
+	return nil
 }
 
 func rootTopologyEpoch(root string) uint64 {
@@ -672,7 +705,9 @@ func (t *Trunks) beginTopologyMutation() (func(), error) {
 				return nil, openErr
 			}
 			t.mu.Unlock()
-			waitRootBorrowers(t.registryRoot, t)
+			if waitErr := waitRootBorrowers(t.registryRoot, t); waitErr != nil {
+				return nil, waitErr
+			}
 			continue
 		}
 		if err != nil {
@@ -1001,16 +1036,10 @@ func (t *Trunks) Head(trunk string) (*XWAL, error) {
 	return view, nil
 }
 
-// Append adds a main-timeline entry to a trunk.
-//   - atMainLT == 0 or >= the head's tail: append (no fork). Returns the
-//     same trunk.
-//   - 0 < atMainLT < tail and within the head's own range: interior fork —
-//     a NEW trunk shares [1..atMainLT] and diverges at atMainLT+1; the
-//     existing trunk keeps its full history. Returns the new trunk.
-//   - atMainLT below the head's own range (in a frozen ancestor): re-split-below
-//     — fork the owning ancestor, minting a sibling trunk; the original
-//     timeline (and the caller's trunk) continues unchanged.
+// Append adds a main-timeline entry at the trunk's tail. atMainLT is
+// ignored — appends never fork; ForkAt is the only forking path.
 func (t *Trunks) Append(trunk string, atMainLT uint64, payload, meta []byte) (string, uint64, error) {
+	_ = atMainLT
 	unlockLineage := t.lockLineage(trunk)
 	defer unlockLineage()
 
@@ -1018,94 +1047,21 @@ func (t *Trunks) Append(trunk string, atMainLT uint64, payload, meta []byte) (st
 	if err != nil {
 		return "", 0, err
 	}
+	defer endRead()
 	branch, err := t.headBranch(trunk)
 	if err != nil {
-		endRead()
 		return "", 0, err
 	}
 	x, release, err := t.borrowHotUntracked(branch)
 	if err != nil {
-		endRead()
 		return "", 0, err
 	}
-	tail := mainTail(x)
-	if atMainLT == 0 || atMainLT >= tail {
-		lt, appendErr := x.AppendMain(payload, meta)
-		_ = release()
-		endRead()
-		if appendErr != nil {
-			return "", 0, appendErr
-		}
-		return trunk, lt, nil
-	}
+	lt, appendErr := x.AppendMain(payload, meta)
 	_ = release()
-	endRead()
-
-	endMutation, err := t.beginTopologyMutation()
-	if err != nil {
-		return "", 0, err
+	if appendErr != nil {
+		return "", 0, appendErr
 	}
-	defer endMutation()
-	if err := t.ensureNoOpenHeads(); err != nil {
-		return "", 0, err
-	}
-	return t.appendForkLocked(trunk, atMainLT, payload, meta)
-}
-
-func (t *Trunks) appendForkLocked(trunk string, atMainLT uint64, payload, meta []byte) (string, uint64, error) {
-	branch, err := t.headBranch(trunk)
-	if err != nil {
-		return "", 0, err
-	}
-	x, err := t.openHotTopology(branch)
-	if err != nil {
-		return "", 0, err
-	}
-	tail := mainTail(x)
-	ownFirst := ownFirstIdx(x)
-
-	// Topology can change between the optimistic read and the exclusive
-	// lock, so re-check whether this became a plain append.
-	if atMainLT == 0 || atMainLT >= tail {
-		lt, aerr := x.AppendMain(payload, meta)
-		x.Close()
-		if aerr != nil {
-			return "", 0, aerr
-		}
-		return trunk, lt, nil
-	}
-	if atMainLT < ownFirst {
-		// Re-split-below: atMainLT lives in a frozen ancestor. Fork the
-		// ancestor node that owns it (re-homing its suffix + children into
-		// the continuation) and append to the new alternative.
-		x.Close()
-		t.retireRootHotPreservingValidation()
-		return t.resplitBelow(branch, atMainLT, payload, meta, true)
-	}
-	x.Close()
-	// Interior fork: share [1..atMainLT], diverge at atMainLT+1.
-	altDir := t.mintNode()
-	contDir := t.mintNode()
-	fx, err := t.openForkSource(branch)
-	if err != nil {
-		return "", 0, err
-	}
-	child, ferr := fx.Fork(atMainLT+1, altDir, contDir) // child = alt; old-future = cont
-	fx.Close()
-	if ferr != nil {
-		return "", 0, ferr
-	}
-	t.markForkResultValidated(branch, altDir, contDir)
-	altLT, aerr := child.AppendMain(payload, meta)
-	child.Close()
-	if aerr != nil {
-		return "", 0, aerr
-	}
-	altTrunk, err := t.commitFork(branch, contDir, altDir)
-	if err != nil {
-		return "", 0, err
-	}
-	return altTrunk, altLT, nil
+	return trunk, lt, nil
 }
 
 // resplitBelow forks the ancestor node along `branch` that OWNS atMainLT (a
@@ -1113,39 +1069,27 @@ func (t *Trunks) appendForkLocked(trunk string, atMainLT uint64, payload, meta [
 // shares [1..atMainLT]. The owner's original timeline beyond atMainLT — its
 // suffix and ALL its child forks (including the caller's own trunk) — re-homes
 // into the continuation (which keeps the owner's trunk id, the normal
-// continuation-chain behavior). If doAppend, payload is written to the new
-// alternative. Caller holds t.mu. This is how a fork at an inherited LT (a
-// turn shared with ancestors) produces a sibling branch.
-func (t *Trunks) resplitBelow(branch []string, atMainLT uint64, payload, meta []byte, doAppend bool) (string, uint64, error) {
+// continuation-chain behavior). Caller holds t.mu. This is how a fork at an
+// inherited LT (a turn shared with ancestors) produces a sibling branch.
+func (t *Trunks) resplitBelow(branch []string, atMainLT uint64) (string, error) {
 	ownerBranch, err := t.ownerOf(branch, atMainLT)
 	if err != nil {
-		return "", 0, err
+		return "", err
 	}
 	altDir := t.mintNode()
 	contDir := t.mintNode()
 	ox, err := t.openForkSource(ownerBranch)
 	if err != nil {
-		return "", 0, err
+		return "", err
 	}
 	child, ferr := ox.Fork(atMainLT+1, altDir, contDir) // child = alt; old-future = cont (re-homes children)
 	ox.Close()
 	if ferr != nil {
-		return "", 0, fmt.Errorf("re-split-below: %w", ferr)
+		return "", fmt.Errorf("re-split-below: %w", ferr)
 	}
 	t.markForkResultValidated(ownerBranch, altDir, contDir)
-	var altLT uint64
-	if doAppend {
-		altLT, ferr = child.AppendMain(payload, meta)
-	}
 	child.Close()
-	if ferr != nil {
-		return "", 0, ferr
-	}
-	altTrunk, cerr := t.commitFork(ownerBranch, contDir, altDir)
-	if cerr != nil {
-		return "", 0, cerr
-	}
-	return altTrunk, altLT, nil
+	return t.commitFork(ownerBranch, contDir, altDir)
 }
 
 // ownerOf returns the branch of the deepest node along `branch` whose own
@@ -1294,10 +1238,9 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 		return t.forkTailLocked(trunk)
 	}
 	if atMainLT < ownFirst {
-		// Re-split-below: fork the ancestor that owns atMainLT (no append).
+		// Re-split-below: fork the ancestor that owns atMainLT.
 		t.retireRootHotPreservingValidation()
-		alt, _, rerr := t.resplitBelow(branch, atMainLT, nil, nil, false)
-		return alt, rerr
+		return t.resplitBelow(branch, atMainLT)
 	}
 
 	altDir := t.mintNode()

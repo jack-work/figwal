@@ -146,10 +146,7 @@ func TestMap_ForksAlongDeep(t *testing.T) {
 	f.Append(root, 0, []byte(`"a1"`), nil) // tail 3
 
 	// interior fork at :2 -> alt inherits system.model, sets a deep leaf
-	alt, _, err := f.Append(root, 2, []byte(`"alt"`), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	alt, _ := forkAppend(t, f, root, 2, []byte(`"alt"`))
 	ap, _ := MapSetPatch([]string{"system", "tags", "42"}, []byte(`{"cache":"ephemeral"}`))
 	f.AppendChannel(alt, "chalkboard", 0, ap, nil)
 

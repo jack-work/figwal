@@ -1,7 +1,6 @@
 package xwal
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -93,10 +92,7 @@ func TestForest_InteriorForkKeepsExistingTrunk(t *testing.T) {
 		}
 	}
 	// Interior fork: `:3` shares [1..3] (genesis,u1,a1) and diverges at 4.
-	alt, altLT, err := f.Append(root, 3, []byte(`"alt-from-4"`), nil)
-	if err != nil {
-		t.Fatalf("interior fork: %v", err)
-	}
+	alt, altLT := forkAppend(t, f, root, 3, []byte(`"alt-from-4"`))
 	if alt == root {
 		t.Fatalf("interior fork must mint a new trunk, got root %s", root)
 	}
@@ -144,10 +140,7 @@ func TestForest_ChalkboardForksAlong(t *testing.T) {
 
 	// interior fork: `:2` shares [1..2] (incl. root-thread chalkboard@2),
 	// diverges at 3 -> alt inherits the chalkboard watermark.
-	alt, _, err := f.Append(root, 2, []byte(`"alt"`), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	alt, _ := forkAppend(t, f, root, 2, []byte(`"alt"`))
 	if _, err := f.AppendChannel(alt, "chalkboard", 0, []byte(`{"set":{"mantra":"alt thread"}}`), nil); err != nil {
 		t.Fatal(err)
 	}
@@ -285,10 +278,7 @@ func TestTrunks_Stumps(t *testing.T) {
 	if _, _, err := f.Append(c1, 0, []byte(`"more"`), nil); err != nil {
 		t.Fatal(err)
 	}
-	alt, _, err := f.Append(c1, 2, []byte(`"branch"`), nil) // interior fork at c1's first own LT
-	if err != nil {
-		t.Fatalf("fork conversation: %v", err)
-	}
+	alt, _ := forkAppend(t, f, c1, 2, []byte(`"branch"`)) // interior fork at c1's first own LT
 	if alt == c1 {
 		t.Fatal("interior fork should mint a new trunk")
 	}
@@ -364,16 +354,10 @@ func TestTrunks_ReSplitBelow(t *testing.T) {
 		}
 	}
 	// Fork at 5 -> alt2 shares [1..5], conv continues with its suffix.
-	alt2, _, err := f.Append(conv, 5, []byte(`"alt-from-5"`), nil)
-	if err != nil {
-		t.Fatalf("interior fork: %v", err)
-	}
+	alt2, _ := forkAppend(t, f, conv, 5, []byte(`"alt-from-5"`))
 	// Now RE-SPLIT-BELOW: fork alt2 at LT 3 — a turn alt2 inherited from conv
 	// (below alt2's own range). Must fork the ancestor and mint a sibling.
-	sib, _, err := f.Append(alt2, 3, []byte(`"resplit-at-3"`), nil)
-	if err != nil {
-		t.Fatalf("re-split-below at inherited LT: %v", err)
-	}
+	sib, _ := forkAppend(t, f, alt2, 3, []byte(`"resplit-at-3"`))
 	if sib == alt2 || sib == conv || sib == "" {
 		t.Fatalf("re-split must mint a distinct sibling trunk, got %q", sib)
 	}
@@ -599,10 +583,7 @@ func TestPromote_HeadRemainsUsableWithoutClose(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	b, _, err := f.Append(c, 3, []byte(`"fromB"`), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	b, _ := forkAppend(t, f, c, 3, []byte(`"fromB"`))
 
 	// Capture the pre-promote head payloads so we can compare.
 	before := headPayloads(t, f, b)
@@ -752,9 +733,10 @@ func TestTopologyMutationSeesRetiredOpenHead(t *testing.T) {
 	if err := mutator.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.ForkTail(trunk); !errors.Is(err, ErrTopologyBusy) {
+	shortTopologyWait(t)
+	if _, err := f.ForkTail(trunk); !isTopologyTimeout(err) {
 		stale.Close()
-		t.Fatalf("ForkTail error = %v, want ErrTopologyBusy", err)
+		t.Fatalf("ForkTail error = %v, want bounded-wait timeout", err)
 	}
 	if err := stale.Close(); err != nil {
 		t.Fatal(err)

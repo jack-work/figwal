@@ -2,7 +2,6 @@ package xwal
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -228,7 +227,7 @@ func TestWorkload212c263aConcurrentLineagesAndTopology(t *testing.T) {
 		retryBusy := func(fn func() error) error {
 			for {
 				err := fn()
-				if !errors.Is(err, ErrTopologyBusy) {
+				if !isTopologyTimeout(err) {
 					return err
 				}
 				runtime.Gosched()
@@ -378,7 +377,7 @@ func TestConcurrentAppendsWithTopologyMutations(t *testing.T) {
 				<-start
 				for {
 					err := topology()
-					if !errors.Is(err, ErrTopologyBusy) {
+					if !isTopologyTimeout(err) {
 						errs <- err
 						return
 					}

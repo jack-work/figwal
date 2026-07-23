@@ -1,7 +1,6 @@
 package xwal
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -162,18 +161,19 @@ func TestRootTopologyMutationRejectsPeerBorrowedHead(t *testing.T) {
 
 	cleanupTrunks(t, peer)
 
+	shortTopologyWait(t)
 	head, err := peer.Head(trunk)
 	if err != nil {
 		t.Fatal(err)
 	}
 	spec := ChannelSpec{Name: "turn-wal", Kind: ChannelLog, Opaque: true}
-	if err := first.EnsureChannel(spec); !errors.Is(err, ErrTopologyBusy) {
+	if err := first.EnsureChannel(spec); !isTopologyTimeout(err) {
 		head.Close()
-		t.Fatalf("EnsureChannel error = %v, want ErrTopologyBusy", err)
+		t.Fatalf("EnsureChannel error = %v, want bounded-wait timeout", err)
 	}
-	if err := first.CreateStump("blocked"); !errors.Is(err, ErrTopologyBusy) {
+	if err := first.CreateStump("blocked"); !isTopologyTimeout(err) {
 		head.Close()
-		t.Fatalf("CreateStump error = %v, want ErrTopologyBusy", err)
+		t.Fatalf("CreateStump error = %v, want bounded-wait timeout", err)
 	}
 	if err := head.Close(); err != nil {
 		t.Fatal(err)

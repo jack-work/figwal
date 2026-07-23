@@ -300,18 +300,12 @@ func TestPromote_ClimbsAndStopsAtStump(t *testing.T) {
 		f.Append(c, 0, []byte(m), nil)
 	}
 	// Interior fork C -> B; extend B; interior fork B -> A.
-	b, _, err := f.Append(c, 4, []byte(`"fromB"`), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	b, _ := forkAppend(t, f, c, 4, []byte(`"fromB"`))
 	f.Append(b, 0, []byte(`"b2"`), nil)
 	bx, _ := f.Head(b)
 	bTail := mainTail(bx)
 	bx.Close()
-	a, _, err := f.Append(b, bTail-1, []byte(`"fromA"`), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	a, _ := forkAppend(t, f, b, bTail-1, []byte(`"fromA"`))
 
 	// A's lineage: parent run is B, then C, then the stump.
 	if id, _ := parentRun(t, f, a); id != b {
@@ -381,12 +375,12 @@ func TestPromote_MultiLevelAndExcess(t *testing.T) {
 	for _, m := range []string{`"m1"`, `"m2"`, `"m3"`} {
 		f.Append(c, 0, []byte(m), nil)
 	}
-	b, _, _ := f.Append(c, 4, []byte(`"fromB"`), nil)
+	b, _ := forkAppend(t, f, c, 4, []byte(`"fromB"`))
 	f.Append(b, 0, []byte(`"b2"`), nil)
 	bx, _ := f.Head(b)
 	bTail := mainTail(bx)
 	bx.Close()
-	a, _, _ := f.Append(b, bTail-1, []byte(`"fromA"`), nil)
+	a, _ := forkAppend(t, f, b, bTail-1, []byte(`"fromA"`))
 
 	// Ask for 10 levels: climbs B then C (2), stops at the stump, excess no-op.
 	n, err := f.Promote(a, 10)

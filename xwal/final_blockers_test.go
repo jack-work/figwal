@@ -1,7 +1,6 @@
 package xwal
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -86,9 +85,10 @@ func TestDetachedHeadRetainsRootBorrowUntilClose(t *testing.T) {
 		head.Close()
 		t.Fatal(err)
 	}
-	if _, err := f.ForkTail(trunk); !errors.Is(err, ErrTopologyBusy) {
+	shortTopologyWait(t)
+	if _, err := f.ForkTail(trunk); !isTopologyTimeout(err) {
 		head.Close()
-		t.Fatalf("ForkTail error = %v, want ErrTopologyBusy", err)
+		t.Fatalf("ForkTail error = %v, want bounded-wait timeout", err)
 	}
 	if err := head.Close(); err != nil {
 		t.Fatal(err)

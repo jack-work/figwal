@@ -51,12 +51,15 @@ func TestForest_FuzzSequential(t *testing.T) {
 				continue
 			}
 			n := uint64(1 + rng.Intn(int(tail-1))) // 1..tail-1
-			alt, _, err := f.Append(tr, n, []byte(`"forked"`), nil)
+			alt, err := f.ForkAt(tr, n)
 			if err != nil {
 				if strings.Contains(err.Error(), "frozen history") {
 					continue // deferred re-split-below; expected, not a fault
 				}
 				t.Fatalf("interior fork %s:%d: %v", tr, n, err)
+			}
+			if _, _, err := f.Append(alt, 0, []byte(`"forked"`), nil); err != nil {
+				t.Fatalf("append after interior fork %s:%d: %v", tr, n, err)
 			}
 			if alt != tr {
 				trunks = append(trunks, alt)
