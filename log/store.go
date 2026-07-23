@@ -144,23 +144,6 @@ func (s *Store) Evict(dir string) error {
 	return nil
 }
 
-// FlushAll flushes every cached log's buffered entries to disk.
-func (s *Store) FlushAll() error {
-	s.mu.Lock()
-	logs := make([]*Log, 0, len(s.logs))
-	for _, l := range s.logs {
-		logs = append(logs, l)
-	}
-	s.mu.Unlock()
-	var errs []error
-	for _, l := range logs {
-		if err := l.Flush(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
-}
-
 // Close flushes buffered entries and closes every disk log after all
 // in-flight cache constructions finish. The Store cannot be used again.
 func (s *Store) Close() error {
