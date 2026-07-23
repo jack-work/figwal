@@ -18,6 +18,10 @@ The corresponding Figaro performance work is on its separate
 
 `docs/long-aria-performance-handoff.md`
 
+The follow-on turn-durability work is workload
+`212c263a-64b4-47af-9570-95702e164055` on branch
+`workload/212c263a-turn-durability`.
+
 ## Product intent
 
 The user confirmed these requirements:
@@ -125,31 +129,89 @@ It:
 - reopen behavior;
 - concurrent append and snapshot reads.
 
+### Workload 212c263a: turn durability
+
+The follow-on workload adds:
+
+- runtime-only `ChannelSpec.SyncMode`, resolved by channel name on every
+  private, shared/hot, recovery, and newly-added channel open;
+- persisted `ChannelSpec.Opaque`, which writes payload bytes as base64 in the
+  XWAL envelope so JSONL canonicalization cannot reorder nested provider JSON;
+- `(*Trunks).EnsureChannel(ChannelSpec) error`, which idempotently adds or
+  backfills a channel, updates runtime policy, retires hot generations, and
+  keeps later topology mirrored;
+- ordered `(*Trunks).SyncChannel(trunk, channel string) error`;
+- immutable-snapshot
+  `(*Trunks).LatestChannelRecord(trunk, channel string, minMainLT uint64)
+  (Record, bool, error)`;
+- empty-root channel forks at channel LT 1, allowing payload-free dynamic
+  channels to mirror later stumps, trunks, and forks without a format change.
+
+`xwal.json` remains backward-compatible: sync mode is never persisted, and
+opaque encoding is an optional channel flag. Legacy raw `p` frames and new
+base64 `p64` frames both decode. Existing channels are never silently changed;
+Figaro should create fresh opaque translator namespaces and bump provider
+fingerprints. The new turn journal should also be created with `Opaque: true`.
+
+Exact-byte tests cover append, cached and cold reopen, `RecordsFrom`,
+`LatestChannelRecord`, tail fork, interior fork, and sibling shared prefixes
+with deliberately non-canonical nested JSON key order.
+
+Review follow-ups fixed three upgrade/recovery cases:
+
+- idempotent reducible backfill preserves each existing `.fork` base and
+  reconstructs a missing watermark from parent state at `base-1`;
+- disk and cached `FirstIndex` fall back to a child's own entries when its
+  inherited parent is empty;
+- fork preparation fails with `ErrTopologyIncomplete` before mutation when a
+  manifest channel lacks its logical branch path;
+- only `EnsureChannel` repairs legacy paths, and it rejects a fallback history
+  whose latest related record reaches or crosses the missing main fork base;
+- channel add/backfill is guarded by a synced `.xwal-channel-pending` plan
+  that `Open`/`OpenTrunks` roll forward before serving;
+- topology mutation is serialized across all registered `Trunks` for a root
+  and rejects peer borrowed heads with `ErrTopologyBusy`;
+- same-root peers share per-lineage writer coordination, hand off stale hot
+  generations before writing, and refresh derived `nodes`/`heads` from a
+  root-scoped topology epoch after another peer mutates the tree;
+- marker and watermark replacement validates content, uses synced temporary
+  files and directory sync, and protects Windows two-rename fallback with a
+  recoverable replacement sentinel and backup;
+- fork preflight caches validated channel topology and watermark state by
+  topology version/generation, retains a shallow missing-artifact probe, and
+  runs deep parent-state repair only after invalidation or detected damage.
+
+Regression tests reopen existing and newly-added reducible channels after
+forks, repair an intentionally removed fork watermark, refuse incomplete
+fork topology, and repair only safe legacy opaque paths. Fault cases cover
+pending plans before manifest publication, partial trees, manifest-first
+legacy recovery with a pending plan, empty/partial/wrong watermarks,
+missing/malformed markers, replacement temp/backup phases, and peer borrowed
+heads. A repair-budget regression test and cached-preflight benchmark guard
+against returning to a deep topology walk on every fork.
+
 ## Current validation
 
-Before the WIP commit:
+For workload `212c263a-64b4-47af-9570-95702e164055`, the final Windows gate
+was split only to make the long deterministic fuzz independently visible:
 
 ```sh
-CGO_ENABLED=0 go test ./... -count=1
+go test ./xwal -skip '^TestForest_FuzzSequential$' -count=1
+go test ./xwal -run '^TestForest_FuzzSequential$' -count=1
+go test ./disk ./log ./log/typed ./segment ./cmd/... -count=1
+go vet ./...
+git diff --check
 ```
 
-passed across:
+All pass. The non-fuzz XWAL suite completed in 30.35 seconds. The deterministic
+500-operation fuzz completed in 511.35 seconds with 189 trunks, below the
+600-second release gate. Root-peer append, stale-topology, detached-head, and
+append-versus-fork regressions passed ten repeated runs. Cached fork preflight
+measured 3.86 ms/op over a five-iteration Windows benchmark.
 
-- `disk`
-- `log`
-- `log/typed`
-- `segment`
-- `xwal`
-- all Figwal commands
-
-The WIP handoff should also run:
-
-```sh
-CGO_ENABLED=0 go vet ./...
-```
-
-No race result should be claimed unless a C compiler is available and the
-race command actually succeeds.
+No race result is claimed: native Windows Go has no usable C compiler. Nix/WSL
+validation belongs to the consuming Figaro stack and remains pending at this
+commit boundary.
 
 ## Known limitations
 
@@ -160,12 +222,15 @@ race command actually succeeds.
    all channel tails, main-LT watermarks, reducible state, and suffix views.
 3. Reducible state and duplicate-key patch lookup at a main LT still need a
    native API suitable for Figaro's chalkboard.
-4. Dynamic channel addition/fork lifecycle needs more crash-injection and
-   generation-retirement testing.
+4. Dynamic channel addition/fork lifecycle still needs more crash-injection
+   testing beyond the deterministic and concurrent coverage in workload
+   `212c263a-64b4-47af-9570-95702e164055`.
 5. Shared generation retirement is subtle. Fork, truncate, clear, close, and
    concurrent borrowed-head lifetimes need race and fault tests.
 6. No release/tag exists for this branch.
-7. Figaro has not been adapted to these new APIs and must remain on v0.7.7.
+7. Figaro adaptation exists on the stacked
+   `workload/212c263a-turn-durability` worktree but is not yet pinned,
+   committed, or released.
 
 ## Next-agent checklist
 
@@ -203,9 +268,10 @@ race command actually succeeds.
 
 ## Do not do yet
 
-- Do not merge this branch into `master`.
-- Do not tag or publish a release.
-- Do not update Figaro to reference this branch or commit.
+- Do not merge this branch into `master` without review.
+- Do not tag or publish a release before the consuming Figaro stack passes.
+- Do not update a released Figaro build to reference this commit until the
+  stacked workload validation is green.
 - Do not delete Figaro's current `cachedLog`.
 - Do not claim native O(1) arbitrary suffix lookup until it is benchmarked and
   indexed.

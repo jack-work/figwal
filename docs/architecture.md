@@ -94,6 +94,14 @@ including inherited parent prefixes. It holds one log read lock per node
 rather than reacquiring it per record and is the primitive used by xwal's
 suffix-oriented foreign-key lookup.
 
+`FirstIndex` prefers the inherited parent's first index when non-zero, but
+falls back to the child's own first index when the parent is empty. The cached
+`log.Log` snapshot follows the same rule.
+
+Inherited `Range` traversal stops at the child's `forkBase` even if a legacy
+parent still physically contains later records. The child own range is the
+only source for indices at and beyond that boundary.
+
 **`Fork` / `ForkRehome` / `ChildForkBases`** (`fork.go`):
 
 - `Fork(atIdx, childName, oldFutureName?)` splits the log at `atIdx`: the
@@ -109,12 +117,13 @@ suffix-oriented foreign-key lookup.
 - `ChildForkBases()` returns each child subdir's `.fork` base — the input
   the joint fork uses to decide which children re-home.
 
-**Empty-own-log handling.** A truly-empty *root* log (no parent, no
-entries) cannot be forked. But an **empty-own** fork child
-(`forkBase > 0`, all content inherited) *can* be forked: it materializes
-empty inheriting children, so every node gets its own branch in every
-channel (per-trunk write isolation). This is how a sparse related channel
-(whose own entries are all past the fork point) participates in a fork.
+**Empty-log handling.** An empty root forks at index 1; an **empty-own**
+fork child (`forkBase > 0`, all content inherited) forks at its
+`forkBase`. Both materialize empty inheriting children, so every node gets
+its own branch in every channel (per-trunk write isolation). Header-mode
+children inherit the empty node's watermark. This keeps dynamically added
+channels mirrored by later topology operations without adding payload
+records.
 
 Crash safety is per-log: a `.fork-pending` sentinel is written before any
 destructive change and removed on completion; `Open` refuses a log that
@@ -130,14 +139,17 @@ still has the sentinel.
 **Main** channel (a `ChannelLog`) plus zero or more related channels;
 reducible channels (`ChannelReducible`, e.g. a jsonmerge chalkboard) ride
 the per-segment watermark headers via `OnSegmentOpen`. Every channel
-entry is a JSON envelope `{"m":<mainLT>,"p":<payload>,"x":<meta>}` so it
-tags the main-timeline LT it belongs to and round-trips through either
-codec.
+entry is a JSON envelope tagging its main-timeline LT. Legacy channels use
+`{"m":<mainLT>,"p":<payload>,"x":<meta>}`. Channels whose manifest entry has
+`opaque: true` use `{"m":<mainLT>,"p64":"<base64>","x":<meta>}`. The base64
+field prevents the JSONL codec's recursive canonicalization from changing
+provider-owned payload bytes. Decoding accepts both frame shapes.
 
 A `Config` describes the join at creation:
 
 - `Main` — the main channel name.
-- `Channels` — the `ChannelSpec` list (name, kind, reducer key).
+- `Channels` — the `ChannelSpec` list (name, kind, reducer key, runtime
+  `SyncMode`, persisted `Opaque` payload encoding).
 - `Registry` — maps reducer names to `Reducer{Reduce, Initial}`;
   resolved on every open (functions are never persisted).
 - `Codec` — `"jsonl"` (default) or `"binary"`; persisted in the manifest.
@@ -145,8 +157,12 @@ A `Config` describes the join at creation:
 - `MintTrunkID` — pluggable opaque trunk-id generator (consumed by the
   Trunks layer).
 
-After first open the on-disk `xwal.json` manifest is authoritative; the
-creation-time `Main`/`Channels`/`Codec` fields are ignored thereafter.
+After first open the on-disk `xwal.json` manifest is authoritative for channel
+shape and codec. `ChannelSpec.SyncMode` remains runtime-only and is resolved
+from `Config.Channels` by channel name on every private or shared open; it is
+never written to the manifest. `ChannelSpec.Opaque` is an optional persisted
+channel property. It is immutable for an existing channel: callers migrate to
+a fresh channel namespace rather than mixing encoding policy implicitly.
 
 Related-channel `Lookup` indexes lazily from the tail. Main LTs are
 non-decreasing, so a lookup near the active end reads only the suffix needed
@@ -163,6 +179,22 @@ applied to every channel by name via `ForkRehome`. A `.xwal-fork-pending`
 plan sentinel makes the join crash-atomic across channels: `Open`
 roll-forward-completes any interrupted fork before serving a branch, so
 the triune is never observed half-diverged.
+
+Before planning a fork, XWAL validates that every manifest channel has the
+complete logical branch path and valid fork markers. A missing or invalid path
+returns `ErrTopologyIncomplete` before a fork plan or filesystem mutation.
+`OpenTrunks` and `EnsureChannel` validate and repair reducible watermarks while
+all hot generations are retired. An inherited related-channel tail that
+reaches the missing main fork boundary is ambiguous and is rejected rather
+than copied or filtered.
+
+`Trunks` caches successful fork preflight validation against its topology
+version and validation generation. Normal in-process topology mutations carry
+that validation forward because they mirror every channel atomically. Forks
+still perform a shallow structural probe for missing paths, markers, and
+watermark files; only an unknown or incomplete generation runs the deep
+parent-state repair. `Refresh` and explicit external-generation retirement
+invalidate the cache.
 
 ---
 
@@ -185,7 +217,7 @@ the tree on open; it cannot diverge from disk because it is read from
 disk.
 
 Open XWAL heads, channel state, segment handles, and recovered offset indexes
-are retained in a generation-scoped `disk.Store`. `Head`, append, state folds,
+are retained in a generation-scoped `log.Store`. `Head`, append, state folds,
 and full listing therefore borrow shared channel views instead of reopening
 the manifest or rescanning segments. Foreign-key suffix indexes live on the
 shared channels, so repeated head views continue the same O(delta) lookup
@@ -200,14 +232,36 @@ than the process.
 Ordinary appends take a per-trunk lineage mutex and a shared topology lock.
 Appends to unrelated trunks can therefore write concurrently, while appends
 within one lineage remain ordered. Forks and other filesystem topology
-changes retain the exclusive topology lock; xwal does not attempt concurrent
-directory mutation that the disk layer cannot safely provide. Callers must
-close borrowed `Head`/`StumpHead` views before a topology mutation; the
-mutation returns an error rather than risking a partial rename or removal
-while Windows still has segment handles open.
+changes additionally take a root-global mutation lease shared by every
+registered `Trunks` for that root. Callers must close borrowed
+`Head`/`StumpHead` views on every peer before a topology mutation; the
+mutation returns `ErrTopologyBusy` rather than risking a partial rename or
+removal while Windows still has segment handles open.
 
 Provides the trunk-level operations: `CreateTrunks` / `OpenTrunks`,
 `Head`, `Append`, `ForkAt` / `ForkTail`, `SpawnChild`, `Remove`,
-`OwnerTrunk`, `AppendChannel`, `List` / `Nodes`. See
+`OwnerTrunk`, `EnsureChannel`, `AppendChannel`, `SyncChannel`,
+`LatestChannelRecord`, `List` / `Nodes`. `EnsureChannel` runs under topology
+exclusion, backfills the manifest channel across existing nodes, installs its
+runtime sync policy, and retires shared hot generations before later opens.
+It writes and syncs `.xwal-channel-pending` before changing the channel tree;
+`Open` and `OpenTrunks` complete that plan idempotently, publish the final
+manifest only after backfill, then remove and sync the sentinel.
+For existing reducible nodes it reads the persisted `.fork` base and repairs
+only the watermark at that base, deriving its state from the parent. Existing
+watermarks are opened and their headers checked rather than trusted by name.
+Repairs write and fsync a temporary segment, atomically rename it, and sync the
+directory. The Windows two-rename fallback is guarded by a synced
+`.replace-pending` sentinel and recoverable `.invalid` backup. Missing or
+malformed branch markers are repaired only by `EnsureChannel`; forks fail
+closed.
+`AppendChannel` and `SyncChannel` use the same per-lineage mutex.
+`LatestChannelRecord` scans backward from one immutable hot snapshot and
+stops after the newest record, including duplicate-main-LT checkpoints and
+inherited fork prefixes. Opaque records retain payload bytes exactly across
+append, cached reopen, inherited prefixes, and divergent forks.
+
+This durability surface implements workload
+`212c263a-64b4-47af-9570-95702e164055`. See
 [`primitives.md`](./primitives.md) for each one's signature and
 invariant.

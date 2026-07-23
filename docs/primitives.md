@@ -89,6 +89,60 @@ shared prefix `[1..atMainLT]` is preserved byte-for-byte and the
 divergence begins at `atMainLT+1`. An at-or-past-tail append extends the
 trunk in place.
 
+## Dynamic channel durability
+
+```go
+type ChannelSpec struct {
+	Name     string
+	Kind     Kind
+	Reducer  string
+	SyncMode SyncMode
+	Opaque   bool
+}
+
+func (t *Trunks) EnsureChannel(spec ChannelSpec) error
+func (t *Trunks) AppendChannel(trunk, channel string, mainLT uint64, payload, meta []byte) (uint64, error)
+func (t *Trunks) SyncChannel(trunk, channel string) error
+func (t *Trunks) LatestChannelRecord(trunk, channel string, minMainLT uint64) (Record, bool, error)
+```
+
+`EnsureChannel` is idempotent. Under topology exclusion it adds a manifest
+channel entry when absent, backfills every existing node, updates
+the in-memory runtime policy, and retires shared hot generations. Later
+stumps, trunks, and forks mirror the channel. `SyncMode` is resolved from
+`Config.Channels` on reopen and is not persisted.
+
+Existing `.fork` markers are authoritative during repair. Reducible
+watermarks are created at the marker's actual base and derive their state from
+the parent at `base-1`; the existing header is validated before a no-op.
+Repair installs a synced temporary segment by atomic rename and syncs the
+directory. A synced `.xwal-channel-pending` plan makes add/backfill
+roll-forward recoverable; the manifest is published only after the tree is
+complete. `Open` and `OpenTrunks` finish a pending plan before serving.
+
+Fork planning never repairs a channel. Missing or invalid logical paths return
+`ErrTopologyIncomplete` before mutation. `EnsureChannel` is the sole repair
+path and rejects ambiguous fallback records at or after the missing main fork
+base. Root-global mutation exclusion covers every registered `Trunks`; a peer
+borrowed head yields `ErrTopologyBusy`.
+
+`Opaque` is persisted in the manifest and makes payload encoding byte-stable:
+the XWAL frame carries base64 under `p64` instead of embedding payload JSON
+under `p`. Readers accept both shapes. `EnsureChannel` rejects an encoding
+mismatch for an existing channel; migrate caches to a fresh namespace instead
+of silently changing old data.
+
+`AppendChannel` and `SyncChannel` take the same per-lineage mutex, so a manual
+durability point is ordered after prior writes on that trunk without
+serializing unrelated trunks. `LatestChannelRecord` reads one immutable hot
+snapshot backward and returns only its newest record when
+`MainLT >= minMainLT`; duplicate main LTs therefore return the newest
+checkpoint.
+
+**Invariant.** Dynamic channels preserve the main topology and shared-prefix
+layout, add no synthetic payload records, and keep append cost independent of
+history length.
+
 ## `ForkTail`
 
 ```go

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/jack-work/figwal/disk"
 	"github.com/jack-work/figwal/log"
@@ -45,13 +46,16 @@ type forkPlanEntry struct {
 // own boundary — the first channel LT whose referenced main LT is >=
 // atMainLT (or its tail if it has not yet caught up). Reducible channels
 // get a fresh watermark at the boundary so the new branch folds from the
-// fork-point state. A channel with no entries is left unforked.
+// fork-point state.
 //
 // The fork is crash-atomic across channels: a plan sentinel is written
 // before any channel diverges and removed only once all have, and Open
 // rolls a partial fork forward to completion.
 func (x *XWAL) Fork(atMainLT uint64, childName, oldFutureName string) (*XWAL, error) {
 	if err := x.ensurePrivate(); err != nil {
+		return nil, err
+	}
+	if err := x.validateForkChannels(); err != nil {
 		return nil, err
 	}
 	plan, err := x.buildForkPlan(atMainLT, childName, oldFutureName)
@@ -74,6 +78,53 @@ func (x *XWAL) Fork(atMainLT uint64, childName, oldFutureName string) (*XWAL, er
 	}
 	childBranch := append(append([]string(nil), x.branch...), childName)
 	return Open(x.root, x.cfg, childBranch...)
+}
+
+// ErrTopologyIncomplete reports a manifest channel whose logical branch tree
+// is not complete enough for a joint fork.
+var ErrTopologyIncomplete = errors.New("xwal: channel topology incomplete")
+
+func (x *XWAL) validateForkChannels() error {
+	for _, name := range x.order {
+		if name == x.main {
+			continue
+		}
+		ch := x.chans[name]
+		logicalDir := filepath.Join(append([]string{x.root, name}, x.branch...)...)
+		if filepath.Clean(ch.dir) != filepath.Clean(logicalDir) {
+			return fmt.Errorf("%w: channel %q missing logical branch %q",
+				ErrTopologyIncomplete, name, strings.Join(x.branch, "/"))
+		}
+		rootedAt := -1
+		probeDir := filepath.Join(x.root, name)
+		for i, part := range x.branch {
+			probeDir = filepath.Join(probeDir, part)
+			if _, err := readForkBaseFile(filepath.Join(probeDir, ".fork")); errors.Is(err, os.ErrNotExist) {
+				if first, ok, segmentErr := firstSegmentBase(probeDir, x.codec); segmentErr == nil && ok && first == 1 {
+					rootedAt = i
+				}
+			}
+		}
+		parentDir := filepath.Join(x.root, name)
+		for i, part := range x.branch {
+			dir := filepath.Join(parentDir, part)
+			if i < rootedAt {
+				parentDir = dir
+				continue
+			}
+			if i == rootedAt {
+				parentDir = dir
+				continue
+			}
+			_, err := readForkBaseFile(filepath.Join(dir, ".fork"))
+			if err != nil {
+				return fmt.Errorf("%w: channel %q node %q has no valid fork marker",
+					ErrTopologyIncomplete, name, strings.Join(x.branch, "/"))
+			}
+			parentDir = dir
+		}
+	}
+	return nil
 }
 
 // buildForkPlan computes the per-channel boundaries for a joint fork at
@@ -124,19 +175,6 @@ func (x *XWAL) buildForkPlan(atMainLT uint64, childName, oldFutureName string) (
 	var mainEntry *forkPlanEntry
 	for _, name := range x.order {
 		ch := x.chans[name]
-		if ch.log.FirstIndex() == 0 && ch.log.ForkBase() == 0 {
-			// Truly-empty ROOT channel (never written, no fork structure):
-			// nothing to fork. A forked node (ForkBase>0) is NOT skipped even
-			// when FirstIndex reads 0 — that happens for a backfilled log
-			// channel whose ancestors are empty, yet the node still forks
-			// (empty-own → empty inheriting children) so its tree stays
-			// mirrored with the main channel.
-			continue
-		}
-		// NOTE: an empty-OWN log (forkBase>0, all content inherited) is NOT
-		// skipped — it forks into empty inheriting children so every trunk
-		// gets its own branch in this channel (write isolation). disk.Fork
-		// handles the empty-own case.
 		var atIdx uint64
 		if name == x.main {
 			atIdx = atMainLT
@@ -160,6 +198,17 @@ func (x *XWAL) buildForkPlan(atMainLT uint64, childName, oldFutureName string) (
 	}
 	if mainEntry != nil {
 		plan.Channels = append(plan.Channels, *mainEntry)
+	}
+	for _, entry := range plan.Channels {
+		for _, descendant := range plan.Rehome {
+			dir := filepath.Join(x.root, entry.Dir, descendant)
+			if !validForkNode(dir, x.codec) {
+				return forkPlan{}, fmt.Errorf(
+					"%w: channel %q missing valid rehome descendant %q",
+					ErrTopologyIncomplete, entry.Name, descendant,
+				)
+			}
+		}
 	}
 	return plan, nil
 }
@@ -230,7 +279,11 @@ func recoverFork(root string, cfg Config, man manifest, plan forkPlan) error {
 		if !ok {
 			return nil, nil, fmt.Errorf("channel %q not in manifest", e.Name)
 		}
-		opts := disk.Options{Codec: codec, SegmentSize: cfg.SegmentSize}
+		opts := disk.Options{
+			Codec:       codec,
+			SegmentSize: cfg.SegmentSize,
+			SyncMode:    syncModeFor(cfg, mc.Name),
+		}
 		if mc.Kind == "reducible" {
 			r, ok := resolveReducer(cfg, mc.Reducer)
 			if !ok || r.Reduce == nil {

@@ -173,7 +173,8 @@ const (
 //
 // Constraints:
 //   - atIdx must be in (FirstIndex, LastIndex+1]; the prefix retains
-//     at least one entry.
+//     at least one entry. An empty log may fork only at its first writable
+//     index (1 for a root, forkBase for a child).
 //   - childName must be a clean filename, must not equal the old-future
 //     subdir name, and must not collide with an existing sibling.
 //   - oldFutureName (when provided) must also be a clean filename.
@@ -240,22 +241,16 @@ func (l *Log) forkImpl(atIdx uint64, childName, oldFutureName string, oldFutureE
 		return nil, fmt.Errorf("%w: childName %q equals old-future subdir name",
 			ErrForkConflict, childName)
 	}
-	// A truly-empty root log (no parent, no entries) can't be forked.
-	// An empty-OWN log of a fork child (forkBase>0, all content inherited)
-	// CAN be forked — it materializes empty inheriting children so every
-	// node has its own branch in every channel (write isolation).
-	if l.isEmptyLocked() && l.forkBase == 0 {
-		return nil, fmt.Errorf("cannot fork empty log %q", l.dir)
-	}
+	empty := l.isEmptyLocked()
 	first := l.firstIndexLocked()
 	last := l.lastIndexLocked()
-	if l.isEmptyLocked() && l.forkBase > 0 {
-		// Empty-own log (all content inherited from the parent): it has no
-		// own segments, so firstIndexLocked/lastIndexLocked read as 0; the
-		// only meaningful fork point is its own first index (forkBase). The
-		// children become empty inheriting branches (write isolation).
-		if atIdx != l.forkBase {
-			return nil, fmt.Errorf("fork index %d invalid for empty-own log (want %d)", atIdx, l.forkBase)
+	if empty {
+		want := l.forkBase
+		if want == 0 {
+			want = 1
+		}
+		if atIdx != want {
+			return nil, fmt.Errorf("fork index %d invalid for empty log (want %d)", atIdx, want)
 		}
 	} else {
 		// atIdx must leave a non-empty prefix — EXCEPT a forked node
@@ -289,8 +284,10 @@ func (l *Log) forkImpl(atIdx uint64, childName, oldFutureName string, oldFutureE
 		if err := l.active.Sync(); err != nil {
 			return nil, err
 		}
-		l.sealed = append(l.sealed, l.active)
-		l.active = nil
+		if l.active.Count() > 0 {
+			l.sealed = append(l.sealed, l.active)
+			l.active = nil
+		}
 	}
 
 	// Header (reducible) mode: the new branches need a fresh watermark
@@ -301,7 +298,19 @@ func (l *Log) forkImpl(atIdx uint64, childName, oldFutureName string, oldFutureE
 	var forkWatermark []byte
 	headerMode := l.opts.OnSegmentOpen != nil
 	if headerMode {
-		w, werr := l.stateAtLocked(atIdx - 1)
+		var w []byte
+		var werr error
+		if empty {
+			if l.active != nil {
+				w = append([]byte(nil), l.active.Header()...)
+			} else if l.parent != nil && atIdx > 1 {
+				w, werr = l.parent.StateAt(atIdx - 1)
+			} else {
+				w, werr = l.opts.OnSegmentOpen(nil, nil)
+			}
+		} else {
+			w, werr = l.stateAtLocked(atIdx - 1)
+		}
 		if werr != nil {
 			return nil, fmt.Errorf("fork watermark at %d: %w", atIdx-1, werr)
 		}
@@ -403,10 +412,16 @@ func (l *Log) forkImpl(atIdx uint64, childName, oldFutureName string, oldFutureE
 		if err := writeWatermarkSeg(newForkDir); err != nil {
 			return nil, rollbackPending(err)
 		}
-		// An explicitly-materialized old-future with no data to carry is an
-		// empty inheriting branch; in header mode it needs the fork
-		// watermark too, so its first append builds on the fork-point state.
-		if createOldFuture && !dataMoves {
+		oldFutureHasBoundary := hasSplit
+		if !oldFutureHasBoundary {
+			for i, action := range actions {
+				if action == actMove && l.sealed[i].BaseIndex() == atIdx {
+					oldFutureHasBoundary = true
+					break
+				}
+			}
+		}
+		if createOldFuture && !oldFutureHasBoundary {
 			if err := writeWatermarkSeg(oldFutureDir); err != nil {
 				return nil, rollbackPending(err)
 			}
@@ -569,6 +584,11 @@ func (l *Log) forkImpl(atIdx uint64, childName, oldFutureName string, oldFutureE
 		}
 	}
 	l.sealed = newSealed
+	if l.active != nil {
+		if err := l.active.Close(); err != nil {
+			return nil, rollbackPending(err)
+		}
+	}
 	l.active = nil
 	l.readOnly = true
 

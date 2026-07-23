@@ -118,6 +118,50 @@ Other durability points:
 - Every `Write` calls `fsync` on the active segment when `SyncMode == SyncAlways` (the default). `SyncManual` defers fsync to `Log.Sync()` for callers driving their own commit cadence.
 - Segment creation and fork operations `fsync` the directory so new dentries survive a crash.
 
+## Multi-channel trunks
+
+`xwal.Trunks` keeps one fork topology mirrored across an IR channel and
+payload-agnostic related channels. Sync policy is selected per channel at
+runtime:
+
+```go
+err := trunks.EnsureChannel(xwal.ChannelSpec{
+    Name:     "turn-wal",
+    Kind:     xwal.ChannelLog,
+    SyncMode: xwal.SyncManual,
+    Opaque:   true,
+})
+_, err = trunks.AppendChannel(trunk, "turn-wal", mainLT, checkpoint, nil)
+err = trunks.SyncChannel(trunk, "turn-wal")
+latest, ok, err := trunks.LatestChannelRecord(trunk, "turn-wal", minMainLT)
+```
+
+`EnsureChannel` is idempotent, backfills existing topology, and makes later
+stumps, trunks, and forks mirror the channel. `SyncMode` is not stored in
+`xwal.json`; every reopen resolves it from `Config.Channels` by name. Channel
+writes and syncs are ordered per lineage, while unrelated lineages remain
+concurrent. Re-running it preserves existing fork bases and repairs missing
+reducible watermarks at the fork's actual base. Watermark repair validates
+the header and installs replacements through a synced temporary file.
+
+Channel addition and repair first persist `.xwal-channel-pending`.
+`Open`/`OpenTrunks` roll that plan forward before serving a channel, and the
+manifest is published only after the mirrored tree is complete. Topology
+mutation is serialized across all registered `Trunks` for the root and is
+rejected while any peer has a borrowed head. Fork planning never repairs a
+legacy path: an incomplete manifest channel returns `ErrTopologyIncomplete`;
+run `EnsureChannel` explicitly, which rejects ambiguous histories rather than
+letting an alternative inherit future records.
+
+`Opaque` is persisted as an optional manifest channel flag. Opaque payloads
+are base64-wrapped inside the XWAL JSON envelope, so JSONL canonicalization
+cannot reorder provider-owned JSON bytes. Reads decode both legacy raw `p`
+frames and opaque `p64` frames. Existing channels keep their encoding; create
+a fresh opaque namespace when migrating a cache.
+
+These APIs implement workload
+`212c263a-64b4-47af-9570-95702e164055`.
+
 ## CLI
 
 `logctl` operates on log directories:

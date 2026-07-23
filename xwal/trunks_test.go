@@ -1,6 +1,7 @@
 package xwal
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -742,15 +743,18 @@ func TestTopologyMutationSeesRetiredOpenHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := mutator.AddChannel(ChannelSpec{Name: "scratch", Kind: ChannelLog}); err != nil {
-		t.Fatal(err)
+	spec := ChannelSpec{Name: "scratch", Kind: ChannelLog}
+	if err := mutator.AddChannel(spec); err != nil {
+		stale.Close()
+		mutator.Close()
+		t.Fatalf("AddChannel with retired head: %v", err)
 	}
 	if err := mutator.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.ForkTail(trunk); err == nil {
+	if _, err := f.ForkTail(trunk); !errors.Is(err, ErrTopologyBusy) {
 		stale.Close()
-		t.Fatal("ForkTail succeeded with an open head from a retired generation")
+		t.Fatalf("ForkTail error = %v, want ErrTopologyBusy", err)
 	}
 	if err := stale.Close(); err != nil {
 		t.Fatal(err)

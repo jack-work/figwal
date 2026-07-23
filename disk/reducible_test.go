@@ -51,6 +51,42 @@ func openReducible(t *testing.T, dir string, segSize int64) *Log {
 	return l
 }
 
+func TestReducible_RepeatedEmptyBaseOneForkKeepsInitial(t *testing.T) {
+	dir := t.TempDir()
+	root := openReducible(t, dir, 4096)
+	child, err := root.Fork(1, "child", "continuation")
+	if err != nil {
+		root.Close()
+		t.Fatal(err)
+	}
+	if err := root.Close(); err != nil {
+		child.Close()
+		t.Fatal(err)
+	}
+	if err := child.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	child = openReducible(t, filepath.Join(dir, "child"), 4096)
+	grandchild, err := child.Fork(1, "grandchild", "continuation")
+	if err != nil {
+		child.Close()
+		t.Fatal(err)
+	}
+	defer child.Close()
+	defer grandchild.Close()
+	if err := grandchild.Write(1, u64(7)); err != nil {
+		t.Fatal(err)
+	}
+	header, err := grandchild.HeaderAt(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := deU64(header); got != 0 || len(header) == 0 {
+		t.Fatalf("header = %v (%d), want retained Initial zero", header, got)
+	}
+}
+
 func TestReducible_HeaderRotationAndState(t *testing.T) {
 	dir := t.TempDir()
 	// Small segments so a 20-entry write rotates several times.
@@ -61,6 +97,7 @@ func TestReducible_HeaderRotationAndState(t *testing.T) {
 		if err := l.Write(i, u64(i)); err != nil {
 			t.Fatalf("write %d: %v", i, err)
 		}
+
 	}
 
 	bases := l.SegmentBaseIndexes()
@@ -193,6 +230,26 @@ func TestReducible_SingleSegmentEmptyWatermark(t *testing.T) {
 	}
 }
 
+func TestReducible_ForkEmptyRoot(t *testing.T) {
+	l := openReducible(t, t.TempDir(), 48)
+	defer l.Close()
+	child, err := l.Fork(1, "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Close()
+	if err := child.Write(1, u64(7)); err != nil {
+		t.Fatal(err)
+	}
+	state, err := child.StateAt(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := deU64(state); got != 7 {
+		t.Fatalf("state = %d, want 7", got)
+	}
+}
+
 // Fork of a header-mode log re-establishes a watermark on each new
 // branch (state at atIdx-1) so neither the child nor the old-future has
 // to fold back into the read-only prefix.
@@ -200,6 +257,7 @@ func TestReducible_Fork(t *testing.T) {
 	dir := t.TempDir()
 	// Force several segments so the fork point lands in a sealed segment.
 	l := openReducible(t, dir, 48)
+	defer l.Close()
 	const n = uint64(12)
 	for i := uint64(1); i <= n; i++ {
 		if err := l.Write(i, u64(i)); err != nil {

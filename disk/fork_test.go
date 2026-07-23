@@ -3,10 +3,11 @@ package disk
 import (
 	"bytes"
 	"errors"
-	"github.com/jack-work/figwal/segment"
 	"fmt"
+	"github.com/jack-work/figwal/segment"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -66,6 +67,74 @@ func TestForkAtTail(t *testing.T) {
 	oldFuture := filepath.Join(dir, filepath.Base(dir))
 	if _, err := os.Stat(oldFuture); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("old-future subdir should be absent at tail fork, got: %v", err)
+	}
+}
+
+func TestForkEmptyRoot(t *testing.T) {
+	dir := t.TempDir()
+	l, err := Open(dir, Options{Codec: segment.BinaryCodec{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	child, err := l.Fork(1, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Close()
+	if err := child.Write(1, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if got := child.FirstIndex(); got != 1 {
+		t.Fatalf("child FirstIndex = %d, want 1", got)
+	}
+	sibling, err := l.Fork(1, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sibling.Close()
+	if err := sibling.Write(1, []byte("other")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestForkChildRangeStopsAtUntruncatedParentBoundary(t *testing.T) {
+	dir := t.TempDir()
+	parent, err := Open(dir, Options{Codec: segment.BinaryCodec{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	if err := parent.Write(1, []byte("prefix")); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.Write(2, []byte("legacy-future")); err != nil {
+		t.Fatal(err)
+	}
+	childDir := filepath.Join(dir, "child")
+	if err := os.MkdirAll(childDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeForkMarker(childDir, 2); err != nil {
+		t.Fatal(err)
+	}
+	child, err := Open(childDir, Options{Codec: segment.BinaryCodec{}, Parent: parent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Close()
+	if err := child.Write(2, []byte("owned-future")); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	if err := child.Range(1, func(_ uint64, payload []byte) error {
+		got = append(got, string(payload))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"prefix", "owned-future"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Range = %v, want %v", got, want)
 	}
 }
 

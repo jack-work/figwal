@@ -23,6 +23,7 @@ var (
 	// Store-owned log. Retire the shared generation and reopen privately
 	// before forking or truncating.
 	ErrSharedMutation = errors.New("log topology mutation requires a private log")
+	errRangeBoundary  = errors.New("log cache range reached fork boundary")
 )
 
 // Options aliases disk.Options so the caller-facing API is a single
@@ -406,7 +407,13 @@ func (s *cacheSnapshot) read(idx uint64) ([]byte, error) {
 
 func (s *cacheSnapshot) rangeFromIdx(from uint64, fn func(idx uint64, payload []byte) error) error {
 	if s.parent != nil && from < s.forkBase {
-		if err := s.parent.rangeFromIdx(from, fn); err != nil {
+		err := s.parent.rangeFromIdx(from, func(idx uint64, payload []byte) error {
+			if idx >= s.forkBase {
+				return errRangeBoundary
+			}
+			return fn(idx, payload)
+		})
+		if err != nil && !errors.Is(err, errRangeBoundary) {
 			return err
 		}
 		from = s.forkBase
@@ -429,7 +436,9 @@ func (s *cacheSnapshot) rangeFromIdx(from uint64, fn func(idx uint64, payload []
 
 func (s *cacheSnapshot) firstIndexRecursive() uint64 {
 	if s.parent != nil {
-		return s.parent.firstIndexRecursive()
+		if first := s.parent.firstIndexRecursive(); first != 0 {
+			return first
+		}
 	}
 	if len(s.entries) == 0 {
 		return 0

@@ -46,21 +46,22 @@ type Trunks struct {
 	nodeSeq  int               // next "n<N>" dir name
 	trunkSeq int               // next "t<N>" trunk id
 
-	lineageMu sync.Mutex
-	lineages  map[string]*sync.Mutex
-
-	// version is bumped every time rebuild() runs, giving consumers a
-	// cheap probe for "has the trunk topology changed since I last
-	// looked?" without a directory walk. Modeled on SQLite's schema
-	// cookie: mutations bump it internally, readers can compare against
-	// their last-seen value, and Refresh() reconciles on demand for the
-	// cross-process case. In-process this is invariably in sync with
-	// disk because every mutating public method ends in rebuild().
-	version atomic.Uint64
+	// version is the local rebuild cookie; rootEpoch tracks mutations made
+	// through any in-process peer for the same canonical root.
+	version   atomic.Uint64
+	rootEpoch atomic.Uint64
 
 	hotMu   sync.Mutex
 	hot     *trunkStore
 	retired map[*trunkStore]struct{}
+
+	validationMu             sync.Mutex
+	validationGeneration     uint64
+	validatedTopologyVersion uint64
+	validatedForkBranches    map[string]uint64
+
+	testAfterReadLock func()
+	testDeepRepair    func()
 }
 
 type trunkStore struct {
@@ -80,6 +81,31 @@ var trunkRegistry = struct {
 	sync.Mutex
 	roots map[string]map[*Trunks]struct{}
 }{roots: map[string]map[*Trunks]struct{}{}}
+
+type rootTopologyState struct {
+	mu        sync.Mutex
+	ready     *sync.Cond
+	mutating  bool
+	borrowers int
+	epoch     uint64
+	owners    map[*Trunks]int
+	lineages  map[string]*rootLineageState
+}
+
+type rootLineageState struct {
+	mu      sync.Mutex
+	ready   *sync.Cond
+	writing bool
+	owner   *Trunks
+	heads   map[*Trunks]int
+}
+
+var rootTopologyRegistry = struct {
+	sync.Mutex
+	states map[string]*rootTopologyState
+}{states: map[string]*rootTopologyState{}}
+
+var ErrTopologyBusy = errors.New("xwal: topology mutation blocked by active root users")
 
 // NodeID and TrunkID are string ids (a node id is a branch dir name; a
 // trunk id is "t<N>").
@@ -130,6 +156,12 @@ func CreateTrunks(dir string, cfg Config) (*Trunks, error) {
 	if cfg.Main == "" {
 		return nil, fmt.Errorf("xwal: CreateTrunks needs cfg.Main")
 	}
+	endMutation, root, err := beginRootTopologyMutation(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer endMutation()
+	retireTrunkStores(dir)
 	x, err := Open(dir, cfg)
 	if err != nil {
 		return nil, err
@@ -157,10 +189,11 @@ func CreateTrunks(dir string, cfg Config) (*Trunks, error) {
 	}
 	x.Close()
 
-	t := &Trunks{root: dir, cfg: cfg, main: cfg.Main}
+	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: cfg.Main}
 	if err := t.rebuild(); err != nil {
 		return nil, err
 	}
+	t.markTopologyValidated()
 	if err := t.register(); err != nil {
 		return nil, err
 	}
@@ -169,14 +202,39 @@ func CreateTrunks(dir string, cfg Config) (*Trunks, error) {
 
 // OpenTrunks opens an existing trunk store, rebuilding its cache from disk.
 func OpenTrunks(dir string, cfg Config) (*Trunks, error) {
+	endMutation, root, err := beginRootTopologyMutation(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer endMutation()
+	retireTrunkStores(dir)
+	man, err := loadOrCreateManifest(dir, cfg)
+	if err != nil {
+		return nil, err
+	}
+	man, err = recoverChannelPending(dir, cfg, man)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := recoverManifestTopology(dir, cfg, man); err != nil {
+		return nil, err
+	}
+	x, err := Open(dir, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := x.Close(); err != nil {
+		return nil, err
+	}
 	main, err := mainChannelName(dir)
 	if err != nil {
 		return nil, err
 	}
-	t := &Trunks{root: dir, cfg: cfg, main: main}
+	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: main}
 	if err := t.rebuild(); err != nil {
 		return nil, err
 	}
+	t.markTopologyValidated()
 	if err := t.register(); err != nil {
 		return nil, err
 	}
@@ -188,7 +246,8 @@ func OpenTrunks(dir string, cfg Config) (*Trunks, error) {
 // Every completed rebuild bumps the version counter so external
 // consumers can probe for topology changes without a walk of their own.
 func (t *Trunks) rebuild() error {
-	t.retireRootHot()
+	oldVersion := t.Version()
+	t.retireRootHotPreservingValidation()
 	t.nodes = map[string]*tnode{}
 	t.heads = map[string]string{}
 	t.nodeSeq, t.trunkSeq = 0, 0
@@ -196,7 +255,12 @@ func (t *Trunks) rebuild() error {
 	if err := t.walk(base, nil, "", true); err != nil {
 		return err
 	}
-	t.version.Add(1)
+	newVersion := t.version.Add(1)
+	t.validationMu.Lock()
+	if t.validatedTopologyVersion != 0 && t.validatedTopologyVersion == oldVersion {
+		t.validatedTopologyVersion = newVersion
+	}
+	t.validationMu.Unlock()
 	return nil
 }
 
@@ -217,8 +281,12 @@ func (t *Trunks) Version() uint64 { return t.version.Load() }
 // markers under our feet. Bumps Version() by one if anything changes
 // (and even if nothing did, because rebuild is unconditional).
 func (t *Trunks) Refresh() error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	endMutation, err := t.beginTopologyMutation()
+	if err != nil {
+		return err
+	}
+	defer endMutation()
+	t.invalidateTopologyValidation()
 	return t.rebuild()
 }
 
@@ -285,19 +353,72 @@ func (t *Trunks) headBranch(trunk string) ([]string, error) {
 	return t.nodes[key].branch, nil
 }
 
+func (t *Trunks) rootLineage(trunk string) *rootLineageState {
+	state := rootTopologyStateFor(t.registryRoot)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	lineage := state.lineages[trunk]
+	if lineage == nil {
+		lineage = &rootLineageState{heads: map[*Trunks]int{}}
+		lineage.ready = sync.NewCond(&lineage.mu)
+		state.lineages[trunk] = lineage
+	}
+	return lineage
+}
+
+func (t *Trunks) adoptLineage(lineage *rootLineageState) {
+	if lineage.owner == nil {
+		lineage.owner = t
+	} else if lineage.owner != t {
+		t.retireHot()
+		lineage.owner = t
+	}
+}
+
+func foreignLineageHeads(lineage *rootLineageState, owner *Trunks) bool {
+	for peer, count := range lineage.heads {
+		if peer != owner && count != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *Trunks) lockLineage(trunk string) func() {
-	t.lineageMu.Lock()
-	if t.lineages == nil {
-		t.lineages = map[string]*sync.Mutex{}
+	lineage := t.rootLineage(trunk)
+	lineage.mu.Lock()
+	for lineage.writing || foreignLineageHeads(lineage, t) {
+		lineage.ready.Wait()
 	}
-	lock := t.lineages[trunk]
-	if lock == nil {
-		lock = &sync.Mutex{}
-		t.lineages[trunk] = lock
+	lineage.writing = true
+	t.adoptLineage(lineage)
+	lineage.mu.Unlock()
+	return func() {
+		lineage.mu.Lock()
+		lineage.writing = false
+		lineage.ready.Broadcast()
+		lineage.mu.Unlock()
 	}
-	t.lineageMu.Unlock()
-	lock.Lock()
-	return lock.Unlock
+}
+
+func (t *Trunks) holdLineageHead(trunk string) func() {
+	lineage := t.rootLineage(trunk)
+	lineage.mu.Lock()
+	for lineage.writing || foreignLineageHeads(lineage, t) {
+		lineage.ready.Wait()
+	}
+	t.adoptLineage(lineage)
+	lineage.heads[t]++
+	lineage.mu.Unlock()
+	return func() {
+		lineage.mu.Lock()
+		lineage.heads[t]--
+		if lineage.heads[t] == 0 {
+			delete(lineage.heads, t)
+		}
+		lineage.ready.Broadcast()
+		lineage.mu.Unlock()
+	}
 }
 
 func (t *Trunks) ensureNoOpenHeads() error {
@@ -311,12 +432,12 @@ func (t *Trunks) ensureNoOpenHeads() error {
 		refs += h.refs
 	}
 	if refs != 0 {
-		return fmt.Errorf("xwal: topology mutation with %d open head(s)", refs)
+		return fmt.Errorf("%w: %d open head(s)", ErrTopologyBusy, refs)
 	}
 	return nil
 }
 
-func (t *Trunks) borrowHot(branch []string) (*XWAL, func() error, error) {
+func (t *Trunks) borrowHotUntracked(branch []string) (*XWAL, func() error, error) {
 	t.hotMu.Lock()
 	h := t.hot
 	if h == nil {
@@ -360,12 +481,211 @@ func (t *Trunks) borrowHot(branch []string) (*XWAL, func() error, error) {
 	return head.x, release, nil
 }
 
-func (t *Trunks) openHot(branch []string) (*XWAL, error) {
-	x, release, err := t.borrowHot(branch)
+func (t *Trunks) openHotTopology(branch []string) (*XWAL, error) {
+	x, release, err := t.borrowHotUntracked(branch)
 	if err != nil {
 		return nil, err
 	}
-	return x.sharedView(release, t.retireRootHot), nil
+	return x.sharedView(release, nil, t.retireRootHotPreservingValidation), nil
+}
+
+func rootTopologyStateFor(root string) *rootTopologyState {
+	rootTopologyRegistry.Lock()
+	defer rootTopologyRegistry.Unlock()
+	state := rootTopologyRegistry.states[root]
+	if state == nil {
+		state = &rootTopologyState{
+			owners:   map[*Trunks]int{},
+			lineages: map[string]*rootLineageState{},
+		}
+		state.ready = sync.NewCond(&state.mu)
+		rootTopologyRegistry.states[root] = state
+	}
+	return state
+}
+
+func canonicalRoot(root string) (string, error) {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(abs), nil
+}
+
+func beginRootTopologyMutation(root string) (func(), string, error) {
+	return beginRootTopologyMutationFor(root, nil)
+}
+
+var errLocalTopologyBorrowers = errors.New("xwal: local topology borrowers")
+
+func beginRootTopologyMutationFor(root string, owner *Trunks) (func(), string, error) {
+	root, err := canonicalRoot(root)
+	if err != nil {
+		return nil, "", err
+	}
+	state := rootTopologyStateFor(root)
+	state.mu.Lock()
+	for state.mutating {
+		state.ready.Wait()
+	}
+	if state.borrowers != 0 {
+		borrowers := state.borrowers
+		local := state.owners[owner]
+		state.mu.Unlock()
+		if owner != nil && local == borrowers {
+			return nil, "", errLocalTopologyBorrowers
+		}
+		return nil, "", fmt.Errorf("%w: %d open head(s)", ErrTopologyBusy, borrowers)
+	}
+	state.mutating = true
+	state.mu.Unlock()
+	return func() {
+		state.mu.Lock()
+		state.mutating = false
+		state.epoch++
+		if owner != nil {
+			owner.rootEpoch.Store(state.epoch)
+		}
+		state.ready.Broadcast()
+		state.mu.Unlock()
+	}, root, nil
+}
+
+func beginRootAdditiveMutation(root string) (func(), error) {
+	root, err := canonicalRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	state := rootTopologyStateFor(root)
+	state.mu.Lock()
+	for state.mutating {
+		state.ready.Wait()
+	}
+	state.mutating = true
+	state.mu.Unlock()
+	return func() {
+		state.mu.Lock()
+		state.mutating = false
+		state.ready.Broadcast()
+		state.mu.Unlock()
+	}, nil
+}
+
+func beginRootBorrow(root string, owner *Trunks) error {
+	state := rootTopologyStateFor(root)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	for state.mutating {
+		state.ready.Wait()
+	}
+	state.borrowers++
+	state.owners[owner]++
+	return nil
+}
+
+func endRootBorrow(root string, owner *Trunks) {
+	state := rootTopologyStateFor(root)
+	state.mu.Lock()
+	state.borrowers--
+	state.owners[owner]--
+	if state.owners[owner] == 0 {
+		delete(state.owners, owner)
+	}
+	state.ready.Broadcast()
+	state.mu.Unlock()
+}
+
+func transferRootBorrow(root string, from, to *Trunks) {
+	state := rootTopologyStateFor(root)
+	state.mu.Lock()
+	state.owners[from]--
+	if state.owners[from] == 0 {
+		delete(state.owners, from)
+	}
+	state.owners[to]++
+	state.ready.Broadcast()
+	state.mu.Unlock()
+}
+
+func waitRootBorrowers(root string, owner *Trunks) {
+	state := rootTopologyStateFor(root)
+	state.mu.Lock()
+	for state.owners[owner] != 0 {
+		state.ready.Wait()
+	}
+	state.mu.Unlock()
+}
+
+func rootTopologyEpoch(root string) uint64 {
+	state := rootTopologyStateFor(root)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.epoch
+}
+
+func (t *Trunks) ensureCurrentTopology() error {
+	epoch := rootTopologyEpoch(t.registryRoot)
+	if t.rootEpoch.Load() == epoch {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	epoch = rootTopologyEpoch(t.registryRoot)
+	if t.rootEpoch.Load() == epoch {
+		return nil
+	}
+	if err := t.rebuild(); err != nil {
+		return err
+	}
+	t.rootEpoch.Store(epoch)
+	return nil
+}
+
+func (t *Trunks) beginTrackedRead() (func(), error) {
+	if err := beginRootBorrow(t.registryRoot, t); err != nil {
+		return nil, err
+	}
+	if err := t.ensureCurrentTopology(); err != nil {
+		endRootBorrow(t.registryRoot, t)
+		return nil, err
+	}
+	t.mu.RLock()
+	if t.testAfterReadLock != nil {
+		t.testAfterReadLock()
+	}
+	return func() {
+		endRootBorrow(t.registryRoot, t)
+		t.mu.RUnlock()
+	}, nil
+}
+
+func (t *Trunks) beginTopologyMutation() (func(), error) {
+	for {
+		t.mu.Lock()
+		end, _, err := beginRootTopologyMutationFor(t.registryRoot, t)
+		if errors.Is(err, errLocalTopologyBorrowers) {
+			if openErr := t.ensureNoOpenHeads(); openErr != nil {
+				t.mu.Unlock()
+				return nil, openErr
+			}
+			t.mu.Unlock()
+			waitRootBorrowers(t.registryRoot, t)
+			continue
+		}
+		if err != nil {
+			t.mu.Unlock()
+			return nil, err
+		}
+		if err := t.rebuild(); err != nil {
+			end()
+			t.mu.Unlock()
+			return nil, err
+		}
+		return func() {
+			end()
+			t.mu.Unlock()
+		}, nil
+	}
 }
 
 func (t *Trunks) releaseHot(h *trunkStore) error {
@@ -403,11 +723,13 @@ func (t *Trunks) retireHot() {
 }
 
 func (t *Trunks) register() error {
-	root, err := filepath.Abs(t.root)
-	if err != nil {
-		return err
+	if t.registryRoot == "" {
+		root, err := canonicalRoot(t.root)
+		if err != nil {
+			return err
+		}
+		t.registryRoot = root
 	}
-	t.registryRoot = filepath.Clean(root)
 	trunkRegistry.Lock()
 	peers := trunkRegistry.roots[t.registryRoot]
 	if peers == nil {
@@ -416,11 +738,106 @@ func (t *Trunks) register() error {
 	}
 	peers[t] = struct{}{}
 	trunkRegistry.Unlock()
+	t.rootEpoch.Store(rootTopologyEpoch(t.registryRoot))
 	return nil
 }
 
 func (t *Trunks) retireRootHot() {
+	invalidateRootTopologyValidation(t.registryRoot)
 	retireTrunkStores(t.root)
+}
+
+func (t *Trunks) retireRootHotPreservingValidation() {
+	retireTrunkStores(t.root)
+}
+
+func invalidateRootTopologyValidation(root string) {
+	trunkRegistry.Lock()
+	peers := make([]*Trunks, 0, len(trunkRegistry.roots[root]))
+	for peer := range trunkRegistry.roots[root] {
+		peers = append(peers, peer)
+	}
+	trunkRegistry.Unlock()
+	for _, peer := range peers {
+		peer.invalidateTopologyValidation()
+	}
+}
+
+func (t *Trunks) invalidateTopologyValidation() {
+	t.validationMu.Lock()
+	t.validationGeneration++
+	t.validatedTopologyVersion = 0
+	t.validatedForkBranches = nil
+	t.validationMu.Unlock()
+}
+
+func (t *Trunks) markTopologyValidated() {
+	t.validationMu.Lock()
+	if t.validationGeneration == 0 {
+		t.validationGeneration = 1
+	}
+	t.validatedTopologyVersion = t.Version()
+	t.validatedForkBranches = nil
+	t.validationMu.Unlock()
+}
+
+func (t *Trunks) forkPreflightValidated(branch []string) bool {
+	key := strings.Join(branch, "/")
+	t.validationMu.Lock()
+	defer t.validationMu.Unlock()
+	if t.validatedTopologyVersion == t.Version() {
+		return true
+	}
+	return t.validatedForkBranches[key] == t.validationGeneration
+}
+
+func (t *Trunks) markForkPreflightValidated(branch []string) {
+	key := strings.Join(branch, "/")
+	t.validationMu.Lock()
+	if t.validationGeneration == 0 {
+		t.validationGeneration = 1
+	}
+	if t.validatedForkBranches == nil {
+		t.validatedForkBranches = make(map[string]uint64)
+	}
+	t.validatedForkBranches[key] = t.validationGeneration
+	t.validationMu.Unlock()
+}
+
+func (t *Trunks) markForkResultValidated(parent []string, children ...string) {
+	t.markForkPreflightValidated(parent)
+	for _, child := range children {
+		if child == "" {
+			continue
+		}
+		branch := append(append([]string(nil), parent...), child)
+		t.markForkPreflightValidated(branch)
+	}
+}
+
+func (t *Trunks) openForkSource(branch []string) (*XWAL, error) {
+	t.retireRootHotPreservingValidation()
+	validated := t.forkPreflightValidated(branch)
+	if validated {
+		complete, err := forkTopologyStructurallyComplete(t.root, t.cfg, branch)
+		if err != nil {
+			return nil, err
+		}
+		validated = complete
+	}
+	if !validated {
+		if t.testDeepRepair != nil {
+			t.testDeepRepair()
+		}
+		if err := repairBranchChannels(t.root, t.cfg, branch); err != nil {
+			return nil, err
+		}
+		if err := repairRehomeDescendants(t.root, t.cfg, branch); err != nil {
+			return nil, err
+		}
+		t.markForkPreflightValidated(branch)
+	}
+	return Open(t.root, t.cfg, branch...)
 }
 
 func retireTrunkStores(root string) {
@@ -488,15 +905,80 @@ func (t *Trunks) Close() error {
 	return errors.Join(errs...)
 }
 
+// EnsureChannel adds and backfills a channel if needed, and installs its
+// runtime policy for subsequent hot heads and topology operations.
+func (t *Trunks) EnsureChannel(spec ChannelSpec) error {
+	endMutation, err := t.beginTopologyMutation()
+	if err != nil {
+		return err
+	}
+	defer endMutation()
+
+	man, err := loadOrCreateManifest(t.root, t.cfg)
+	if err != nil {
+		return err
+	}
+	man, err = recoverChannelPending(t.root, t.cfg, man)
+	if err != nil {
+		return err
+	}
+	if err := validateChannelSpec(t.root, t.cfg, man, spec); err != nil {
+		return err
+	}
+	if err := t.ensureNoOpenHeads(); err != nil {
+		return err
+	}
+
+	cfg := withChannelSpec(t.cfg, spec)
+	t.retireRootHotPreservingValidation()
+	pending := channelPendingPlan{Channel: manifestChannel{
+		Name: spec.Name, Kind: spec.Kind.String(), Reducer: spec.Reducer, Opaque: spec.Opaque,
+	}}
+	if err := writeChannelPending(t.root, pending); err != nil {
+		return err
+	}
+	if _, err := recoverChannelPending(t.root, cfg, man); err != nil {
+		return err
+	}
+
+	t.cfg = cfg
+	return t.rebuild()
+}
+
 // Head opens the live head node of a trunk. Caller closes it.
 func (t *Trunks) Head(trunk string) (*XWAL, error) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	branch, err := t.headBranch(trunk)
-	if err != nil {
+	releaseLineage := t.holdLineageHead(trunk)
+	if err := beginRootBorrow(t.registryRoot, t); err != nil {
+		releaseLineage()
 		return nil, err
 	}
-	return t.openHot(branch)
+	if err := t.ensureCurrentTopology(); err != nil {
+		endRootBorrow(t.registryRoot, t)
+		releaseLineage()
+		return nil, err
+	}
+	t.mu.RLock()
+	branch, err := t.headBranch(trunk)
+	if err != nil {
+		t.mu.RUnlock()
+		endRootBorrow(t.registryRoot, t)
+		releaseLineage()
+		return nil, err
+	}
+	x, release, err := t.borrowHotUntracked(branch)
+	t.mu.RUnlock()
+	if err != nil {
+		endRootBorrow(t.registryRoot, t)
+		releaseLineage()
+		return nil, err
+	}
+	view := x.sharedView(release, func() {
+		endRootBorrow(t.registryRoot, t)
+	}, t.retireRootHotPreservingValidation)
+	view.releaseLineage = releaseLineage
+	view.borrowRoot = t.registryRoot
+	view.borrowOwner = t
+	return view, nil
 }
 
 // Append adds a main-timeline entry to a trunk.
@@ -512,32 +994,38 @@ func (t *Trunks) Append(trunk string, atMainLT uint64, payload, meta []byte) (st
 	unlockLineage := t.lockLineage(trunk)
 	defer unlockLineage()
 
-	t.mu.RLock()
-	branch, err := t.headBranch(trunk)
+	endRead, err := t.beginTrackedRead()
 	if err != nil {
-		t.mu.RUnlock()
 		return "", 0, err
 	}
-	x, release, err := t.borrowHot(branch)
+	branch, err := t.headBranch(trunk)
 	if err != nil {
-		t.mu.RUnlock()
+		endRead()
+		return "", 0, err
+	}
+	x, release, err := t.borrowHotUntracked(branch)
+	if err != nil {
+		endRead()
 		return "", 0, err
 	}
 	tail := mainTail(x)
 	if atMainLT == 0 || atMainLT >= tail {
 		lt, appendErr := x.AppendMain(payload, meta)
 		_ = release()
-		t.mu.RUnlock()
+		endRead()
 		if appendErr != nil {
 			return "", 0, appendErr
 		}
 		return trunk, lt, nil
 	}
 	_ = release()
-	t.mu.RUnlock()
+	endRead()
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	endMutation, err := t.beginTopologyMutation()
+	if err != nil {
+		return "", 0, err
+	}
+	defer endMutation()
 	if err := t.ensureNoOpenHeads(); err != nil {
 		return "", 0, err
 	}
@@ -549,7 +1037,7 @@ func (t *Trunks) appendForkLocked(trunk string, atMainLT uint64, payload, meta [
 	if err != nil {
 		return "", 0, err
 	}
-	x, err := t.openHot(branch)
+	x, err := t.openHotTopology(branch)
 	if err != nil {
 		return "", 0, err
 	}
@@ -571,15 +1059,14 @@ func (t *Trunks) appendForkLocked(trunk string, atMainLT uint64, payload, meta [
 		// ancestor node that owns it (re-homing its suffix + children into
 		// the continuation) and append to the new alternative.
 		x.Close()
-		t.retireRootHot()
+		t.retireRootHotPreservingValidation()
 		return t.resplitBelow(branch, atMainLT, payload, meta, true)
 	}
 	x.Close()
-	t.retireRootHot()
 	// Interior fork: share [1..atMainLT], diverge at atMainLT+1.
 	altDir := t.mintNode()
 	contDir := t.mintNode()
-	fx, err := Open(t.root, t.cfg, branch...)
+	fx, err := t.openForkSource(branch)
 	if err != nil {
 		return "", 0, err
 	}
@@ -588,6 +1075,7 @@ func (t *Trunks) appendForkLocked(trunk string, atMainLT uint64, payload, meta [
 	if ferr != nil {
 		return "", 0, ferr
 	}
+	t.markForkResultValidated(branch, altDir, contDir)
 	altLT, aerr := child.AppendMain(payload, meta)
 	child.Close()
 	if aerr != nil {
@@ -609,14 +1097,13 @@ func (t *Trunks) appendForkLocked(trunk string, atMainLT uint64, payload, meta [
 // alternative. Caller holds t.mu. This is how a fork at an inherited LT (a
 // turn shared with ancestors) produces a sibling branch.
 func (t *Trunks) resplitBelow(branch []string, atMainLT uint64, payload, meta []byte, doAppend bool) (string, uint64, error) {
-	t.retireRootHot()
 	ownerBranch, err := t.ownerOf(branch, atMainLT)
 	if err != nil {
 		return "", 0, err
 	}
 	altDir := t.mintNode()
 	contDir := t.mintNode()
-	ox, err := Open(t.root, t.cfg, ownerBranch...)
+	ox, err := t.openForkSource(ownerBranch)
 	if err != nil {
 		return "", 0, err
 	}
@@ -625,6 +1112,7 @@ func (t *Trunks) resplitBelow(branch []string, atMainLT uint64, payload, meta []
 	if ferr != nil {
 		return "", 0, fmt.Errorf("re-split-below: %w", ferr)
 	}
+	t.markForkResultValidated(ownerBranch, altDir, contDir)
 	var altLT uint64
 	if doAppend {
 		altLT, ferr = child.AppendMain(payload, meta)
@@ -681,8 +1169,17 @@ func (t *Trunks) readForkBase(branch []string) (uint64, error) {
 //     PARENT, adding one new alternative sibling trunk; the trunk keeps its
 //     empty head untouched.
 func (t *Trunks) ForkTail(trunk string) (string, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	unlockLineage := t.lockLineage(trunk)
+	defer unlockLineage()
+	endMutation, err := t.beginTopologyMutation()
+	if err != nil {
+		return "", err
+	}
+	defer endMutation()
+	return t.forkTailLocked(trunk)
+}
+
+func (t *Trunks) forkTailLocked(trunk string) (string, error) {
 	if err := t.ensureNoOpenHeads(); err != nil {
 		return "", err
 	}
@@ -691,7 +1188,7 @@ func (t *Trunks) ForkTail(trunk string) (string, error) {
 		return "", fmt.Errorf("xwal: unknown trunk %q", trunk)
 	}
 	head := t.nodes[headKey]
-	x, err := t.openHot(head.branch)
+	x, err := t.openHotTopology(head.branch)
 	if err != nil {
 		return "", err
 	}
@@ -699,7 +1196,7 @@ func (t *Trunks) ForkTail(trunk string) (string, error) {
 	empty := isEmptyHead(x)
 	fb := mainForkBase(x)
 	x.Close()
-	t.retireRootHot()
+	t.retireRootHotPreservingValidation()
 
 	if empty {
 		// Redirect to an N-ary fork of the parent at the head's fork point.
@@ -708,7 +1205,7 @@ func (t *Trunks) ForkTail(trunk string) (string, error) {
 		}
 		pbranch := t.nodes[head.parent].branch
 		altDir := t.mintNode()
-		px, err := Open(t.root, t.cfg, pbranch...)
+		px, err := t.openForkSource(pbranch)
 		if err != nil {
 			return "", err
 		}
@@ -717,6 +1214,7 @@ func (t *Trunks) ForkTail(trunk string) (string, error) {
 		if ferr != nil {
 			return "", fmt.Errorf("fork-tail (empty head, via parent): %w", ferr)
 		}
+		t.markForkResultValidated(pbranch, altDir)
 		altX.Close()
 		altTrunk := t.mintTrunk()
 		if err := writeTrunkID(t.irDir(append(append([]string(nil), pbranch...), altDir)), altTrunk); err != nil {
@@ -730,7 +1228,7 @@ func (t *Trunks) ForkTail(trunk string) (string, error) {
 	// prefix in every channel (always-materialize → write isolation).
 	altDir := t.mintNode()
 	contDir := t.mintNode()
-	fx, err := Open(t.root, t.cfg, head.branch...)
+	fx, err := t.openForkSource(head.branch)
 	if err != nil {
 		return "", err
 	}
@@ -739,6 +1237,7 @@ func (t *Trunks) ForkTail(trunk string) (string, error) {
 	if ferr != nil {
 		return "", fmt.Errorf("fork-tail: %w", ferr)
 	}
+	t.markForkResultValidated(head.branch, altDir, contDir)
 	child.Close()
 	return t.commitFork(head.branch, contDir, altDir)
 }
@@ -749,19 +1248,22 @@ func (t *Trunks) ForkTail(trunk string) (string, error) {
 // tail it degenerates to a tail fork (ForkTail). Returns the new alternative
 // trunk. (Append does fork+send in one; ForkAt is the imperative-only fork.)
 func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
-	t.mu.Lock()
+	unlockLineage := t.lockLineage(trunk)
+	defer unlockLineage()
+	endMutation, err := t.beginTopologyMutation()
+	if err != nil {
+		return "", err
+	}
+	defer endMutation()
 	if err := t.ensureNoOpenHeads(); err != nil {
-		t.mu.Unlock()
 		return "", err
 	}
 	branch, err := t.headBranch(trunk)
 	if err != nil {
-		t.mu.Unlock()
 		return "", err
 	}
-	x, err := t.openHot(branch)
+	x, err := t.openHotTopology(branch)
 	if err != nil {
-		t.mu.Unlock()
 		return "", err
 	}
 	tail := mainTail(x)
@@ -769,34 +1271,29 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 	x.Close()
 
 	if atMainLT == 0 || atMainLT >= tail {
-		t.mu.Unlock()
-		return t.ForkTail(trunk) // ForkTail re-acquires the lock
+		return t.forkTailLocked(trunk)
 	}
 	if atMainLT < ownFirst {
 		// Re-split-below: fork the ancestor that owns atMainLT (no append).
-		t.retireRootHot()
+		t.retireRootHotPreservingValidation()
 		alt, _, rerr := t.resplitBelow(branch, atMainLT, nil, nil, false)
-		t.mu.Unlock()
 		return alt, rerr
 	}
 
-	t.retireRootHot()
 	altDir := t.mintNode()
 	contDir := t.mintNode()
-	fx, err := Open(t.root, t.cfg, branch...)
+	fx, err := t.openForkSource(branch)
 	if err != nil {
-		t.mu.Unlock()
 		return "", err
 	}
 	child, ferr := fx.Fork(atMainLT+1, altDir, contDir) // child = alt; old-future = cont
 	fx.Close()
 	if ferr != nil {
-		t.mu.Unlock()
 		return "", ferr
 	}
+	t.markForkResultValidated(branch, altDir, contDir)
 	child.Close()
 	alt, cerr := t.commitFork(branch, contDir, altDir)
-	t.mu.Unlock()
 	return alt, cerr
 }
 
@@ -805,12 +1302,15 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 // refuses a trunk that has live branches (descendant trunks branched off it)
 // unless recursive — in which case those branches go too.
 func (t *Trunks) Remove(trunk string, recursive bool) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	endMutation, err := t.beginTopologyMutation()
+	if err != nil {
+		return err
+	}
+	defer endMutation()
 	if err := t.ensureNoOpenHeads(); err != nil {
 		return err
 	}
-	t.retireRootHot()
+	t.retireRootHotPreservingValidation()
 
 	// The founding node is the shallowest node carrying this trunk (its
 	// parent is in another trunk, or it is the root).
@@ -875,8 +1375,11 @@ func (t *Trunks) Remove(trunk string, recursive bool) error {
 // stumps, addressed with SpawnUnderRoot / SpawnUnderStump. SpawnChild
 // remains for spawning a fresh child under an existing trunk.
 func (t *Trunks) SpawnChild(parent TrunkID) (TrunkID, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	endMutation, err := t.beginTopologyMutation()
+	if err != nil {
+		return "", err
+	}
+	defer endMutation()
 	if err := t.ensureNoOpenHeads(); err != nil {
 		return "", err
 	}
@@ -894,8 +1397,11 @@ func (t *Trunks) SpawnChild(parent TrunkID) (TrunkID, error) {
 // (figaro names them <loadout>@<hash>). Idempotent callers should check
 // Stumps() first; a duplicate name is an error.
 func (t *Trunks) CreateStump(name string) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	endMutation, err := t.beginTopologyMutation()
+	if err != nil {
+		return err
+	}
+	defer endMutation()
 	if err := t.ensureNoOpenHeads(); err != nil {
 		return err
 	}
@@ -916,19 +1422,47 @@ func (t *Trunks) CreateStump(name string) error {
 // StumpHead opens a stump's branch for appending its birth content (IR +
 // related channels), before it gains trunk children. Caller closes it.
 func (t *Trunks) StumpHead(name string) (*XWAL, error) {
+	releaseLineage := t.holdLineageHead("stump:" + name)
+	if err := beginRootBorrow(t.registryRoot, t); err != nil {
+		releaseLineage()
+		return nil, err
+	}
+	if err := t.ensureCurrentTopology(); err != nil {
+		endRootBorrow(t.registryRoot, t)
+		releaseLineage()
+		return nil, err
+	}
 	t.mu.RLock()
-	defer t.mu.RUnlock()
 	n := t.nodes[name]
 	if n == nil || !n.isStump {
+		t.mu.RUnlock()
+		endRootBorrow(t.registryRoot, t)
+		releaseLineage()
 		return nil, fmt.Errorf("xwal: no stump %q", name)
 	}
-	return t.openHot([]string{name})
+	x, release, err := t.borrowHotUntracked([]string{name})
+	t.mu.RUnlock()
+	if err != nil {
+		endRootBorrow(t.registryRoot, t)
+		releaseLineage()
+		return nil, err
+	}
+	view := x.sharedView(release, func() {
+		endRootBorrow(t.registryRoot, t)
+	}, t.retireRootHotPreservingValidation)
+	view.releaseLineage = releaseLineage
+	view.borrowRoot = t.registryRoot
+	view.borrowOwner = t
+	return view, nil
 }
 
 // SpawnUnderStump mints a new trunk (a top-level aria) as a child of a stump.
 func (t *Trunks) SpawnUnderStump(name string) (TrunkID, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	endMutation, err := t.beginTopologyMutation()
+	if err != nil {
+		return "", err
+	}
+	defer endMutation()
 	if err := t.ensureNoOpenHeads(); err != nil {
 		return "", err
 	}
@@ -942,8 +1476,11 @@ func (t *Trunks) SpawnUnderStump(name string) (TrunkID, error) {
 // SpawnUnderRoot mints a new trunk directly under the root (a top-level
 // trunk with no stump — e.g. a loadoutless conversation).
 func (t *Trunks) SpawnUnderRoot() (TrunkID, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	endMutation, err := t.beginTopologyMutation()
+	if err != nil {
+		return "", err
+	}
+	defer endMutation()
 	if err := t.ensureNoOpenHeads(); err != nil {
 		return "", err
 	}
@@ -970,14 +1507,13 @@ func (t *Trunks) spawnTrunkAt(parentBranch []string) (TrunkID, error) {
 // continuation), creating an empty child dir named childDir in every channel.
 // Returns the child's branch. Caller holds t.mu and must rebuild afterwards.
 func (t *Trunks) forkChild(parentBranch []string, childDir string) ([]string, error) {
-	x, err := t.openHot(parentBranch)
+	x, err := t.openHotTopology(parentBranch)
 	if err != nil {
 		return nil, err
 	}
 	tail := mainTail(x)
 	x.Close()
-	t.retireRootHot()
-	fx, err := Open(t.root, t.cfg, parentBranch...)
+	fx, err := t.openForkSource(parentBranch)
 	if err != nil {
 		return nil, err
 	}
@@ -986,6 +1522,7 @@ func (t *Trunks) forkChild(parentBranch []string, childDir string) ([]string, er
 	if ferr != nil {
 		return nil, ferr
 	}
+	t.markForkResultValidated(parentBranch, childDir)
 	c.Close()
 	return append(append([]string(nil), parentBranch...), childDir), nil
 }
@@ -995,8 +1532,11 @@ func (t *Trunks) forkChild(parentBranch []string, childDir string) ([]string, er
 // Callers layer policy on this: e.g. an LT owned by a "ceremonial" trunk (a
 // null root or loadout) can be redirected to SpawnChild instead of a re-split.
 func (t *Trunks) OwnerTrunk(trunk string, atMainLT uint64) (string, error) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+	endRead, err := t.beginTrackedRead()
+	if err != nil {
+		return "", err
+	}
+	defer endRead()
 	branch, err := t.headBranch(trunk)
 	if err != nil {
 		return "", err
@@ -1024,8 +1564,11 @@ type Owner struct {
 
 // Owner resolves which node owns atMainLT along the given trunk's lineage.
 func (t *Trunks) Owner(trunk TrunkID, atMainLT uint64) (Owner, error) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+	endRead, err := t.beginTrackedRead()
+	if err != nil {
+		return Owner{}, err
+	}
+	defer endRead()
 	branch, err := t.headBranch(trunk)
 	if err != nil {
 		return Owner{}, err
@@ -1050,12 +1593,15 @@ func (t *Trunks) Owner(trunk TrunkID, atMainLT uint64) (Owner, error) {
 // ErrAtStump; excess levels past the stump are a no-op. Returns the number
 // of levels actually climbed.
 func (t *Trunks) Promote(trunk TrunkID, levels int) (int, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	endMutation, err := t.beginTopologyMutation()
+	if err != nil {
+		return 0, err
+	}
+	defer endMutation()
 	if err := t.ensureNoOpenHeads(); err != nil {
 		return 0, err
 	}
-	t.retireRootHot()
+	t.retireRootHotPreservingValidation()
 	if levels <= 0 {
 		levels = 1
 	}
@@ -1121,8 +1667,11 @@ type StumpInfo struct {
 
 // Stumps returns every stump, sorted by name.
 func (t *Trunks) Stumps() []StumpInfo {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+	endRead, err := t.beginTrackedRead()
+	if err != nil {
+		return nil
+	}
+	defer endRead()
 	var out []StumpInfo
 	for _, n := range t.nodes {
 		if !n.isStump {
@@ -1176,13 +1725,16 @@ func (t *Trunks) commitFork(headBranch []string, contDir, altDir string) (string
 func (t *Trunks) AppendChannel(trunk, channel string, mainLT uint64, payload, meta []byte) (uint64, error) {
 	unlockLineage := t.lockLineage(trunk)
 	defer unlockLineage()
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+	endRead, err := t.beginTrackedRead()
+	if err != nil {
+		return 0, err
+	}
+	defer endRead()
 	branch, err := t.headBranch(trunk)
 	if err != nil {
 		return 0, err
 	}
-	x, release, err := t.borrowHot(branch)
+	x, release, err := t.borrowHotUntracked(branch)
 	if err != nil {
 		return 0, err
 	}
@@ -1191,6 +1743,50 @@ func (t *Trunks) AppendChannel(trunk, channel string, mainLT uint64, payload, me
 		mainLT = mainTail(x) + 1 // reducible default: one ahead
 	}
 	return x.Append(channel, mainLT, payload, meta)
+}
+
+// SyncChannel orders a channel durability point with writes on the same
+// lineage without blocking unrelated lineages.
+func (t *Trunks) SyncChannel(trunk, channel string) error {
+	unlockLineage := t.lockLineage(trunk)
+	defer unlockLineage()
+	endRead, err := t.beginTrackedRead()
+	if err != nil {
+		return err
+	}
+	defer endRead()
+	branch, err := t.headBranch(trunk)
+	if err != nil {
+		return err
+	}
+	x, release, err := t.borrowHotUntracked(branch)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return x.SyncChannel(channel)
+}
+
+// LatestChannelRecord reads the newest channel checkpoint from the hot
+// immutable snapshot when it is at or beyond minMainLT.
+func (t *Trunks) LatestChannelRecord(trunk, channel string, minMainLT uint64) (Record, bool, error) {
+	unlockLineage := t.lockLineage(trunk)
+	defer unlockLineage()
+	endRead, err := t.beginTrackedRead()
+	if err != nil {
+		return Record{}, false, err
+	}
+	defer endRead()
+	branch, err := t.headBranch(trunk)
+	if err != nil {
+		return Record{}, false, err
+	}
+	x, release, err := t.borrowHotUntracked(branch)
+	if err != nil {
+		return Record{}, false, err
+	}
+	defer release()
+	return x.LatestChannelRecord(channel, minMainLT)
 }
 
 // --- listing ---
@@ -1207,18 +1803,23 @@ type TrunkInfo struct {
 
 // List returns every trunk, in id order.
 func (t *Trunks) List() []TrunkInfo {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+	endRead, err := t.beginTrackedRead()
+	if err != nil {
+		return nil
+	}
+	defer endRead()
 	ids := t.orderedTrunkIDsLocked()
 	out := make([]TrunkInfo, 0, len(ids))
 	for _, id := range ids {
+		unlockLineage := t.lockLineage(id)
 		key := t.heads[id]
 		ti := TrunkInfo{ID: id, Head: t.nodes[key].branch}
 		ti.Parent, ti.Stump, ti.BranchedLT = t.lineage(id)
-		if x, err := t.openHot(t.nodes[key].branch); err == nil {
+		if x, err := t.openHotTopology(t.nodes[key].branch); err == nil {
 			ti.Tip = mainTail(x)
 			x.Close()
 		}
+		unlockLineage()
 		out = append(out, ti)
 	}
 	return out
@@ -1271,8 +1872,11 @@ func (t *Trunks) forkBaseOf(branch []string) uint64 {
 // is O(trunks) with no per-trunk disk scan. Tip is left zero; use Head/List
 // when you actually need it.
 func (t *Trunks) ListLight() []TrunkInfo {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+	endRead, err := t.beginTrackedRead()
+	if err != nil {
+		return nil
+	}
+	defer endRead()
 	out := make([]TrunkInfo, 0, len(t.heads))
 	for _, id := range t.orderedTrunkIDsLocked() {
 		key := t.heads[id]
@@ -1312,8 +1916,11 @@ type NodeInfo struct {
 
 // Nodes returns every node (debug), root first.
 func (t *Trunks) Nodes() []NodeInfo {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+	endRead, err := t.beginTrackedRead()
+	if err != nil {
+		return nil
+	}
+	defer endRead()
 	out := make([]NodeInfo, 0, len(t.nodes))
 	for _, n := range t.nodes {
 		out = append(out, NodeInfo{Branch: n.branch, Trunk: n.trunk, Frozen: n.frozen, Children: n.children})

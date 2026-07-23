@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"github.com/jack-work/figwal/segment"
+	"os"
+	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -190,6 +193,70 @@ func TestCachedForkSplitsCache(t *testing.T) {
 	got, _ := child.Read(4)
 	if string(got) != `{"alt":4}` {
 		t.Fatalf("child[4]=%q", got)
+	}
+}
+
+func TestCachedEmptyParentChildFirstIndex(t *testing.T) {
+	c, err := Open(t.TempDir(), Options{Codec: segment.BinaryCodec{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	child, err := c.Fork(1, "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Close()
+	if err := child.Write(1, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if got := child.FirstIndex(); got != 1 {
+		t.Fatalf("FirstIndex = %d, want 1", got)
+	}
+	if got := child.Snapshot().FirstIndex(); got != 1 {
+		t.Fatalf("snapshot FirstIndex = %d, want 1", got)
+	}
+}
+
+func TestCachedRangeStopsAtUntruncatedParentBoundary(t *testing.T) {
+	dir := t.TempDir()
+	parent, err := Open(dir, Options{Codec: segment.BinaryCodec{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.Write(1, []byte("prefix")); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.Write(2, []byte("legacy-future")); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.Close(); err != nil {
+		t.Fatal(err)
+	}
+	childDir := filepath.Join(dir, "child")
+	if err := os.MkdirAll(childDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(childDir, ".fork"), []byte("base=2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	child, err := Open(childDir, Options{Codec: segment.BinaryCodec{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Close()
+	if err := child.Write(2, []byte("owned-future")); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	if err := child.Range(1, func(_ uint64, payload []byte) error {
+		got = append(got, string(payload))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"prefix", "owned-future"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Range = %v, want %v", got, want)
 	}
 }
 

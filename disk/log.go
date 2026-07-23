@@ -26,6 +26,7 @@ var (
 	ErrPayloadTooLarge = errors.New("payload too large for segment size")
 	ErrReadOnly        = errors.New("log is read-only (branch point with child forks)")
 	ErrForkMismatch    = errors.New(".fork base does not match first segment baseIndex")
+	errRangeBoundary   = errors.New("range reached fork boundary")
 )
 
 // SyncMode controls when Write fsyncs the active segment.
@@ -75,6 +76,10 @@ type Log struct {
 	forkBase   uint64 // first index this log owns; 0 if not a fork
 	readOnly   bool   // true when the dir has child subdirs (branch point)
 }
+
+// SyncDir durably persists directory entry changes where the platform
+// supports directory fsync.
+func SyncDir(dir string) error { return syncDir(dir) }
 
 func Open(dir string, opts Options) (*Log, error) {
 	if opts.SegmentSize == 0 {
@@ -258,7 +263,13 @@ func (l *Log) Range(from uint64, fn func(idx uint64, payload []byte) error) erro
 	// fork the parent's segments are truncated to end at forkBase-1, so
 	// parent.Range will not yield beyond our forkBase on its own.
 	if l.parent != nil && from < l.forkBase {
-		if err := l.parent.Range(from, fn); err != nil {
+		err := l.parent.Range(from, func(idx uint64, payload []byte) error {
+			if idx >= l.forkBase {
+				return errRangeBoundary
+			}
+			return fn(idx, payload)
+		})
+		if err != nil && !errors.Is(err, errRangeBoundary) {
 			return err
 		}
 		from = l.forkBase
@@ -411,7 +422,9 @@ func (l *Log) FirstIndex() uint64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	if l.parent != nil {
-		return l.parent.FirstIndex()
+		if first := l.parent.FirstIndex(); first != 0 {
+			return first
+		}
 	}
 	return l.firstIndexLocked()
 }

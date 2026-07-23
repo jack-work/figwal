@@ -7,11 +7,14 @@
 package xwal
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -52,17 +55,29 @@ type Reducer struct {
 	Initial []byte
 }
 
-// ChannelSpec declares one channel at creation time.
+// SyncMode controls when a channel fsyncs. It is runtime policy and is not
+// persisted in xwal.json.
+type SyncMode = disk.SyncMode
+
+const (
+	SyncAlways = disk.SyncAlways
+	SyncManual = disk.SyncManual
+)
+
+// ChannelSpec declares one channel's persisted shape and runtime policy.
 type ChannelSpec struct {
-	Name    string
-	Kind    Kind
-	Reducer string // registry key; required iff Kind == ChannelReducible
+	Name     string
+	Kind     Kind
+	Reducer  string // registry key; required iff Kind == ChannelReducible
+	SyncMode SyncMode
+	Opaque   bool // persist payload bytes without JSON canonicalization
 }
 
 // Config opens or creates an xwal. On first open the manifest is written
-// from Main+Channels; afterwards the manifest is authoritative and those
-// fields are ignored. Registry resolves reducer names to functions on
-// every open (functions are not persisted).
+// from Main+Channels; afterwards the manifest is authoritative for channel
+// shape, while Channels still supplies runtime sync policy by name. Registry
+// resolves reducer names to functions on every open (functions and sync modes
+// are not persisted).
 type Config struct {
 	Main        string
 	Channels    []ChannelSpec
@@ -94,10 +109,14 @@ type XWAL struct {
 	codec  segment.SegmentCodec
 	shared bool
 
-	closeOnce sync.Once
-	closeErr  error
-	release   func() error
-	retire    func()
+	closeOnce      sync.Once
+	closeErr       error
+	release        func() error
+	releaseRoot    func()
+	releaseLineage func()
+	retire         func()
+	borrowRoot     string
+	borrowOwner    *Trunks
 }
 
 type channel struct {
@@ -109,6 +128,8 @@ type channel struct {
 	log     *log.Log
 	reduce  ReduceFunc
 	initial []byte
+	sync    SyncMode
+	opaque  bool
 	fk      map[uint64]uint64 // main-LT -> channel-LT (last wins)
 	fkBuilt bool              // all entries indexed?
 	fkNext  uint64            // highest channel-LT not yet indexed
@@ -159,6 +180,7 @@ func (ch *channel) lookup(mainLT uint64) (uint64, bool, error) {
 }
 
 const manifestName = "xwal.json"
+const channelPendingName = ".xwal-channel-pending"
 
 type manifest struct {
 	Main     string            `json:"main"`
@@ -170,6 +192,11 @@ type manifestChannel struct {
 	Name    string `json:"name"`
 	Kind    string `json:"kind"`
 	Reducer string `json:"reducer,omitempty"`
+	Opaque  bool   `json:"opaque,omitempty"`
+}
+
+type channelPendingPlan struct {
+	Channel manifestChannel `json:"channel"`
 }
 
 // Open opens (creating if absent) the xwal rooted at dir. branch selects
@@ -186,6 +213,10 @@ func open(dir string, cfg Config, store *log.Store, branch ...string) (*XWAL, er
 		return nil, err
 	}
 	man, err := loadOrCreateManifest(dir, cfg)
+	if err != nil {
+		return nil, err
+	}
+	man, err = recoverChannelPending(dir, cfg, man)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +246,9 @@ func open(dir string, cfg Config, store *log.Store, branch ...string) (*XWAL, er
 		shared: store != nil,
 	}
 	for _, mc := range man.Channels {
-		ch := &channel{name: mc.Name, rname: mc.Reducer}
+		ch := &channel{
+			name: mc.Name, rname: mc.Reducer, sync: syncModeFor(cfg, mc.Name), opaque: mc.Opaque,
+		}
 		switch mc.Kind {
 		case "reducible":
 			ch.kind = ChannelReducible
@@ -228,7 +261,7 @@ func open(dir string, cfg Config, store *log.Store, branch ...string) (*XWAL, er
 		default:
 			ch.kind = ChannelLog
 		}
-		opts := disk.Options{Codec: codec, SegmentSize: cfg.SegmentSize}
+		opts := disk.Options{Codec: codec, SegmentSize: cfg.SegmentSize, SyncMode: ch.sync}
 		if ch.kind == ChannelReducible {
 			opts.OnSegmentOpen = reducibleFold(ch.reduce, ch.initial)
 		}
@@ -264,6 +297,12 @@ func (x *XWAL) channelDir(name string) string {
 	for i := 1; i <= len(x.branch); i++ {
 		cand := filepath.Join(append([]string{base}, x.branch[:i]...)...)
 		if pathExists(cand) {
+			if name != x.main {
+				if _, err := readForkBaseFile(filepath.Join(cand, ".fork")); err != nil &&
+					!errors.Is(err, os.ErrNotExist) {
+					break
+				}
+			}
 			dir = cand
 		} else {
 			break
@@ -314,6 +353,9 @@ func codecByName(name string) (segment.SegmentCodec, error) {
 
 func loadOrCreateManifest(dir string, cfg Config) (manifest, error) {
 	path := filepath.Join(dir, manifestName)
+	if err := recoverAtomicReplacement(path); err != nil {
+		return manifest{}, err
+	}
 	data, err := os.ReadFile(path)
 	if err == nil {
 		var m manifest
@@ -338,17 +380,30 @@ func loadOrCreateManifest(dir string, cfg Config) (manifest, error) {
 	}
 	m := manifest{Main: cfg.Main, Codec: codecName}
 	seenMain := false
+	seen := map[string]struct{}{}
 	for _, c := range cfg.Channels {
+		if _, ok := seen[c.Name]; ok {
+			return manifest{}, fmt.Errorf("xwal: duplicate channel %q", c.Name)
+		}
+		if err := validateChannelSpec(dir, cfg, m, c); err != nil {
+			return manifest{}, err
+		}
+		seen[c.Name] = struct{}{}
 		if c.Name == cfg.Main {
 			seenMain = true
 		}
 		if c.Kind == ChannelReducible && c.Reducer == "" {
 			return manifest{}, fmt.Errorf("xwal: reducible channel %q needs a reducer name", c.Name)
 		}
-		m.Channels = append(m.Channels, manifestChannel{Name: c.Name, Kind: c.Kind.String(), Reducer: c.Reducer})
+		m.Channels = append(m.Channels, manifestChannel{
+			Name: c.Name, Kind: c.Kind.String(), Reducer: c.Reducer, Opaque: c.Opaque,
+		})
 	}
 	if !seenMain {
 		return manifest{}, fmt.Errorf("xwal: main channel %q not in Channels", cfg.Main)
+	}
+	if err := prepareInitialChannels(dir, cfg, m); err != nil {
+		return manifest{}, err
 	}
 	if err := writeManifest(dir, m); err != nil {
 		return manifest{}, err
@@ -356,18 +411,577 @@ func loadOrCreateManifest(dir string, cfg Config) (manifest, error) {
 	return m, nil
 }
 
-func writeManifest(dir string, m manifest) error {
-	body, _ := json.MarshalIndent(m, "", "  ")
-	path := filepath.Join(dir, manifestName)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, body, 0o644); err != nil {
+func prepareInitialChannels(dir string, cfg Config, m manifest) error {
+	codec, err := codecByName(m.Codec)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	for _, mc := range m.Channels {
+		chDir := filepath.Join(dir, mc.Name)
+		if err := mkdirAllSynced(chDir); err != nil {
+			return err
+		}
+		if mc.Kind != ChannelReducible.String() {
+			continue
+		}
+		reducer, ok := resolveReducer(cfg, mc.Reducer)
+		if !ok || reducer.Reduce == nil {
+			return fmt.Errorf("xwal: no reducer %q registered for channel %q", mc.Reducer, mc.Name)
+		}
+		if err := ensureWatermark(chDir, 1, codec, reducer.Initial); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func syncModeFor(cfg Config, name string) SyncMode {
+	var mode SyncMode
+	for _, spec := range cfg.Channels {
+		if spec.Name == name {
+			mode = spec.SyncMode
+		}
+	}
+	return mode
+}
+
+func validateChannelSpec(root string, cfg Config, man manifest, spec ChannelSpec) error {
+	nativeName := filepath.FromSlash(spec.Name)
+	if spec.Name == "" || filepath.IsAbs(nativeName) || filepath.Clean(nativeName) != nativeName ||
+		nativeName == "." || nativeName == ".." ||
+		strings.HasPrefix(nativeName, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("xwal: invalid channel name %q", spec.Name)
+	}
+	for _, component := range strings.FieldsFunc(nativeName, func(r rune) bool {
+		return r == '/' || r == '\\'
+	}) {
+		if strings.HasPrefix(component, ".") ||
+			component == manifestName ||
+			strings.HasSuffix(component, ".tmp") ||
+			strings.HasSuffix(component, ".invalid") ||
+			strings.HasSuffix(component, ".replace-pending") {
+			return fmt.Errorf("xwal: reserved channel path component %q", component)
+		}
+	}
+	switch spec.Kind {
+	case ChannelLog:
+		if spec.Reducer != "" {
+			return fmt.Errorf("xwal: log channel %q cannot name reducer %q", spec.Name, spec.Reducer)
+		}
+	case ChannelReducible:
+		if spec.Reducer == "" {
+			return fmt.Errorf("xwal: reducible channel %q needs a reducer name", spec.Name)
+		}
+		reducer, ok := resolveReducer(cfg, spec.Reducer)
+		if !ok || reducer.Reduce == nil {
+			return fmt.Errorf("xwal: no reducer %q registered for channel %q", spec.Reducer, spec.Name)
+		}
+		codec, err := codecByName(man.Codec)
+		if err != nil {
+			return err
+		}
+		if _, err := codec.Hash(reducer.Initial); err != nil {
+			return fmt.Errorf("xwal: invalid initial state for channel %q: %w", spec.Name, err)
+		}
+	default:
+		return fmt.Errorf("xwal: invalid kind %d for channel %q", spec.Kind, spec.Name)
+	}
+	path := filepath.Join(root, spec.Name)
+	if info, err := os.Stat(path); err == nil && !info.IsDir() {
+		return fmt.Errorf("xwal: channel path %q is not a directory", path)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for _, existing := range man.Channels {
+		if existing.Name != spec.Name {
+			continue
+		}
+		if existing.Kind != spec.Kind.String() ||
+			existing.Reducer != spec.Reducer ||
+			existing.Opaque != spec.Opaque {
+			return fmt.Errorf("xwal: channel %q already exists as kind=%s reducer=%q opaque=%t",
+				spec.Name, existing.Kind, existing.Reducer, existing.Opaque)
+		}
+	}
+	return nil
+}
+
+func withChannelSpec(cfg Config, spec ChannelSpec) Config {
+	channels := append([]ChannelSpec(nil), cfg.Channels...)
+	for i := range channels {
+		if channels[i].Name == spec.Name {
+			channels[i] = spec
+			cfg.Channels = channels
+			return cfg
+		}
+	}
+	cfg.Channels = append(channels, spec)
+	return cfg
+}
+
+func writeManifest(dir string, m manifest) error {
+	body, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, manifestName)
+	tmp := path + ".tmp"
+	if err := writeSyncedFile(tmp, body); err != nil {
+		return err
+	}
+	if err := atomicReplaceFile(tmp, path); err != nil {
+		return err
+	}
+	return disk.SyncDir(dir)
+}
+
+func writeChannelPending(root string, plan channelPendingPlan) error {
+	body, err := json.Marshal(plan)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(root, channelPendingName)
+	tmp := path + ".tmp"
+	if err := writeSyncedFile(tmp, body); err != nil {
+		return err
+	}
+	if err := atomicReplaceFile(tmp, path); err != nil {
+		return err
+	}
+	return disk.SyncDir(root)
+}
+
+func readChannelPending(root string) (channelPendingPlan, bool, error) {
+	path := filepath.Join(root, channelPendingName)
+	if err := recoverAtomicReplacement(path); err != nil {
+		return channelPendingPlan{}, false, err
+	}
+	body, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return channelPendingPlan{}, false, nil
+	}
+	if err != nil {
+		return channelPendingPlan{}, false, err
+	}
+	var plan channelPendingPlan
+	if err := json.Unmarshal(body, &plan); err != nil {
+		return channelPendingPlan{}, false, err
+	}
+	return plan, true, nil
+}
+
+func removeChannelPending(root string) error {
+	if err := os.Remove(filepath.Join(root, channelPendingName)); err != nil &&
+		!errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return disk.SyncDir(root)
+}
+
+func recoverChannelPending(root string, cfg Config, man manifest) (manifest, error) {
+	plan, pending, err := readChannelPending(root)
+	if err != nil || !pending {
+		return man, err
+	}
+	codec, err := codecByName(man.Codec)
+	if err != nil {
+		return man, err
+	}
+	ch, err := channelFromManifest(cfg, plan.Channel)
+	if err != nil {
+		return man, err
+	}
+	recovery := &XWAL{root: root, main: man.Main, cfg: cfg, codec: codec}
+	if err := recovery.backfillChannel(ch); err != nil {
+		return man, err
+	}
+	found := false
+	for _, existing := range man.Channels {
+		if existing.Name == plan.Channel.Name {
+			if existing != plan.Channel {
+				return man, fmt.Errorf("xwal: pending channel %q conflicts with manifest", existing.Name)
+			}
+			found = true
+			break
+		}
+	}
+	if !found {
+		man.Channels = append(man.Channels, plan.Channel)
+		if err := writeManifest(root, man); err != nil {
+			return man, err
+		}
+	}
+	if err := removeChannelPending(root); err != nil {
+		return man, err
+	}
+	return man, nil
+}
+
+func channelFromManifest(cfg Config, mc manifestChannel) (*channel, error) {
+	ch := &channel{
+		name: mc.Name, kind: ChannelLog, rname: mc.Reducer,
+		sync: syncModeFor(cfg, mc.Name), opaque: mc.Opaque,
+	}
+	if mc.Kind != ChannelReducible.String() {
+		return ch, nil
+	}
+	ch.kind = ChannelReducible
+	reducer, ok := resolveReducer(cfg, ch.rname)
+	if !ok || reducer.Reduce == nil {
+		return nil, fmt.Errorf("xwal: no reducer %q registered for channel %q", ch.rname, ch.name)
+	}
+	ch.reduce = reducer.Reduce
+	ch.initial = reducer.Initial
+	return ch, nil
+}
+
+func recoverManifestTopology(root string, cfg Config, man manifest) (manifest, error) {
+	codec, err := codecByName(man.Codec)
+	if err != nil {
+		return man, err
+	}
+	for _, mc := range man.Channels {
+		if mc.Name == man.Main {
+			continue
+		}
+		ch, err := channelFromManifest(cfg, mc)
+		if err != nil {
+			return man, err
+		}
+		recovery := &XWAL{root: root, main: man.Main, cfg: cfg, codec: codec}
+		needsRepair, err := recovery.channelTopologyNeedsRepair(ch)
+		if err != nil {
+			return man, err
+		}
+		if !needsRepair {
+			continue
+		}
+		if err := writeChannelPending(root, channelPendingPlan{Channel: mc}); err != nil {
+			return man, err
+		}
+		man, err = recoverChannelPending(root, cfg, man)
+		if err != nil {
+			return man, err
+		}
+	}
+	return man, nil
+}
+
+func forkTopologyStructurallyComplete(root string, cfg Config, branch []string) (bool, error) {
+	if pathExists(filepath.Join(root, channelPendingName)) {
+		return false, nil
+	}
+	man, err := loadOrCreateManifest(root, cfg)
+	if err != nil {
+		return false, err
+	}
+	codec, err := codecByName(man.Codec)
+	if err != nil {
+		return false, err
+	}
+	channels := make([]*channel, 0, len(man.Channels))
+	for _, mc := range man.Channels {
+		ch, err := channelFromManifest(cfg, mc)
+		if err != nil {
+			return false, err
+		}
+		channels = append(channels, ch)
+		dir := filepath.Join(append([]string{root, mc.Name}, branch...)...)
+		complete, err := channelNodeStructurallyComplete(dir, len(branch) == 0, ch, codec)
+		if err != nil || !complete {
+			return complete, err
+		}
+	}
+
+	mainDir := filepath.Join(append([]string{root, man.Main}, branch...)...)
+	entries, err := os.ReadDir(mainDir)
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		for i, mc := range man.Channels {
+			dir := filepath.Join(append([]string{root, mc.Name}, branch...)...)
+			complete, err := channelNodeStructurallyComplete(
+				filepath.Join(dir, entry.Name()), false, channels[i], codec,
+			)
+			if err != nil || !complete {
+				return complete, err
+			}
+		}
+	}
+	return true, nil
+}
+
+func channelNodeStructurallyComplete(
+	dir string,
+	root bool,
+	ch *channel,
+	codec segment.SegmentCodec,
+) (bool, error) {
+	info, err := os.Stat(dir)
+	if errors.Is(err, os.ErrNotExist) || err == nil && !info.IsDir() {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	base := uint64(1)
+	if !root {
+		base, err = readForkBaseFile(filepath.Join(dir, ".fork"))
+		if err != nil {
+			first, ok, firstErr := firstSegmentBase(dir, codec)
+			if firstErr != nil {
+				return false, firstErr
+			}
+			if !ok || first != 1 {
+				return false, nil
+			}
+			base = 1
+		}
+	}
+	if ch.kind != ChannelReducible {
+		return true, nil
+	}
+	info, err = os.Stat(watermarkPath(dir, base, codec))
+	return err == nil && info.Mode().IsRegular() && info.Size() > 0, nil
+}
+
+func repairBranchChannels(root string, cfg Config, branch []string) error {
+	man, err := loadOrCreateManifest(root, cfg)
+	if err != nil {
+		return err
+	}
+	man, err = recoverChannelPending(root, cfg, man)
+	if err != nil {
+		return err
+	}
+	codec, err := codecByName(man.Codec)
+	if err != nil {
+		return err
+	}
+	for _, mc := range man.Channels {
+		if mc.Name == man.Main {
+			continue
+		}
+		ch, err := channelFromManifest(cfg, mc)
+		if err != nil {
+			return err
+		}
+		needsRepair, err := branchChannelNeedsRepair(root, man.Main, cfg, codec, branch, ch)
+		if err != nil {
+			return err
+		}
+		if !needsRepair {
+			continue
+		}
+		if err := writeChannelPending(root, channelPendingPlan{Channel: mc}); err != nil {
+			return err
+		}
+		man, err = recoverChannelPending(root, cfg, man)
+		if err != nil {
+			return err
+		}
+		needsRepair, err = branchChannelNeedsRepair(root, man.Main, cfg, codec, branch, ch)
+		if err != nil {
+			return err
+		}
+		if needsRepair {
+			return fmt.Errorf("%w: channel %q branch %q remains incomplete after repair",
+				ErrTopologyIncomplete, mc.Name, strings.Join(branch, "/"))
+		}
+	}
+	return nil
+}
+
+func repairRehomeDescendants(root string, cfg Config, branch []string) error {
+	man, err := loadOrCreateManifest(root, cfg)
+	if err != nil {
+		return err
+	}
+	mainDir := filepath.Join(append([]string{root, man.Main}, branch...)...)
+	entries, err := os.ReadDir(mainDir)
+	if err != nil {
+		return err
+	}
+	var descendants []string
+	for _, entry := range entries {
+		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+			descendants = append(descendants, entry.Name())
+		}
+	}
+	if len(descendants) == 0 {
+		return nil
+	}
+	codec, err := codecByName(man.Codec)
+	if err != nil {
+		return err
+	}
+	for _, mc := range man.Channels {
+		if mc.Name == man.Main {
+			continue
+		}
+		channelDir := filepath.Join(append([]string{root, mc.Name}, branch...)...)
+		for _, descendant := range descendants {
+			dir := filepath.Join(channelDir, descendant)
+			if validForkNode(dir, codec) {
+				continue
+			}
+			if err := writeChannelPending(root, channelPendingPlan{Channel: mc}); err != nil {
+				return err
+			}
+			man, err = recoverChannelPending(root, cfg, man)
+			if err != nil {
+				return err
+			}
+			if !validForkNode(dir, codec) {
+				return fmt.Errorf("%w: channel %q descendant %q has no valid fork marker",
+					ErrTopologyIncomplete, mc.Name, descendant)
+			}
+		}
+	}
+	return nil
+}
+
+func validForkNode(dir string, codec segment.SegmentCodec) bool {
+	if _, err := readForkBaseFile(filepath.Join(dir, ".fork")); err == nil {
+		return true
+	}
+	first, ok, err := firstSegmentBase(dir, codec)
+	return err == nil && ok && first == 1
+}
+
+func branchChannelNeedsRepair(
+	root, main string,
+	cfg Config,
+	codec segment.SegmentCodec,
+	branch []string,
+	ch *channel,
+) (bool, error) {
+	parentDir := filepath.Join(root, ch.name)
+	info, err := os.Stat(parentDir)
+	if errors.Is(err, os.ErrNotExist) || err == nil && !info.IsDir() {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if ch.kind == ChannelReducible {
+		valid, err := validateWatermark(parentDir, 1, codec, ch.initial)
+		if err != nil || !valid {
+			return true, nil
+		}
+	}
+	recovery := &XWAL{root: root, main: main, cfg: cfg, codec: codec}
+	for _, part := range branch {
+		dir := filepath.Join(parentDir, part)
+		info, err := os.Stat(dir)
+		if errors.Is(err, os.ErrNotExist) || err == nil && !info.IsDir() {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		base, err := readForkBaseFile(filepath.Join(dir, ".fork"))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				first, ok, segmentErr := firstSegmentBase(dir, codec)
+				if segmentErr != nil {
+					return false, segmentErr
+				}
+				if ok && first == 1 {
+					if ch.kind == ChannelReducible {
+						valid, err := validateWatermark(dir, 1, codec, ch.initial)
+						if err != nil || !valid {
+							return true, nil
+						}
+					}
+					parentDir = dir
+					continue
+				}
+			}
+			return true, nil
+		}
+		if ch.kind == ChannelReducible {
+			state, err := recovery.backfillWatermarkState(parentDir, base, ch)
+			if err != nil {
+				return false, err
+			}
+			valid, err := validateWatermark(dir, base, codec, state)
+			if err != nil || !valid {
+				return true, nil
+			}
+		}
+		parentDir = dir
+	}
+	return false, nil
+}
+
+func (x *XWAL) channelTopologyNeedsRepair(ch *channel) (bool, error) {
+	mainBase := filepath.Join(x.root, x.main)
+	chBase := filepath.Join(x.root, ch.name)
+	var walk func(mainDir, chDir, parentChDir string, depth int) (bool, error)
+	walk = func(mainDir, chDir, parentChDir string, depth int) (bool, error) {
+		info, err := os.Stat(chDir)
+		if errors.Is(err, os.ErrNotExist) || err == nil && !info.IsDir() {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if depth == 0 {
+			if ch.kind == ChannelReducible {
+				valid, err := validateWatermark(chDir, 1, x.codec, ch.initial)
+				if err != nil || !valid {
+					return true, nil
+				}
+			}
+		} else {
+			base, markerErr := readForkBaseFile(filepath.Join(chDir, ".fork"))
+			if markerErr != nil {
+				if first, ok, segmentErr := firstSegmentBase(chDir, x.codec); segmentErr != nil {
+					return false, segmentErr
+				} else if !ok || first != 1 {
+					return true, nil
+				}
+			} else if ch.kind == ChannelReducible {
+				state, err := x.backfillWatermarkState(parentChDir, base, ch)
+				if err != nil {
+					return false, err
+				}
+				valid, err := validateWatermark(chDir, base, x.codec, state)
+				if err != nil || !valid {
+					return true, nil
+				}
+			}
+		}
+		entries, err := os.ReadDir(mainDir)
+		if err != nil {
+			return false, err
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+				continue
+			}
+			needsRepair, err := walk(
+				filepath.Join(mainDir, entry.Name()),
+				filepath.Join(chDir, entry.Name()),
+				chDir,
+				depth+1,
+			)
+			if err != nil || needsRepair {
+				return needsRepair, err
+			}
+		}
+		return false, nil
+	}
+	return walk(mainBase, chBase, "", 0)
 }
 
 func (x *XWAL) channelOpts(ch *channel) disk.Options {
-	opts := disk.Options{Codec: x.codec, SegmentSize: x.cfg.SegmentSize}
+	opts := disk.Options{Codec: x.codec, SegmentSize: x.cfg.SegmentSize, SyncMode: ch.sync}
 	if ch.kind == ChannelReducible {
 		opts.OnSegmentOpen = reducibleFold(ch.reduce, ch.initial)
 	}
@@ -393,6 +1007,13 @@ func (x *XWAL) Clear(channelName string) error {
 		return err
 	}
 	if err := os.MkdirAll(ch.dir, 0o755); err != nil {
+		return err
+	}
+	if ch.kind == ChannelReducible {
+		if err := seedWatermark(ch.dir, 1, x.codec, ch.initial); err != nil {
+			return err
+		}
+	} else if err := seedEmptyLog(ch.dir, x.codec); err != nil {
 		return err
 	}
 	l, err := log.Open(ch.dir, x.channelOpts(ch))
@@ -423,6 +1044,12 @@ func (x *XWAL) AddChannel(spec ChannelSpec) error {
 	if err := x.ensurePrivate(); err != nil {
 		return err
 	}
+	endMutation, err := beginRootAdditiveMutation(x.root)
+	if err != nil {
+		return err
+	}
+	defer endMutation()
+	retireTrunkStores(x.root)
 	if _, exists := x.chans[spec.Name]; exists {
 		return fmt.Errorf("xwal: channel %q already exists", spec.Name)
 	}
@@ -430,16 +1057,12 @@ func (x *XWAL) AddChannel(spec ChannelSpec) error {
 	if err != nil {
 		return err
 	}
-	if spec.Kind == ChannelReducible && spec.Reducer == "" {
-		return fmt.Errorf("xwal: reducible channel %q needs a reducer name", spec.Name)
-	}
-	man.Channels = append(man.Channels, manifestChannel{
-		Name: spec.Name, Kind: spec.Kind.String(), Reducer: spec.Reducer,
-	})
-	if err := writeManifest(x.root, man); err != nil {
+	if err := validateChannelSpec(x.root, x.cfg, man, spec); err != nil {
 		return err
 	}
-	ch := &channel{name: spec.Name, kind: spec.Kind, rname: spec.Reducer}
+	ch := &channel{
+		name: spec.Name, kind: spec.Kind, rname: spec.Reducer, sync: spec.SyncMode, opaque: spec.Opaque,
+	}
 	if spec.Kind == ChannelReducible {
 		r, ok := resolveReducer(x.cfg, spec.Reducer)
 		if !ok || r.Reduce == nil {
@@ -448,10 +1071,17 @@ func (x *XWAL) AddChannel(spec ChannelSpec) error {
 		ch.reduce = r.Reduce
 		ch.initial = r.Initial
 	}
-	// Root + backfill the channel's node tree to mirror the main channel.
-	if err := x.backfillChannel(ch); err != nil {
-		return fmt.Errorf("xwal: backfill channel %q: %w", spec.Name, err)
+	pending := channelPendingPlan{Channel: manifestChannel{
+		Name: spec.Name, Kind: spec.Kind.String(), Reducer: spec.Reducer, Opaque: spec.Opaque,
+	}}
+	if err := writeChannelPending(x.root, pending); err != nil {
+		return err
 	}
+	x.cfg = withChannelSpec(x.cfg, spec)
+	if _, err := recoverChannelPending(x.root, x.cfg, man); err != nil {
+		return fmt.Errorf("xwal: complete channel %q: %w", spec.Name, err)
+	}
+	retireTrunkStores(x.root)
 	// Open the handle for THIS branch (now that the structure exists).
 	cdir := x.channelDir(spec.Name)
 	l, err := log.Open(cdir, x.channelOpts(ch))
@@ -468,30 +1098,24 @@ func (x *XWAL) AddChannel(spec ChannelSpec) error {
 
 // backfillChannel materializes a newly-added channel's node tree to mirror
 // the main channel's directory tree: for every main-channel node dir it
-// creates the corresponding channel dir, with a .fork marker for non-root
-// nodes (the empty-channel fork base — the node's own first index) and, for a
-// reducible channel, an Initial-watermark seed segment so StateAt has a base
-// to fold from. No payload entries are written (content is derivable).
+// creates the corresponding channel dir. Existing fork markers keep their
+// base; missing nodes inherit the parent's visible tail. Reducible watermarks
+// are repaired from parent state. No payload entries are written.
 func (x *XWAL) backfillChannel(ch *channel) error {
 	mainBase := filepath.Join(x.root, x.main)
 	chBase := filepath.Join(x.root, ch.name)
-	var walk func(mainDir, chDir string, depth int) error
-	walk = func(mainDir, chDir string, depth int) error {
-		if err := os.MkdirAll(chDir, 0o755); err != nil {
+	var walk func(mainDir, chDir, parentChDir string, depth int) error
+	walk = func(mainDir, chDir, parentChDir string, depth int) error {
+		if err := mkdirAllSynced(chDir); err != nil {
 			return err
 		}
 		if depth > 0 {
-			// Empty-channel fork base: an all-empty channel forks at its own
-			// first index (1) at every level — what the joint-fork boundary
-			// computation yields for an empty channel. Reads below it resolve
-			// up the (empty) parent chain.
-			const base = uint64(1)
-			if err := writeBackfillFork(chDir, base, x.codec, ch); err != nil {
+			if err := x.ensureBackfillFork(mainDir, parentChDir, chDir, ch); err != nil {
 				return err
 			}
 		} else if ch.kind == ChannelReducible {
 			// Seed the channel root with the Initial watermark too.
-			if err := seedWatermark(chDir, 1, x.codec, ch.initial); err != nil {
+			if err := ensureWatermark(chDir, 1, x.codec, ch.initial); err != nil {
 				return err
 			}
 		}
@@ -501,39 +1125,377 @@ func (x *XWAL) backfillChannel(ch *channel) error {
 		}
 		for _, e := range ents {
 			if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
-				if err := walk(filepath.Join(mainDir, e.Name()), filepath.Join(chDir, e.Name()), depth+1); err != nil {
+				if err := walk(
+					filepath.Join(mainDir, e.Name()),
+					filepath.Join(chDir, e.Name()),
+					chDir,
+					depth+1,
+				); err != nil {
 					return err
 				}
 			}
 		}
 		return nil
 	}
-	return walk(mainBase, chBase, 0)
+	return walk(mainBase, chBase, "", 0)
 }
 
-// writeBackfillFork writes a child node's .fork marker (and, for a reducible
-// channel, its Initial-watermark seed segment at base).
-func writeBackfillFork(chDir string, base uint64, codec segment.SegmentCodec, ch *channel) error {
+func (x *XWAL) ensureBackfillFork(mainDir, parentDir, chDir string, ch *channel) error {
+	if _, err := os.Stat(filepath.Join(chDir, ".fork")); errors.Is(err, os.ErrNotExist) {
+		if first, ok, baseErr := firstSegmentBase(chDir, x.codec); baseErr != nil {
+			return baseErr
+		} else if ok && first == 1 {
+			if ch.kind == ChannelReducible {
+				return ensureWatermark(chDir, 1, x.codec, ch.initial)
+			}
+			return nil
+		}
+	}
+	marker := filepath.Join(chDir, ".fork")
+	base, err := readForkBaseFile(marker)
+	switch {
+	case err == nil:
+	default:
+		if first, ok, segmentErr := firstSegmentBase(chDir, x.codec); segmentErr != nil {
+			return segmentErr
+		} else if ok {
+			base = first
+		} else {
+			parent, openErr := log.Open(parentDir, x.channelOpts(ch))
+			if openErr != nil {
+				return openErr
+			}
+			last := parent.LastIndex()
+			if last > 0 {
+				frame, readErr := parent.Read(last)
+				if readErr != nil {
+					parent.Close()
+					return readErr
+				}
+				lastMainLT, decodeErr := decodeMainLT(frame)
+				if decodeErr != nil {
+					parent.Close()
+					return decodeErr
+				}
+				mainForkBase, markerErr := readForkBaseFile(filepath.Join(mainDir, ".fork"))
+				if markerErr != nil {
+					parent.Close()
+					return markerErr
+				}
+				if lastMainLT >= mainForkBase {
+					parent.Close()
+					return fmt.Errorf(
+						"%w: channel %q has main-LT %d at or after missing branch base %d",
+						ErrTopologyIncomplete, ch.name, lastMainLT, mainForkBase,
+					)
+				}
+			}
+			closeErr := parent.Close()
+			if closeErr != nil {
+				return closeErr
+			}
+			if last == ^uint64(0) {
+				return fmt.Errorf("xwal: cannot backfill channel after max index")
+			}
+			base = last + 1
+		}
+		if err := writeBackfillFork(chDir, base); err != nil {
+			return err
+		}
+	}
+	if ch.kind != ChannelReducible {
+		return nil
+	}
+	state, err := x.backfillWatermarkState(parentDir, base, ch)
+	if err != nil {
+		return err
+	}
+	return ensureWatermark(chDir, base, x.codec, state)
+}
+
+func mkdirAllSynced(path string) error {
+	if info, err := os.Stat(path); err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("xwal: %q is not a directory", path)
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	parent := filepath.Dir(path)
+	if parent != path {
+		if err := mkdirAllSynced(parent); err != nil {
+			return err
+		}
+	}
+	if err := os.Mkdir(path, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	if err := disk.SyncDir(parent); err != nil {
+		return err
+	}
+	return disk.SyncDir(path)
+}
+
+func (x *XWAL) backfillWatermarkState(parentDir string, base uint64, ch *channel) ([]byte, error) {
+	if base <= 1 {
+		return ch.initial, nil
+	}
+	parent, err := log.Open(parentDir, x.channelOpts(ch))
+	if err != nil {
+		return nil, err
+	}
+	state, err := parent.StateAt(base - 1)
+	closeErr := parent.Close()
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return state, nil
+}
+
+func readForkBaseFile(path string) (uint64, error) {
+	if err := recoverAtomicReplacement(path); err != nil {
+		return 0, err
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(line), "base="); ok {
+			base, err := strconv.ParseUint(strings.TrimSpace(value), 10, 64)
+			if err != nil || base == 0 {
+				return 0, fmt.Errorf("xwal: malformed fork marker %q", path)
+			}
+			return base, nil
+		}
+	}
+	return 0, fmt.Errorf("xwal: malformed fork marker %q", path)
+}
+
+func writeBackfillFork(chDir string, base uint64) error {
 	body := fmt.Sprintf("base=%d\n", base)
-	tmp := filepath.Join(chDir, ".fork.tmp")
-	if err := os.WriteFile(tmp, []byte(body), 0o644); err != nil {
+	final := filepath.Join(chDir, ".fork")
+	tmp := final + ".tmp"
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, filepath.Join(chDir, ".fork")); err != nil {
+	if _, err := file.Write([]byte(body)); err != nil {
+		file.Close()
 		return err
 	}
-	if ch.kind == ChannelReducible {
-		return seedWatermark(chDir, base, codec, ch.initial)
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
 	}
-	return nil
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := atomicReplaceFile(tmp, final); err != nil {
+		return err
+	}
+	return disk.SyncDir(chDir)
+}
+
+func seedEmptyLog(dir string, codec segment.SegmentCodec) error {
+	final := watermarkPath(dir, 1, codec)
+	if pathExists(final) {
+		return nil
+	}
+	tmp := final + ".tmp"
+	_ = os.Remove(tmp)
+	seg, err := segment.Create(tmp, codec, 1, 0)
+	if err != nil {
+		return err
+	}
+	if err := seg.Sync(); err != nil {
+		seg.Close()
+		return err
+	}
+	if err := seg.Close(); err != nil {
+		return err
+	}
+	if err := atomicReplaceFile(tmp, final); err != nil {
+		return err
+	}
+	return disk.SyncDir(dir)
+}
+
+func ensureWatermark(chDir string, baseIndex uint64, codec segment.SegmentCodec, initial []byte) error {
+	valid, err := validateWatermark(chDir, baseIndex, codec, initial)
+	if err != nil {
+		return err
+	}
+	if valid {
+		return nil
+	}
+	return rewriteWatermark(chDir, baseIndex, codec, initial)
+}
+
+func watermarkPath(chDir string, baseIndex uint64, codec segment.SegmentCodec) string {
+	return filepath.Join(chDir, fmt.Sprintf("%020d%s", baseIndex, codec.FileExt()))
+}
+
+func firstSegmentBase(dir string, codec segment.SegmentCodec) (uint64, bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, false, err
+	}
+	var first uint64
+	found := false
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != codec.FileExt() {
+			continue
+		}
+		base, err := strconv.ParseUint(strings.TrimSuffix(entry.Name(), codec.FileExt()), 10, 64)
+		if err != nil {
+			continue
+		}
+		if !found || base < first {
+			first = base
+			found = true
+		}
+	}
+	return first, found, nil
+}
+
+func validateWatermark(
+	chDir string,
+	baseIndex uint64,
+	codec segment.SegmentCodec,
+	expected []byte,
+) (bool, error) {
+	path := watermarkPath(chDir, baseIndex, codec)
+	if err := recoverAtomicReplacement(path); err != nil {
+		return false, err
+	}
+	if !pathExists(path) {
+		return false, nil
+	}
+	header, _, ok, err := readWatermarkSegment(path, codec)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	return statesEqual(header, expected), nil
+}
+
+func statesEqual(left, right []byte) bool {
+	if bytes.Equal(left, right) {
+		return true
+	}
+	var l, r any
+	ld := json.NewDecoder(bytes.NewReader(left))
+	rd := json.NewDecoder(bytes.NewReader(right))
+	ld.UseNumber()
+	rd.UseNumber()
+	if ld.Decode(&l) != nil || rd.Decode(&r) != nil {
+		return false
+	}
+	lc, lerr := json.Marshal(l)
+	rc, rerr := json.Marshal(r)
+	return lerr == nil && rerr == nil && bytes.Equal(lc, rc)
+}
+
+func readWatermarkSegment(path string, codec segment.SegmentCodec) ([]byte, uint64, bool, error) {
+	header, entries, ok, err := readHeaderedSegment(path, codec)
+	return header, uint64(len(entries)), ok, err
+}
+
+func readHeaderedSegment(
+	path string,
+	codec segment.SegmentCodec,
+) ([]byte, [][]byte, bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	defer file.Close()
+	type span struct {
+		off int64
+		len int
+	}
+	var spans []span
+	if err := codec.ScanFrames(file, func(off int64, frameLen int) error {
+		spans = append(spans, span{off: off, len: frameLen})
+		return nil
+	}); err != nil {
+		return nil, nil, false, err
+	}
+	if len(spans) == 0 {
+		return nil, nil, false, nil
+	}
+	frames := make([][]byte, 0, len(spans))
+	for _, span := range spans {
+		payload, _, err := codec.ReadFrame(file, span.off, span.off+int64(span.len))
+		if err != nil {
+			return nil, nil, false, err
+		}
+		frames = append(frames, payload)
+	}
+	return frames[0], frames[1:], true, nil
+}
+
+func rewriteWatermark(
+	chDir string,
+	baseIndex uint64,
+	codec segment.SegmentCodec,
+	header []byte,
+) error {
+	final := watermarkPath(chDir, baseIndex, codec)
+	var entries [][]byte
+	if pathExists(final) {
+		_, existing, readable, err := readHeaderedSegment(final, codec)
+		if err != nil {
+			return err
+		}
+		if readable {
+			entries = existing
+		}
+	}
+	tmp := final + ".tmp"
+	_ = os.Remove(tmp)
+	seg, err := segment.Create(tmp, codec, baseIndex, 0)
+	if err != nil {
+		return err
+	}
+	if err := seg.WriteHeader(header); err != nil {
+		seg.Close()
+		return err
+	}
+	for _, entry := range entries {
+		if _, err := seg.Append(entry); err != nil {
+			seg.Close()
+			return err
+		}
+	}
+	if err := seg.Sync(); err != nil {
+		seg.Close()
+		return err
+	}
+	if err := seg.Close(); err != nil {
+		return err
+	}
+	if err := atomicReplaceFile(tmp, final); err != nil {
+		return err
+	}
+	return disk.SyncDir(chDir)
 }
 
 // seedWatermark writes a header-only segment at baseIndex carrying the
 // reducible Initial state, so an empty reducible node folds from a defined
 // watermark (mirrors disk.Fork's writeWatermarkSeg).
 func seedWatermark(chDir string, baseIndex uint64, codec segment.SegmentCodec, initial []byte) error {
-	name := fmt.Sprintf("%020d%s", baseIndex, codec.FileExt())
-	seg, err := segment.Create(filepath.Join(chDir, name), codec, baseIndex, 0)
+	final := watermarkPath(chDir, baseIndex, codec)
+	tmp := final + ".tmp"
+	_ = os.Remove(tmp)
+	seg, err := segment.Create(tmp, codec, baseIndex, 0)
 	if err != nil {
 		return err
 	}
@@ -545,7 +1507,91 @@ func seedWatermark(chDir string, baseIndex uint64, codec segment.SegmentCodec, i
 		seg.Close()
 		return err
 	}
-	return seg.Close()
+	if err := seg.Close(); err != nil {
+		return err
+	}
+	if err := atomicReplaceFile(tmp, final); err != nil {
+		return err
+	}
+	return disk.SyncDir(chDir)
+}
+
+func atomicReplaceFile(tmp, final string) error {
+	if err := os.Rename(tmp, final); err == nil {
+		_ = os.Remove(final + ".invalid")
+		_ = os.Remove(final + ".replace-pending")
+		return nil
+	} else if !pathExists(final) {
+		return err
+	}
+	invalid := final + ".invalid"
+	pending := final + ".replace-pending"
+	if err := writeSyncedFile(pending, []byte("replace\n")); err != nil {
+		return err
+	}
+	if err := disk.SyncDir(filepath.Dir(final)); err != nil {
+		return err
+	}
+	_ = os.Remove(invalid)
+	if err := os.Rename(final, invalid); err != nil {
+		return err
+	}
+	if err := disk.SyncDir(filepath.Dir(final)); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		_ = os.Rename(invalid, final)
+		return err
+	}
+	if err := disk.SyncDir(filepath.Dir(final)); err != nil {
+		return err
+	}
+	_ = os.Remove(invalid)
+	_ = os.Remove(pending)
+	return nil
+}
+
+func recoverAtomicReplacement(final string) error {
+	pending := final + ".replace-pending"
+	if !pathExists(pending) {
+		return nil
+	}
+	tmp := final + ".tmp"
+	invalid := final + ".invalid"
+	if !pathExists(final) {
+		switch {
+		case pathExists(tmp):
+			if err := os.Rename(tmp, final); err != nil {
+				return err
+			}
+		case pathExists(invalid):
+			if err := os.Rename(invalid, final); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("xwal: replacement pending for %q without recoverable file", final)
+		}
+	}
+	_ = os.Remove(tmp)
+	_ = os.Remove(invalid)
+	_ = os.Remove(pending)
+	return disk.SyncDir(filepath.Dir(final))
+}
+
+func writeSyncedFile(path string, body []byte) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(body); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 // AppendMain appends payload (with optional opaque meta) to the main
@@ -556,7 +1602,7 @@ func (x *XWAL) AppendMain(payload, meta []byte) (uint64, error) {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 	next := ch.log.LastIndex() + 1
-	if err := ch.log.Write(next, encodeFrame(next, payload, meta)); err != nil {
+	if err := ch.log.Write(next, encodeChannelFrame(next, payload, meta, ch.opaque)); err != nil {
 		return 0, err
 	}
 	if ch.fkScan || ch.fkBuilt {
@@ -586,13 +1632,24 @@ func (x *XWAL) Append(channelName string, mainLT uint64, payload, meta []byte) (
 			channelName, mainLT, lastMain)
 	}
 	next := ch.log.LastIndex() + 1
-	if err := ch.log.Write(next, encodeFrame(mainLT, payload, meta)); err != nil {
+	if err := ch.log.Write(next, encodeChannelFrame(mainLT, payload, meta, ch.opaque)); err != nil {
 		return 0, err
 	}
 	if ch.fkScan || ch.fkBuilt {
 		ch.fk[mainLT] = next
 	}
 	return next, nil
+}
+
+// SyncChannel makes prior writes to a channel durable.
+func (x *XWAL) SyncChannel(channelName string) error {
+	ch := x.chans[channelName]
+	if ch == nil {
+		return fmt.Errorf("xwal: no channel %q", channelName)
+	}
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	return ch.log.Sync()
 }
 
 // Read returns the (mainLT, payload) at channelLT — the meta-free view.
@@ -706,6 +1763,32 @@ func (x *XWAL) RecordsFrom(channelName string, fromMainLT uint64, limit int) ([]
 	return records, nil
 }
 
+// LatestChannelRecord returns the newest record from one immutable channel
+// snapshot when its main LT meets the requested recovery watermark.
+func (x *XWAL) LatestChannelRecord(channelName string, minMainLT uint64) (Record, bool, error) {
+	ch := x.chans[channelName]
+	if ch == nil {
+		return Record{}, false, fmt.Errorf("xwal: no channel %q", channelName)
+	}
+	var latest Record
+	found := false
+	err := ch.log.Snapshot().ScanFromEnd(0, func(idx uint64, frame []byte) error {
+		record, err := decodeRecord(idx, frame)
+		if err != nil {
+			return err
+		}
+		if record.MainLT >= minMainLT {
+			latest = record
+			found = true
+		}
+		return errStopRange
+	})
+	if err != nil && !errors.Is(err, errStopRange) {
+		return Record{}, false, err
+	}
+	return latest, found, nil
+}
+
 // StateAt folds a reducible channel to channelLT (watermark + patches).
 func (x *XWAL) StateAt(channelName string, channelLT uint64) ([]byte, error) {
 	ch := x.chans[channelName]
@@ -738,6 +1821,7 @@ type ChannelInfo struct {
 	Name     string
 	Kind     Kind
 	Reducer  string
+	Opaque   bool
 	First    uint64
 	Last     uint64
 	Segments int
@@ -752,6 +1836,7 @@ func (x *XWAL) Channels() []ChannelInfo {
 			Name:     name,
 			Kind:     ch.kind,
 			Reducer:  ch.rname,
+			Opaque:   ch.opaque,
 			First:    ch.log.FirstIndex(),
 			Last:     ch.log.LastIndex(),
 			Segments: len(ch.log.SegmentBaseIndexes()),
@@ -766,18 +1851,19 @@ func (x *XWAL) Main() string { return x.main }
 // Branch returns this branch's fork chain (empty for the trunk).
 func (x *XWAL) Branch() []string { return append([]string(nil), x.branch...) }
 
-func (x *XWAL) sharedView(release func() error, retire func()) *XWAL {
+func (x *XWAL) sharedView(release func() error, releaseRoot func(), retire func()) *XWAL {
 	return &XWAL{
-		root:    x.root,
-		branch:  append([]string(nil), x.branch...),
-		main:    x.main,
-		order:   x.order,
-		chans:   x.chans,
-		cfg:     x.cfg,
-		codec:   x.codec,
-		shared:  true,
-		release: release,
-		retire:  retire,
+		root:        x.root,
+		branch:      append([]string(nil), x.branch...),
+		main:        x.main,
+		order:       x.order,
+		chans:       x.chans,
+		cfg:         x.cfg,
+		codec:       x.codec,
+		shared:      true,
+		release:     release,
+		releaseRoot: releaseRoot,
+		retire:      retire,
 	}
 }
 
@@ -786,6 +1872,14 @@ func (x *XWAL) Close() error {
 	x.closeOnce.Do(func() {
 		if x.release != nil {
 			x.closeErr = x.release()
+			if x.releaseRoot != nil {
+				x.releaseRoot()
+				x.releaseRoot = nil
+			}
+			if x.releaseLineage != nil {
+				x.releaseLineage()
+				x.releaseLineage = nil
+			}
 			return
 		}
 		if x.shared {
@@ -797,6 +1891,14 @@ func (x *XWAL) Close() error {
 					x.closeErr = err
 				}
 			}
+		}
+		if x.releaseRoot != nil {
+			x.releaseRoot()
+			x.releaseRoot = nil
+		}
+		if x.releaseLineage != nil {
+			x.releaseLineage()
+			x.releaseLineage = nil
 		}
 	})
 	return x.closeErr
@@ -815,6 +1917,12 @@ func (x *XWAL) ensurePrivate() error {
 	if err != nil {
 		return err
 	}
+	if x.releaseRoot != nil && x.borrowOwner != nil {
+		transferRootBorrow(x.borrowRoot, x.borrowOwner, nil)
+		root := x.borrowRoot
+		x.releaseRoot = func() { endRootBorrow(root, nil) }
+		x.borrowOwner = nil
+	}
 	var releaseErr error
 	if x.release != nil {
 		releaseErr = x.release()
@@ -830,16 +1938,15 @@ func (x *XWAL) ensurePrivate() error {
 }
 
 // A channel entry is stored as a JSON object so it round-trips through
-// either codec (the JSONL codec needs JSON objects; the binary codec
-// stores the bytes opaquely): {"m":<mainLT>,"p":<payload>,"x":<meta>}.
-// Payload (and optional opaque meta) are embedded raw when themselves
-// valid JSON, else as a JSON string. Meta is a free side-channel for the
-// caller (e.g. a cache fingerprint). Reducible watermarks are stored as
-// the bare state object, not wrapped.
+// either codec. Legacy channels embed JSON under p. Opaque channels put the
+// original payload bytes in base64 under p64 so JSONL canonicalization cannot
+// rewrite them. Meta remains a free side-channel. Reducible watermarks are
+// stored as the bare state object, not wrapped.
 type frameObj struct {
-	M uint64          `json:"m"`
-	P json.RawMessage `json:"p"`
-	X json.RawMessage `json:"x,omitempty"`
+	M   uint64          `json:"m"`
+	P   json.RawMessage `json:"p,omitempty"`
+	P64 *string         `json:"p64,omitempty"`
+	X   json.RawMessage `json:"x,omitempty"`
 }
 
 // Record is a decoded channel entry.
@@ -862,9 +1969,19 @@ func embedJSON(b []byte) json.RawMessage {
 }
 
 func encodeFrame(mainLT uint64, payload, meta []byte) []byte {
-	o := frameObj{M: mainLT, P: embedJSON(payload)}
-	if len(o.P) == 0 {
-		o.P = json.RawMessage("null")
+	return encodeChannelFrame(mainLT, payload, meta, false)
+}
+
+func encodeChannelFrame(mainLT uint64, payload, meta []byte, opaque bool) []byte {
+	o := frameObj{M: mainLT}
+	if opaque {
+		encoded := base64.StdEncoding.EncodeToString(payload)
+		o.P64 = &encoded
+	} else {
+		o.P = embedJSON(payload)
+		if len(o.P) == 0 {
+			o.P = json.RawMessage("null")
+		}
 	}
 	o.X = embedJSON(meta)
 	b, _ := json.Marshal(o)
@@ -881,7 +1998,11 @@ func decodeFrame(f []byte) (uint64, []byte, error) {
 	if err := json.Unmarshal(f, &o); err != nil {
 		return 0, nil, fmt.Errorf("xwal: decode frame: %w", err)
 	}
-	return o.M, o.P, nil
+	payload, err := o.payload()
+	if err != nil {
+		return 0, nil, err
+	}
+	return o.M, payload, nil
 }
 
 func decodeRecord(channelLT uint64, f []byte) (Record, error) {
@@ -892,11 +2013,26 @@ func decodeRecord(channelLT uint64, f []byte) (Record, error) {
 	if err := json.Unmarshal(f, &o); err != nil {
 		return Record{}, fmt.Errorf("xwal: decode frame: %w", err)
 	}
-	return Record{ChannelLT: channelLT, MainLT: o.M, Payload: o.P, Meta: o.X}, nil
+	payload, err := o.payload()
+	if err != nil {
+		return Record{}, err
+	}
+	return Record{ChannelLT: channelLT, MainLT: o.M, Payload: payload, Meta: o.X}, nil
+}
+
+func (o frameObj) payload() ([]byte, error) {
+	if o.P64 == nil {
+		return o.P, nil
+	}
+	payload, err := base64.StdEncoding.DecodeString(*o.P64)
+	if err != nil {
+		return nil, fmt.Errorf("xwal: decode opaque payload: %w", err)
+	}
+	return payload, nil
 }
 
 func decodeMainLT(f []byte) (uint64, error) {
-	if m, _, _, ok := fastDecodeFrame(f); ok {
+	if m, ok := fastDecodeMainLT(f); ok {
 		return m, nil
 	}
 	var o struct {
@@ -906,6 +2042,25 @@ func decodeMainLT(f []byte) (uint64, error) {
 		return 0, fmt.Errorf("xwal: decode frame: %w", err)
 	}
 	return o.M, nil
+}
+
+func fastDecodeMainLT(f []byte) (uint64, bool) {
+	const prefix = `{"m":`
+	if len(f) <= len(prefix) || string(f[:len(prefix)]) != prefix || !json.Valid(f) {
+		return 0, false
+	}
+	i := len(prefix)
+	start := i
+	var mainLT uint64
+	for i < len(f) && f[i] >= '0' && f[i] <= '9' {
+		d := uint64(f[i] - '0')
+		if mainLT > (^uint64(0)-d)/10 {
+			return 0, false
+		}
+		mainLT = mainLT*10 + d
+		i++
+	}
+	return mainLT, i > start && i < len(f) && f[i] == ','
 }
 
 func fastDecodeFrame(f []byte) (uint64, []byte, []byte, bool) {
@@ -924,15 +2079,35 @@ func fastDecodeFrame(f []byte) (uint64, []byte, []byte, bool) {
 		mainLT = mainLT*10 + d
 		i++
 	}
-	if i == start || i+5 > len(f) || string(f[i:i+5]) != `,"p":` {
+	if i == start {
 		return 0, nil, nil, false
 	}
-	i += 5
+	opaque := false
+	switch {
+	case i+5 <= len(f) && string(f[i:i+5]) == `,"p":`:
+		i += 5
+	case i+7 <= len(f) && string(f[i:i+7]) == `,"p64":`:
+		i += 7
+		opaque = true
+	default:
+		return 0, nil, nil, false
+	}
 	end, ok := jsonValueEnd(f, i)
 	if !ok {
 		return 0, nil, nil, false
 	}
 	payload := f[i:end]
+	if opaque {
+		if len(payload) < 2 || payload[0] != '"' || payload[len(payload)-1] != '"' {
+			return 0, nil, nil, false
+		}
+		decoded := make([]byte, base64.StdEncoding.DecodedLen(len(payload)-2))
+		n, err := base64.StdEncoding.Decode(decoded, payload[1:len(payload)-1])
+		if err != nil {
+			return 0, nil, nil, false
+		}
+		payload = decoded[:n]
+	}
 	if end+1 == len(f) && f[end] == '}' {
 		return mainLT, payload, nil, true
 	}
