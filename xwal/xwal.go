@@ -980,6 +980,9 @@ func (x *XWAL) channelOpts(ch *channel) disk.Options {
 // index — for caches that invalidate wholesale (translation fingerprint
 // drift). NOTE: on a forked branch this also drops the branch's link to
 // its parent for that channel; intended for trunk-level cache resets.
+// FLUSHER-UNAWARE: on a raw handle nothing stops a concurrent store
+// flush from writing into the wiped dir — use Store.Clear instead when
+// the store's flusher is running.
 func (x *XWAL) Clear(channelName string) error {
 	if err := x.ensurePrivate(); err != nil {
 		return err

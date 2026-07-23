@@ -227,6 +227,36 @@ func (s *Store) Promote(trunk TrunkID, levels int) (int, error) {
 	return n, err
 }
 
+// Clear wipes a channel's own data for a trunk's lineage and reseeds it
+// empty, atomically with the flusher: pending buffers for the channel
+// are drained and every hot handle is retired under the topology lock
+// before the wipe, so an in-flight flush can never resurrect wiped
+// records. Intended for trunk-level cache resets (translation caches).
+func (s *Store) Clear(trunk, channel string) error {
+	endMutation, err := s.Trunks.beginTopologyMutation()
+	if err != nil {
+		return err
+	}
+	defer endMutation()
+	if err := s.Trunks.ensureNoOpenHeads(); err != nil {
+		return err
+	}
+	s.Trunks.retireRootHotPreservingValidation()
+	branch, err := s.Trunks.headBranch(trunk)
+	if err != nil {
+		return err
+	}
+	x, err := Open(s.Trunks.root, s.Trunks.cfg, branch...)
+	if err != nil {
+		return err
+	}
+	clearErr := x.Clear(channel)
+	if cerr := x.Close(); clearErr == nil {
+		clearErr = cerr
+	}
+	return clearErr
+}
+
 // FlushStump synchronously persists a stump's birth records, lineage-
 // coherently. Raw StumpHead writes are invisible to the flusher; call
 // this before spawning children under a freshly written stump.

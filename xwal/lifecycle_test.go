@@ -240,3 +240,69 @@ func containsBytes(haystack, needle []byte) bool {
 	}
 	return false
 }
+
+func TestStoreClearDoesNotResurrectPending(t *testing.T) {
+	dir := t.TempDir()
+	opts := testStoreOptions()
+	opts.FlushInterval = 10 * time.Millisecond
+	opts.Opaque = []string{"translations"}
+	s, err := OpenStore(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	tr, err := s.SpawnUnderRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lt, err := s.Append(tr, "ir", 0, []byte(`{"turn":1}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		if _, err := s.Append(tr, "translations", lt, []byte("stale-fingerprint-record"), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Kick()
+	if err := s.Clear(tr, "translations"); err != nil {
+		t.Fatalf("Store.Clear: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	if rec, ok, err := s.Lookup(tr, "translations", lt); err != nil || ok {
+		t.Fatalf("cleared record resurrected: %+v ok=%v err=%v", rec, ok, err)
+	}
+	clt, err := s.Append(tr, "translations", lt, []byte("fresh-record"), nil)
+	if err != nil {
+		t.Fatalf("append after clear: %v", err)
+	}
+	if clt != 1 {
+		t.Fatalf("cleared channel did not reset: first append at %d", clt)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	filepath.Walk(filepath.Join(dir, "translations"), func(p string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			if b, rerr := os.ReadFile(p); rerr == nil && containsBytes(b, []byte("stale-fingerprint-record")) {
+				found = true
+			}
+		}
+		return nil
+	})
+	if found {
+		t.Fatal("stale records present on disk after Clear + flush window")
+	}
+	s2, err := OpenStore(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	rec, ok, err := s2.Lookup(tr, "translations", lt)
+	if err != nil || !ok || string(rec.Payload) != "fresh-record" {
+		t.Fatalf("post-clear record after reopen: %+v ok=%v err=%v", rec, ok, err)
+	}
+}
