@@ -117,6 +117,33 @@ func (s *Store) open(abs string, opts Options) (*Log, error) {
 	return l, nil
 }
 
+// Evict flushes and drops the cached Log for dir, releasing its in-RAM
+// snapshot; the next Open rebuilds it from disk. The underlying disk
+// log stays cached in the disk store for cheap reload. On flush failure
+// the log stays cached, so no buffered entry is orphaned.
+func (s *Store) Evict(dir string) error {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	abs = filepath.Clean(abs)
+	s.mu.Lock()
+	l := s.logs[abs]
+	s.mu.Unlock()
+	if l == nil {
+		return nil
+	}
+	if err := l.Flush(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if s.logs[abs] == l {
+		delete(s.logs, abs)
+	}
+	s.mu.Unlock()
+	return nil
+}
+
 // FlushAll flushes every cached log's buffered entries to disk.
 func (s *Store) FlushAll() error {
 	s.mu.Lock()

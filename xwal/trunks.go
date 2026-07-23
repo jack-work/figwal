@@ -76,6 +76,7 @@ type hotHead struct {
 	ready chan struct{}
 	x     *XWAL
 	err   error
+	refs  int
 }
 
 var trunkRegistry = struct {
@@ -469,6 +470,7 @@ func (t *Trunks) borrowHotUntracked(branch []string) (*XWAL, func() error, error
 		head = &hotHead{ready: make(chan struct{})}
 		h.heads[key] = head
 	}
+	head.refs++
 	t.hotMu.Unlock()
 
 	if creator {
@@ -483,6 +485,9 @@ func (t *Trunks) borrowHotUntracked(branch []string) (*XWAL, func() error, error
 		<-head.ready
 	}
 	if head.err != nil {
+		t.hotMu.Lock()
+		head.refs--
+		t.hotMu.Unlock()
 		_ = t.releaseHot(h)
 		return nil, nil, head.err
 	}
@@ -491,11 +496,86 @@ func (t *Trunks) borrowHotUntracked(branch []string) (*XWAL, func() error, error
 	var releaseErr error
 	release := func() error {
 		once.Do(func() {
+			t.hotMu.Lock()
+			head.refs--
+			t.hotMu.Unlock()
 			releaseErr = t.releaseHot(h)
 		})
 		return releaseErr
 	}
 	return head.x, release, nil
+}
+
+// evictLineage unloads a trunk's hot head: buffered entries are flushed
+// under the lineage lock (appenders excluded), then the head and its
+// channel snapshots are dropped; the next touch reloads from disk. A
+// head still borrowed is skipped. Returns whether the lineage is now
+// unloaded.
+func (t *Trunks) evictLineage(trunk string) (bool, error) {
+	unlock := t.lockLineage(trunk)
+	defer unlock()
+	t.mu.RLock()
+	headKey, ok := t.heads[trunk]
+	var branch []string
+	if ok {
+		branch = t.nodes[headKey].branch
+	}
+	t.mu.RUnlock()
+	if !ok {
+		return true, nil
+	}
+	key := strings.Join(branch, "\x00")
+
+	t.hotMu.Lock()
+	h := t.hot
+	if h == nil {
+		t.hotMu.Unlock()
+		return true, nil
+	}
+	head := h.heads[key]
+	if head == nil {
+		t.hotMu.Unlock()
+		return true, nil
+	}
+	if head.refs != 0 || head.x == nil || head.err != nil {
+		t.hotMu.Unlock()
+		return false, nil
+	}
+	t.hotMu.Unlock()
+
+	for _, name := range head.x.order {
+		if err := head.x.chans[name].log.Flush(); err != nil {
+			return false, err
+		}
+	}
+
+	t.hotMu.Lock()
+	if t.hot != h || h.heads[key] != head || head.refs != 0 {
+		t.hotMu.Unlock()
+		return false, nil
+	}
+	delete(h.heads, key)
+	inUse := map[string]bool{}
+	for _, other := range h.heads {
+		if other.x == nil {
+			continue
+		}
+		for _, ch := range other.x.chans {
+			inUse[ch.dir] = true
+		}
+	}
+	t.hotMu.Unlock()
+
+	for _, name := range head.x.order {
+		ch := head.x.chans[name]
+		if inUse[ch.dir] {
+			continue
+		}
+		if err := h.store.Evict(ch.dir); err != nil {
+			return true, err
+		}
+	}
+	return true, nil
 }
 
 func (t *Trunks) openHotTopology(branch []string) (*XWAL, error) {

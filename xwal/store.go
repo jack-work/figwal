@@ -15,12 +15,15 @@ type StoreOptions struct {
 	Main              string
 	FlushInterval     time.Duration
 	MaxUnflushedBytes int64
-	Reducers          map[string]Reducer
-	Opaque            []string
-	Codec             string
-	SegmentSize       int64
-	Genesis           []byte
-	MintTrunkID       func() string
+	// IdleUnload evicts a lineage's in-RAM head after this much time
+	// without an append or read; 0 = default 5m, negative = never.
+	IdleUnload  time.Duration
+	Reducers    map[string]Reducer
+	Opaque      []string
+	Codec       string
+	SegmentSize int64
+	Genesis     []byte
+	MintTrunkID func() string
 }
 
 type Store struct {
@@ -28,17 +31,21 @@ type Store struct {
 	opts     StoreOptions
 	lockFile *os.File
 
-	mu    sync.Mutex
-	dirty map[string]struct{}
-	kick  chan struct{}
-	stop  chan struct{}
-	done  chan struct{}
+	mu         sync.Mutex
+	dirty      map[string]struct{}
+	touch      map[string]time.Time
+	kick       chan struct{}
+	stop       chan struct{}
+	done       chan struct{}
 
 	closeOnce sync.Once
 	closeErr  error
 }
 
-const defaultFlushInterval = time.Second
+const (
+	defaultFlushInterval = time.Second
+	defaultIdleUnload    = 5 * time.Minute
+)
 
 func OpenStore(root string, opts StoreOptions) (*Store, error) {
 	if root == "" {
@@ -73,11 +80,6 @@ func OpenStore(root string, opts StoreOptions) (*Store, error) {
 			return nil, err
 		}
 	}
-	if err := ensureDeclaredChannels(t, cfg); err != nil {
-		t.Close()
-		unlockRoot(lockFile)
-		return nil, err
-	}
 	if err := markUnclean(root); err != nil {
 		t.Close()
 		unlockRoot(lockFile)
@@ -86,11 +88,15 @@ func OpenStore(root string, opts StoreOptions) (*Store, error) {
 	if opts.FlushInterval <= 0 {
 		opts.FlushInterval = defaultFlushInterval
 	}
+	if opts.IdleUnload == 0 {
+		opts.IdleUnload = defaultIdleUnload
+	}
 	s := &Store{
 		Trunks:   t,
 		opts:     opts,
 		lockFile: lockFile,
 		dirty:    map[string]struct{}{},
+		touch:    map[string]time.Time{},
 		kick:     make(chan struct{}, 1),
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
@@ -111,6 +117,7 @@ func (s *Store) run() {
 		case <-s.kick:
 		}
 		s.flushDirty()
+		s.evictIdle()
 	}
 }
 
@@ -123,8 +130,17 @@ func (s *Store) Kick() {
 }
 
 func (s *Store) markDirty(trunk string) {
+	now := time.Now()
 	s.mu.Lock()
 	s.dirty[trunk] = struct{}{}
+	s.touch[trunk] = now
+	s.mu.Unlock()
+}
+
+func (s *Store) markTouched(trunk string) {
+	now := time.Now()
+	s.mu.Lock()
+	s.touch[trunk] = now
 	s.mu.Unlock()
 }
 
@@ -146,6 +162,53 @@ func (s *Store) flushDirty() {
 	if err := s.Trunks.flushHot(); err != nil {
 		slog.Warn("xwal: stray flush failed", "err", err)
 	}
+}
+
+func (s *Store) evictIdle() {
+	if s.opts.IdleUnload < 0 {
+		return
+	}
+	now := time.Now()
+	s.mu.Lock()
+	var idle []string
+	for tr, at := range s.touch {
+		if _, isDirty := s.dirty[tr]; isDirty {
+			continue
+		}
+		if now.Sub(at) >= s.opts.IdleUnload {
+			idle = append(idle, tr)
+		}
+	}
+	s.mu.Unlock()
+	sort.Strings(idle)
+	for _, tr := range idle {
+		evicted, err := s.Trunks.evictLineage(tr)
+		if err != nil {
+			slog.Warn("xwal: lineage evict failed", "trunk", tr, "err", err)
+			continue
+		}
+		if evicted {
+			s.mu.Lock()
+			delete(s.touch, tr)
+			s.mu.Unlock()
+		}
+	}
+}
+
+// LoadedHeads reports how many lineage heads are currently resident in
+// memory (loaded hot snapshots).
+func (s *Store) LoadedHeads() int {
+	t := s.Trunks
+	t.hotMu.Lock()
+	defer t.hotMu.Unlock()
+	n := 0
+	if t.hot != nil {
+		n += len(t.hot.heads)
+	}
+	for h := range t.retired {
+		n += len(h.heads)
+	}
+	return n
 }
 
 func (s *Store) flushLineage(trunk string) error {
@@ -220,26 +283,6 @@ func (s *Store) Append(trunk, channel string, mainLT uint64, payload, meta []byt
 	return lt, nil
 }
 
-func ensureDeclaredChannels(t *Trunks, cfg Config) error {
-	names, err := channelNames(t.root)
-	if err != nil {
-		return err
-	}
-	existing := make(map[string]bool, len(names))
-	for _, name := range names {
-		existing[name] = true
-	}
-	for _, spec := range cfg.Channels {
-		if existing[spec.Name] {
-			continue
-		}
-		if err := t.ensureChannel(spec); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (s *Store) autoCreateChannel(channel string) error {
 	spec := ChannelSpec{Name: channel, Kind: ChannelLog}
 	for _, name := range s.opts.Opaque {
@@ -259,6 +302,7 @@ func (s *Store) Fork(trunk string, atMainLT uint64) (string, error) {
 }
 
 func (s *Store) Read(trunk, channel string, channelLT uint64) (uint64, []byte, error) {
+	s.markTouched(trunk)
 	x, err := s.Trunks.Head(trunk)
 	if err != nil {
 		return 0, nil, err
@@ -268,6 +312,7 @@ func (s *Store) Read(trunk, channel string, channelLT uint64) (uint64, []byte, e
 }
 
 func (s *Store) ReadAt(trunk, channel string, channelLT uint64) (Record, error) {
+	s.markTouched(trunk)
 	x, err := s.Trunks.Head(trunk)
 	if err != nil {
 		return Record{}, err
@@ -277,6 +322,7 @@ func (s *Store) ReadAt(trunk, channel string, channelLT uint64) (Record, error) 
 }
 
 func (s *Store) Lookup(trunk, channel string, mainLT uint64) (Record, bool, error) {
+	s.markTouched(trunk)
 	x, err := s.Trunks.Head(trunk)
 	if err != nil {
 		return Record{}, false, err
@@ -286,6 +332,7 @@ func (s *Store) Lookup(trunk, channel string, mainLT uint64) (Record, bool, erro
 }
 
 func (s *Store) StateAt(trunk, channel string, channelLT uint64) ([]byte, error) {
+	s.markTouched(trunk)
 	x, err := s.Trunks.Head(trunk)
 	if err != nil {
 		return nil, err
@@ -295,6 +342,7 @@ func (s *Store) StateAt(trunk, channel string, channelLT uint64) ([]byte, error)
 }
 
 func (s *Store) RecordsFrom(trunk, channel string, fromMainLT uint64, limit int) ([]Record, error) {
+	s.markTouched(trunk)
 	x, err := s.Trunks.Head(trunk)
 	if err != nil {
 		return nil, err
@@ -304,6 +352,7 @@ func (s *Store) RecordsFrom(trunk, channel string, fromMainLT uint64, limit int)
 }
 
 func (s *Store) Channels(trunk string) ([]ChannelInfo, error) {
+	s.markTouched(trunk)
 	x, err := s.Trunks.Head(trunk)
 	if err != nil {
 		return nil, err
