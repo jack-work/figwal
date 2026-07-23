@@ -48,7 +48,6 @@ func buildLongAria(b *testing.B, records int) (string, Config) {
 		opts := disk.Options{
 			Codec:       segment.JSONLCodec{},
 			SegmentSize: cfg.SegmentSize,
-			SyncMode:    disk.SyncManual,
 		}
 		if spec.Kind == ChannelReducible {
 			r := cfg.Registry[spec.Reducer]
@@ -348,7 +347,6 @@ func buildLongTrunk(b *testing.B, records int) (*Trunks, Config, TrunkID, uint64
 		opts := disk.Options{
 			Codec:       segment.JSONLCodec{},
 			SegmentSize: cfg.SegmentSize,
-			SyncMode:    disk.SyncManual,
 		}
 		if spec.Kind == ChannelReducible {
 			r := cfg.Registry[spec.Reducer]

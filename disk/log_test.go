@@ -72,7 +72,7 @@ func TestWriteRead(t *testing.T) {
 }
 
 func TestScanFromEndAcrossFork(t *testing.T) {
-	root, err := Open(t.TempDir(), Options{SyncMode: SyncManual})
+	root, err := Open(t.TempDir(), Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,10 +420,8 @@ func TestTruncateFrontPersists(t *testing.T) {
 	}
 }
 
-func TestSyncManual(t *testing.T) {
-	// With SyncManual, Write should not invoke fsync. We can't observe
-	// the fsync call directly, but we can at least exercise the path.
-	l, err := Open(t.TempDir(), Options{SyncMode: SyncManual})
+func TestExplicitSync(t *testing.T) {
+	l, err := Open(t.TempDir(), Options{})
 	if err != nil {
 		t.Fatal(err)
 	}

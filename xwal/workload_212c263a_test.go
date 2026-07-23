@@ -28,8 +28,8 @@ func TestWorkload212c263aEnsureChannelLaterTopology(t *testing.T) {
 	}
 
 	for _, spec := range []ChannelSpec{
-		{Name: "turn-wal", Kind: ChannelLog, SyncMode: SyncManual, Opaque: true},
-		{Name: "translations/anthropic", Kind: ChannelLog, SyncMode: SyncManual, Opaque: true},
+		{Name: "turn-wal", Kind: ChannelLog, Opaque: true},
+		{Name: "translations/anthropic", Kind: ChannelLog, Opaque: true},
 		{Name: "turn-state", Kind: ChannelReducible, Reducer: "jsonmerge"},
 	} {
 		if err := f.EnsureChannel(spec); err != nil {
@@ -57,7 +57,7 @@ func TestWorkload212c263aEnsureChannelLaterTopology(t *testing.T) {
 func TestWorkload212c263aEnsureChannelRuntimePolicy(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	f, trunk := seedTrunk(t, dir)
-	spec := ChannelSpec{Name: "turn-wal", Kind: ChannelLog, SyncMode: SyncManual, Opaque: true}
+	spec := ChannelSpec{Name: "turn-wal", Kind: ChannelLog, Opaque: true}
 	if err := f.EnsureChannel(spec); err != nil {
 		t.Fatal(err)
 	}
@@ -90,17 +90,9 @@ func TestWorkload212c263aEnsureChannelRuntimePolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := head.chans[spec.Name].sync; got != SyncManual {
-		head.Close()
-		t.Fatalf("hot head sync mode = %v, want SyncManual", got)
-	}
 	if !head.chans[spec.Name].opaque {
 		head.Close()
 		t.Fatal("turn-wal is not opaque")
-	}
-	if got := head.chans["ir"].sync; got != SyncAlways {
-		head.Close()
-		t.Fatalf("IR sync mode = %v, want SyncAlways", got)
 	}
 	head.Close()
 
@@ -111,18 +103,11 @@ func TestWorkload212c263aEnsureChannelRuntimePolicy(t *testing.T) {
 	if err != nil || !ok || string(record.Payload) != `{"checkpoint":"visible"}` {
 		t.Fatalf("in-process latest = %+v ok=%v err=%v", record, ok, err)
 	}
-	if err := f.SyncChannel(trunk, spec.Name); err != nil {
-		t.Fatalf("SyncChannel: %v", err)
-	}
 
 	reopenCfg := withChannelSpec(trunksCfg(), spec)
 	normal, err := Open(dir, reopenCfg)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if got := normal.chans[spec.Name].sync; got != SyncManual {
-		normal.Close()
-		t.Fatalf("normal reopen sync mode = %v, want SyncManual", got)
 	}
 	normal.Close()
 
@@ -138,21 +123,14 @@ func TestWorkload212c263aEnsureChannelRuntimePolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := head.chans[spec.Name].sync; got != SyncManual {
-		head.Close()
-		t.Fatalf("reopened hot sync mode = %v, want SyncManual", got)
-	}
 	head.Close()
 
 	addDir := filepath.Join(t.TempDir(), "add")
 	x, _ := triune(t, addDir)
 	defer x.Close()
-	added := ChannelSpec{Name: "manual-added", Kind: ChannelLog, SyncMode: SyncManual, Opaque: true}
+	added := ChannelSpec{Name: "manual-added", Kind: ChannelLog, Opaque: true}
 	if err := x.AddChannel(added); err != nil {
 		t.Fatal(err)
-	}
-	if got := x.chans[added.Name].sync; got != SyncManual {
-		t.Fatalf("AddChannel sync mode = %v, want SyncManual", got)
 	}
 	if !x.chans[added.Name].opaque {
 		t.Fatal("AddChannel did not apply opaque encoding")
@@ -163,7 +141,7 @@ func TestWorkload212c263aLatestDuplicateAcrossFork(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	f, trunk := seedTrunk(t, dir)
 	const channel = "turn-wal"
-	if err := f.EnsureChannel(ChannelSpec{Name: channel, Kind: ChannelLog, SyncMode: SyncManual, Opaque: true}); err != nil {
+	if err := f.EnsureChannel(ChannelSpec{Name: channel, Kind: ChannelLog, Opaque: true}); err != nil {
 		t.Fatal(err)
 	}
 	_, mainLT, err := f.Append(trunk, 0, []byte(`"turn"`), nil)
@@ -226,7 +204,7 @@ func TestWorkload212c263aConcurrentLineagesAndTopology(t *testing.T) {
 		t.Fatal(err)
 	}
 	const channel = "turn-wal"
-	if err := f.EnsureChannel(ChannelSpec{Name: channel, Kind: ChannelLog, SyncMode: SyncManual, Opaque: true}); err != nil {
+	if err := f.EnsureChannel(ChannelSpec{Name: channel, Kind: ChannelLog, Opaque: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -236,10 +214,6 @@ func TestWorkload212c263aConcurrentLineagesAndTopology(t *testing.T) {
 		defer wg.Done()
 		for i := uint64(1); i <= 48; i++ {
 			if _, err := f.AppendChannel(trunk, channel, i, []byte(fmt.Sprintf(`{"checkpoint":%d}`, i)), nil); err != nil {
-				errs <- err
-				return
-			}
-			if err := f.SyncChannel(trunk, channel); err != nil {
 				errs <- err
 				return
 			}
@@ -346,7 +320,7 @@ func TestConcurrentAppendsWithTopologyMutations(t *testing.T) {
 					for i := 0; i < 8; i++ {
 						err := f.EnsureChannel(ChannelSpec{
 							Name: fmt.Sprintf("turn-wal/%d", i), Kind: ChannelLog,
-							SyncMode: SyncManual, Opaque: true,
+							Opaque: true,
 						})
 						if err != nil {
 							return err

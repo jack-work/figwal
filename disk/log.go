@@ -29,24 +29,10 @@ var (
 	errRangeBoundary   = errors.New("range reached fork boundary")
 )
 
-// SyncMode controls when Write fsyncs the active segment.
-type SyncMode int
-
-const (
-	// SyncAlways fsyncs after every Write (default; the standard WAL
-	// durability guarantee).
-	SyncAlways SyncMode = iota
-	// SyncManual disables automatic fsync. Callers must invoke
-	// Log.Sync() to make writes durable. Useful for batched workloads
-	// that drive their own commit cadence.
-	SyncManual
-)
-
 // Options configures a Log.
 type Options struct {
 	SegmentSize int64                // 0 = default
 	Codec       segment.SegmentCodec // nil = segment.BinaryCodec{}
-	SyncMode    SyncMode             // zero value = SyncAlways
 	// Parent, if non-nil, is the log this dir was forked from. When nil
 	// and the dir contains a .fork marker file, Open auto-walks `..` to
 	// resolve the parent. Use a Store if you need to deduplicate parent
@@ -237,14 +223,11 @@ func (l *Log) Write(idx uint64, payload []byte) error {
 	if err != nil {
 		return err
 	}
-	if l.opts.SyncMode == SyncAlways {
-		return l.active.Sync()
-	}
 	return nil
 }
 
-// Sync fsyncs the active segment. Useful with SyncManual to flush a
-// batch of writes, or as an extra durability point with SyncAlways.
+// Sync fsyncs the active segment. Write does not fsync on its own;
+// callers batch writes and Sync at their durability points.
 func (l *Log) Sync() error {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -466,6 +449,13 @@ func (l *Log) Parent() *Log { return l.parent }
 // ForkBase returns the global index at which this log begins relative
 // to its parent. Zero for a trunk.
 func (l *Log) ForkBase() uint64 { return l.forkBase }
+
+// IsReadOnly reports whether this log is a frozen branch point.
+func (l *Log) IsReadOnly() bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.readOnly
+}
 
 // HeaderAt returns the opaque block-0 header of the segment that holds
 // idx (the watermark, in reducible use). It walks the parent chain for

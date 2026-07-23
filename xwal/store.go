@@ -2,6 +2,7 @@ package xwal
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,9 +26,17 @@ type Store struct {
 	opts     StoreOptions
 	lockFile *os.File
 
+	mu    sync.Mutex
+	dirty map[string]struct{}
+	kick  chan struct{}
+	stop  chan struct{}
+	done  chan struct{}
+
 	closeOnce sync.Once
 	closeErr  error
 }
+
+const defaultFlushInterval = time.Second
 
 func OpenStore(root string, opts StoreOptions) (*Store, error) {
 	if root == "" {
@@ -54,7 +63,78 @@ func OpenStore(root string, opts StoreOptions) (*Store, error) {
 		unlockRoot(lockFile)
 		return nil, err
 	}
-	return &Store{Trunks: t, opts: opts, lockFile: lockFile}, nil
+	if opts.FlushInterval <= 0 {
+		opts.FlushInterval = defaultFlushInterval
+	}
+	s := &Store{
+		Trunks:   t,
+		opts:     opts,
+		lockFile: lockFile,
+		dirty:    map[string]struct{}{},
+		kick:     make(chan struct{}, 1),
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+	go s.run()
+	return s, nil
+}
+
+func (s *Store) run() {
+	defer close(s.done)
+	ticker := time.NewTicker(s.opts.FlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stop:
+			return
+		case <-ticker.C:
+		case <-s.kick:
+		}
+		s.flushDirty()
+	}
+}
+
+// Kick schedules an immediate asynchronous flush of dirty lineages.
+func (s *Store) Kick() {
+	select {
+	case s.kick <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Store) markDirty(trunk string) {
+	s.mu.Lock()
+	s.dirty[trunk] = struct{}{}
+	s.mu.Unlock()
+}
+
+func (s *Store) flushDirty() {
+	s.mu.Lock()
+	trunks := make([]string, 0, len(s.dirty))
+	for tr := range s.dirty {
+		trunks = append(trunks, tr)
+	}
+	s.dirty = map[string]struct{}{}
+	s.mu.Unlock()
+	sort.Strings(trunks)
+	for _, tr := range trunks {
+		if err := s.flushLineage(tr); err != nil {
+			slog.Warn("xwal: lineage flush failed", "trunk", tr, "err", err)
+			s.markDirty(tr)
+		}
+	}
+	if err := s.Trunks.flushHot(); err != nil {
+		slog.Warn("xwal: stray flush failed", "err", err)
+	}
+}
+
+func (s *Store) flushLineage(trunk string) error {
+	x, err := s.Trunks.Head(trunk)
+	if err != nil {
+		return err
+	}
+	defer x.Close()
+	return x.flushCoherent()
 }
 
 func (o StoreOptions) config() Config {
@@ -99,9 +179,18 @@ func (o StoreOptions) config() Config {
 func (s *Store) Append(trunk, channel string, mainLT uint64, payload, meta []byte) (uint64, error) {
 	if channel == s.Trunks.main {
 		_, lt, err := s.Trunks.Append(trunk, 0, payload, meta)
-		return lt, err
+		if err != nil {
+			return 0, err
+		}
+		s.markDirty(trunk)
+		return lt, nil
 	}
-	return s.Trunks.AppendChannel(trunk, channel, mainLT, payload, meta)
+	lt, err := s.Trunks.AppendChannel(trunk, channel, mainLT, payload, meta)
+	if err != nil {
+		return 0, err
+	}
+	s.markDirty(trunk)
+	return lt, nil
 }
 
 func (s *Store) Fork(trunk string, atMainLT uint64) (string, error) {
@@ -164,6 +253,9 @@ func (s *Store) Channels(trunk string) ([]ChannelInfo, error) {
 
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() {
+		close(s.stop)
+		<-s.done
+		s.flushDirty()
 		s.closeErr = s.Trunks.Close()
 		if err := unlockRoot(s.lockFile); err != nil && s.closeErr == nil {
 			s.closeErr = err

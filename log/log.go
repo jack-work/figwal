@@ -31,20 +31,13 @@ var (
 // trivial type-name change at the import site.
 type Options = disk.Options
 
-// SyncMode aliases disk.SyncMode for the same reason.
-type SyncMode = disk.SyncMode
-
-const (
-	SyncAlways = disk.SyncAlways
-	SyncManual = disk.SyncManual
-)
-
 // Log is a figwal write-ahead log. Reads are lock-free over an
 // immutable snapshot held in an atomic.Pointer; many goroutines can
 // read in parallel with zero contention. Writes serialize on a
-// writer mutex, fsync to disk (per SyncMode), then publish a new
-// snapshot. A reader either sees the pre-write or post-write snapshot;
-// never a partial state.
+// writer mutex, publish a new snapshot immediately, and buffer the
+// payload for a later Flush; disk follows memory with bounded lag. A
+// reader either sees the pre-write or post-write snapshot; never a
+// partial state.
 //
 // Forks reshape both the on-disk log and the in-memory cache. The
 // parent's snapshot is truncated to [first, atIdx-1] (a reslice that
@@ -54,8 +47,12 @@ const (
 type Log struct {
 	inner  *disk.Log
 	wmu    sync.Mutex
+	fmu    sync.Mutex
 	snap   atomic.Pointer[cacheSnapshot]
 	shared bool
+
+	pending      [][]byte
+	pendingFirst uint64
 }
 
 func (s *cacheSnapshot) scanFromEnd(from uint64, fn func(idx uint64, payload []byte) error) error {
@@ -193,17 +190,25 @@ func (l *Log) LastIndex() uint64 {
 	return 0
 }
 
-// Write appends an entry. Disk write + fsync (per SyncMode) happens
-// under the writer mutex, then the cache snapshot is replaced
-// atomically.
+// Write appends an entry to the in-memory snapshot and buffers it for
+// the next Flush. It returns without touching disk.
 func (l *Log) Write(idx uint64, payload []byte) error {
 	l.wmu.Lock()
 	defer l.wmu.Unlock()
 
-	if err := l.inner.Write(idx, payload); err != nil {
-		return err
+	if l.inner.IsReadOnly() {
+		return fmt.Errorf("%w: fork parent", ErrReadOnly)
 	}
 	old := l.snap.Load()
+	expected := uint64(1)
+	if n := len(old.entries); n > 0 {
+		expected = old.firstIdx + uint64(n)
+	} else if old.forkBase > 0 {
+		expected = old.forkBase
+	}
+	if idx != expected {
+		return fmt.Errorf("%w: got %d, want %d", disk.ErrOutOfOrder, idx, expected)
+	}
 	cp := make([]byte, len(payload))
 	copy(cp, payload)
 	entries := append(old.entries, cp)
@@ -211,6 +216,10 @@ func (l *Log) Write(idx uint64, payload []byte) error {
 	if len(old.entries) == 0 {
 		firstIdx = idx
 	}
+	if len(l.pending) == 0 {
+		l.pendingFirst = idx
+	}
+	l.pending = append(l.pending, cp)
 	l.snap.Store(&cacheSnapshot{
 		firstIdx: firstIdx,
 		entries:  entries,
@@ -220,8 +229,53 @@ func (l *Log) Write(idx uint64, payload []byte) error {
 	return nil
 }
 
-// Sync forces an fsync on the active segment.
-func (l *Log) Sync() error { return l.inner.Sync() }
+// Flush persists every buffered entry and fsyncs. Appends are only
+// briefly blocked (buffer bookkeeping); the disk IO runs outside the
+// writer mutex.
+func (l *Log) Flush() error { return l.FlushTo(^uint64(0)) }
+
+// FlushTo persists buffered entries with index <= target and fsyncs.
+func (l *Log) FlushTo(target uint64) error {
+	l.fmu.Lock()
+	defer l.fmu.Unlock()
+	l.wmu.Lock()
+	n := 0
+	if len(l.pending) > 0 && target >= l.pendingFirst {
+		n = len(l.pending)
+		if span := target - l.pendingFirst + 1; span < uint64(n) {
+			n = int(span)
+		}
+	}
+	batch := l.pending[:n:n]
+	first := l.pendingFirst
+	l.wmu.Unlock()
+	if n == 0 {
+		return nil
+	}
+	for i, p := range batch {
+		if err := l.inner.Write(first+uint64(i), p); err != nil {
+			return err
+		}
+	}
+	if err := l.inner.Sync(); err != nil {
+		return err
+	}
+	l.wmu.Lock()
+	l.pending = l.pending[n:]
+	l.pendingFirst = first + uint64(n)
+	l.wmu.Unlock()
+	return nil
+}
+
+// PendingBounds reports the unflushed index range, if any.
+func (l *Log) PendingBounds() (first, last uint64, ok bool) {
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+	if len(l.pending) == 0 {
+		return 0, 0, false
+	}
+	return l.pendingFirst, l.pendingFirst + uint64(len(l.pending)) - 1, true
+}
 
 // Hash returns the codec's integrity token for the payload at idx.
 func (l *Log) Hash(idx uint64) (string, error) {
@@ -242,8 +296,14 @@ func (l *Log) Fork(atIdx uint64, name string, oldFutureNameOpt ...string) (*Log,
 	if l.shared {
 		return nil, ErrSharedMutation
 	}
+	if err := l.Flush(); err != nil {
+		return nil, err
+	}
 	l.wmu.Lock()
 	defer l.wmu.Unlock()
+	if len(l.pending) > 0 {
+		return nil, fmt.Errorf("log fork: raced a concurrent write")
+	}
 
 	childInner, err := l.inner.Fork(atIdx, name, oldFutureNameOpt...)
 	if err != nil {
@@ -258,8 +318,14 @@ func (l *Log) ForkRehome(atIdx uint64, name, oldFutureName string, rehome []stri
 	if l.shared {
 		return nil, ErrSharedMutation
 	}
+	if err := l.Flush(); err != nil {
+		return nil, err
+	}
 	l.wmu.Lock()
 	defer l.wmu.Unlock()
+	if len(l.pending) > 0 {
+		return nil, fmt.Errorf("log fork: raced a concurrent write")
+	}
 
 	childInner, err := l.inner.ForkRehome(atIdx, name, oldFutureName, rehome)
 	if err != nil {
@@ -303,6 +369,9 @@ func (l *Log) TruncateFront(beforeIdx uint64) error {
 	if l.shared {
 		return ErrSharedMutation
 	}
+	if err := l.Flush(); err != nil {
+		return err
+	}
 	l.wmu.Lock()
 	defer l.wmu.Unlock()
 	if err := l.inner.TruncateFront(beforeIdx); err != nil {
@@ -345,19 +414,30 @@ func (l *Log) ChildForkBases() (map[string]uint64, error) {
 }
 
 // StateAt reconstructs a header-mode state from the on-disk watermark.
-func (l *Log) StateAt(idx uint64) ([]byte, error) { return l.inner.StateAt(idx) }
+// The disk fold must see every appended patch, so buffered entries are
+// flushed first.
+func (l *Log) StateAt(idx uint64) ([]byte, error) {
+	if err := l.Flush(); err != nil {
+		return nil, err
+	}
+	return l.inner.StateAt(idx)
+}
 
 // SegmentBaseIndexes returns this log's own segment bases.
 func (l *Log) SegmentBaseIndexes() []uint64 { return l.inner.SegmentBaseIndexes() }
 
-// Close closes the underlying disk.Log. Parent logs auto-opened
-// during Open are not closed automatically; manage them via a Store
-// or explicit handles for shared lifetimes.
+// Close flushes buffered entries and closes the underlying disk.Log.
+// Parent logs auto-opened during Open are not closed automatically;
+// manage them via a Store or explicit handles for shared lifetimes.
 func (l *Log) Close() error {
 	if l.shared {
 		return nil
 	}
-	return l.inner.Close()
+	flushErr := l.Flush()
+	if err := l.inner.Close(); err != nil {
+		return err
+	}
+	return flushErr
 }
 
 // Snapshot exposes the current snapshot pointer for callers that

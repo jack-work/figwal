@@ -702,6 +702,23 @@ func (t *Trunks) releaseHot(h *trunkStore) error {
 	return nil
 }
 
+func (t *Trunks) flushHot() error {
+	t.hotMu.Lock()
+	h := t.hot
+	if h != nil {
+		h.refs++
+	}
+	t.hotMu.Unlock()
+	if h == nil {
+		return nil
+	}
+	err := h.store.FlushAll()
+	if rerr := t.releaseHot(h); rerr != nil && err == nil {
+		err = rerr
+	}
+	return err
+}
+
 func (t *Trunks) retireHot() {
 	t.hotMu.Lock()
 	h := t.hot
@@ -1743,28 +1760,6 @@ func (t *Trunks) AppendChannel(trunk, channel string, mainLT uint64, payload, me
 		mainLT = mainTail(x) + 1 // reducible default: one ahead
 	}
 	return x.Append(channel, mainLT, payload, meta)
-}
-
-// SyncChannel orders a channel durability point with writes on the same
-// lineage without blocking unrelated lineages.
-func (t *Trunks) SyncChannel(trunk, channel string) error {
-	unlockLineage := t.lockLineage(trunk)
-	defer unlockLineage()
-	endRead, err := t.beginTrackedRead()
-	if err != nil {
-		return err
-	}
-	defer endRead()
-	branch, err := t.headBranch(trunk)
-	if err != nil {
-		return err
-	}
-	x, release, err := t.borrowHotUntracked(branch)
-	if err != nil {
-		return err
-	}
-	defer release()
-	return x.SyncChannel(channel)
 }
 
 // LatestChannelRecord reads the newest channel checkpoint from the hot

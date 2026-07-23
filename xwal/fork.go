@@ -55,6 +55,9 @@ func (x *XWAL) Fork(atMainLT uint64, childName, oldFutureName string) (*XWAL, er
 	if err := x.ensurePrivate(); err != nil {
 		return nil, err
 	}
+	if err := x.flushAll(); err != nil {
+		return nil, err
+	}
 	if err := x.validateForkChannels(); err != nil {
 		return nil, err
 	}
@@ -282,7 +285,6 @@ func recoverFork(root string, cfg Config, man manifest, plan forkPlan) error {
 		opts := disk.Options{
 			Codec:       codec,
 			SegmentSize: cfg.SegmentSize,
-			SyncMode:    syncModeFor(cfg, mc.Name),
 		}
 		if mc.Kind == "reducible" {
 			r, ok := resolveReducer(cfg, mc.Reducer)

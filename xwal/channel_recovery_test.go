@@ -16,7 +16,7 @@ func TestOpenTrunksCompletesPendingChannelBeforeManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	spec := ChannelSpec{Name: "turn-wal", Kind: ChannelLog, SyncMode: SyncManual, Opaque: true}
+	spec := ChannelSpec{Name: "turn-wal", Kind: ChannelLog, Opaque: true}
 	plan := channelPendingPlan{Channel: manifestChannel{
 		Name: spec.Name, Kind: spec.Kind.String(), Opaque: spec.Opaque,
 	}}
@@ -166,7 +166,7 @@ func TestRootTopologyMutationRejectsPeerBorrowedHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	spec := ChannelSpec{Name: "turn-wal", Kind: ChannelLog, SyncMode: SyncManual, Opaque: true}
+	spec := ChannelSpec{Name: "turn-wal", Kind: ChannelLog, Opaque: true}
 	if err := first.EnsureChannel(spec); !errors.Is(err, ErrTopologyBusy) {
 		head.Close()
 		t.Fatalf("EnsureChannel error = %v, want ErrTopologyBusy", err)

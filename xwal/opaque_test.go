@@ -41,7 +41,7 @@ func TestOpaqueChannelExactBytesAcrossCachedReopen(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	f, trunk := seedTrunk(t, dir)
 	spec := ChannelSpec{
-		Name: "translations/provider", Kind: ChannelLog, SyncMode: SyncManual, Opaque: true,
+		Name: "translations/provider", Kind: ChannelLog, Opaque: true,
 	}
 	if err := f.EnsureChannel(spec); err != nil {
 		t.Fatal(err)

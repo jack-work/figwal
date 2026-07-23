@@ -55,22 +55,12 @@ type Reducer struct {
 	Initial []byte
 }
 
-// SyncMode controls when a channel fsyncs. It is runtime policy and is not
-// persisted in xwal.json.
-type SyncMode = disk.SyncMode
-
-const (
-	SyncAlways = disk.SyncAlways
-	SyncManual = disk.SyncManual
-)
-
-// ChannelSpec declares one channel's persisted shape and runtime policy.
+// ChannelSpec declares one channel's persisted shape.
 type ChannelSpec struct {
-	Name     string
-	Kind     Kind
-	Reducer  string // registry key; required iff Kind == ChannelReducible
-	SyncMode SyncMode
-	Opaque   bool // persist payload bytes without JSON canonicalization
+	Name    string
+	Kind    Kind
+	Reducer string // registry key; required iff Kind == ChannelReducible
+	Opaque  bool   // persist payload bytes without JSON canonicalization
 }
 
 // Config opens or creates an xwal. On first open the manifest is written
@@ -128,7 +118,6 @@ type channel struct {
 	log     *log.Log
 	reduce  ReduceFunc
 	initial []byte
-	sync    SyncMode
 	opaque  bool
 	fk      map[uint64]uint64 // main-LT -> channel-LT (last wins)
 	fkBuilt bool              // all entries indexed?
@@ -246,9 +235,7 @@ func open(dir string, cfg Config, store *log.Store, branch ...string) (*XWAL, er
 		shared: store != nil,
 	}
 	for _, mc := range man.Channels {
-		ch := &channel{
-			name: mc.Name, rname: mc.Reducer, sync: syncModeFor(cfg, mc.Name), opaque: mc.Opaque,
-		}
+		ch := &channel{name: mc.Name, rname: mc.Reducer, opaque: mc.Opaque}
 		switch mc.Kind {
 		case "reducible":
 			ch.kind = ChannelReducible
@@ -261,7 +248,7 @@ func open(dir string, cfg Config, store *log.Store, branch ...string) (*XWAL, er
 		default:
 			ch.kind = ChannelLog
 		}
-		opts := disk.Options{Codec: codec, SegmentSize: cfg.SegmentSize, SyncMode: ch.sync}
+		opts := disk.Options{Codec: codec, SegmentSize: cfg.SegmentSize}
 		if ch.kind == ChannelReducible {
 			opts.OnSegmentOpen = reducibleFold(ch.reduce, ch.initial)
 		}
@@ -433,16 +420,6 @@ func prepareInitialChannels(dir string, cfg Config, m manifest) error {
 		}
 	}
 	return nil
-}
-
-func syncModeFor(cfg Config, name string) SyncMode {
-	var mode SyncMode
-	for _, spec := range cfg.Channels {
-		if spec.Name == name {
-			mode = spec.SyncMode
-		}
-	}
-	return mode
 }
 
 func validateChannelSpec(root string, cfg Config, man manifest, spec ChannelSpec) error {
@@ -618,10 +595,7 @@ func recoverChannelPending(root string, cfg Config, man manifest) (manifest, err
 }
 
 func channelFromManifest(cfg Config, mc manifestChannel) (*channel, error) {
-	ch := &channel{
-		name: mc.Name, kind: ChannelLog, rname: mc.Reducer,
-		sync: syncModeFor(cfg, mc.Name), opaque: mc.Opaque,
-	}
+	ch := &channel{name: mc.Name, kind: ChannelLog, rname: mc.Reducer, opaque: mc.Opaque}
 	if mc.Kind != ChannelReducible.String() {
 		return ch, nil
 	}
@@ -981,7 +955,7 @@ func (x *XWAL) channelTopologyNeedsRepair(ch *channel) (bool, error) {
 }
 
 func (x *XWAL) channelOpts(ch *channel) disk.Options {
-	opts := disk.Options{Codec: x.codec, SegmentSize: x.cfg.SegmentSize, SyncMode: ch.sync}
+	opts := disk.Options{Codec: x.codec, SegmentSize: x.cfg.SegmentSize}
 	if ch.kind == ChannelReducible {
 		opts.OnSegmentOpen = reducibleFold(ch.reduce, ch.initial)
 	}
@@ -1061,7 +1035,7 @@ func (x *XWAL) AddChannel(spec ChannelSpec) error {
 		return err
 	}
 	ch := &channel{
-		name: spec.Name, kind: spec.Kind, rname: spec.Reducer, sync: spec.SyncMode, opaque: spec.Opaque,
+		name: spec.Name, kind: spec.Kind, rname: spec.Reducer, opaque: spec.Opaque,
 	}
 	if spec.Kind == ChannelReducible {
 		r, ok := resolveReducer(x.cfg, spec.Reducer)
@@ -1641,15 +1615,76 @@ func (x *XWAL) Append(channelName string, mainLT uint64, payload, meta []byte) (
 	return next, nil
 }
 
-// SyncChannel makes prior writes to a channel durable.
-func (x *XWAL) SyncChannel(channelName string) error {
-	ch := x.chans[channelName]
-	if ch == nil {
-		return fmt.Errorf("xwal: no channel %q", channelName)
+func (x *XWAL) flushAll() error {
+	if ch := x.chans[x.main]; ch != nil {
+		if err := ch.log.Flush(); err != nil {
+			return err
+		}
 	}
-	ch.mu.Lock()
-	defer ch.mu.Unlock()
-	return ch.log.Sync()
+	for _, name := range x.order {
+		if name == x.main {
+			continue
+		}
+		if err := x.chans[name].log.Flush(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// flushCoherent persists this lineage's channels as one cut: the main
+// channel first, then each related channel only up to the last record
+// whose main-LT referent is already durable.
+func (x *XWAL) flushCoherent() error {
+	main := x.chans[x.main]
+	if main == nil {
+		return x.flushAll()
+	}
+	if err := main.log.Flush(); err != nil {
+		return err
+	}
+	mainTail := main.log.LastIndex()
+	for _, name := range x.order {
+		if name == x.main {
+			continue
+		}
+		ch := x.chans[name]
+		target, err := coherentTarget(ch, mainTail)
+		if err != nil {
+			return err
+		}
+		if err := ch.log.FlushTo(target); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// coherentTarget is the highest pending index whose record references a
+// main-LT at or below mainTail. Records are main-LT-non-decreasing, so
+// everything at or below it is safe to persist.
+func coherentTarget(ch *channel, mainTail uint64) (uint64, error) {
+	first, last, ok := ch.log.PendingBounds()
+	if !ok {
+		return 0, nil
+	}
+	for idx := last; idx >= first; idx-- {
+		f, err := ch.log.Read(idx)
+		if err != nil {
+			return 0, err
+		}
+		m, err := decodeMainLT(f)
+		if err != nil {
+			return 0, err
+		}
+		if m <= mainTail {
+			return idx, nil
+		}
+		if idx == first {
+			break
+		}
+	}
+	return 0, nil
 }
 
 // Read returns the (mainLT, payload) at channelLT — the meta-free view.

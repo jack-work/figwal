@@ -33,7 +33,7 @@ func TestTopologyLocksBeforePublishingRootMutation(t *testing.T) {
 				return func() error {
 					return f.EnsureChannel(ChannelSpec{
 						Name: "turn-wal/ordered", Kind: ChannelLog,
-						SyncMode: SyncManual, Opaque: true,
+						Opaque: true,
 					})
 				}
 			},
