@@ -92,7 +92,7 @@ func mapTrunksCfg() Config {
 // trunk under it (own range from LT 2), the migration of the old root-trunk.
 func seedMapTrunk(t *testing.T, dir string) (*Trunks, TrunkID) {
 	t.Helper()
-	f, err := CreateTrunks(dir, mapTrunksCfg())
+	f, err := createTrunks(dir, mapTrunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}

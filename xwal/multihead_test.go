@@ -67,7 +67,7 @@ func TestOpenRejectsMultipleHeads(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if reopened, err := OpenTrunks(dir, trunksCfg()); err == nil {
+	if reopened, err := openTrunks(dir, trunksCfg()); err == nil {
 		reopened.Close()
 		t.Fatal("OpenTrunks accepted multiple live heads for one trunk")
 	}

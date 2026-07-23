@@ -58,9 +58,9 @@ func OpenStore(root string, opts StoreOptions) (*Store, error) {
 	wasUnclean := pathExists(uncleanPath(root))
 	var t *Trunks
 	if pathExists(filepath.Join(root, manifestName)) {
-		t, err = OpenTrunks(root, cfg)
+		t, err = openTrunks(root, cfg)
 	} else {
-		t, err = CreateTrunks(root, cfg)
+		t, err = createTrunks(root, cfg)
 	}
 	if err != nil {
 		unlockRoot(lockFile)
@@ -233,7 +233,7 @@ func ensureDeclaredChannels(t *Trunks, cfg Config) error {
 		if existing[spec.Name] {
 			continue
 		}
-		if err := t.EnsureChannel(spec); err != nil {
+		if err := t.ensureChannel(spec); err != nil {
 			return err
 		}
 	}
@@ -251,7 +251,7 @@ func (s *Store) autoCreateChannel(channel string) error {
 		spec.Kind = ChannelReducible
 		spec.Reducer = channel
 	}
-	return s.Trunks.EnsureChannel(spec)
+	return s.Trunks.ensureChannel(spec)
 }
 
 func (s *Store) Fork(trunk string, atMainLT uint64) (string, error) {

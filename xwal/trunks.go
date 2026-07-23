@@ -155,9 +155,9 @@ func mainTail(x *XWAL) uint64 { return x.chans[x.main].log.LastIndex() }
 // directory itself: it carries NO .trunk marker (it is addressed by being
 // the root, not by an id) and holds the genesis every trunk inherits.
 // Stumps (CreateStump) and trunks live below it.
-func CreateTrunks(dir string, cfg Config) (*Trunks, error) {
+func createTrunks(dir string, cfg Config) (*Trunks, error) {
 	if cfg.Main == "" {
-		return nil, fmt.Errorf("xwal: CreateTrunks needs cfg.Main")
+		return nil, fmt.Errorf("xwal: create needs cfg.Main")
 	}
 	endMutation, root, err := beginRootTopologyMutation(dir)
 	if err != nil {
@@ -204,7 +204,7 @@ func CreateTrunks(dir string, cfg Config) (*Trunks, error) {
 }
 
 // OpenTrunks opens an existing trunk store, rebuilding its cache from disk.
-func OpenTrunks(dir string, cfg Config) (*Trunks, error) {
+func openTrunks(dir string, cfg Config) (*Trunks, error) {
 	endMutation, root, err := beginRootTopologyMutation(dir)
 	if err != nil {
 		return nil, err
@@ -962,7 +962,7 @@ func (t *Trunks) Close() error {
 
 // EnsureChannel adds and backfills a channel if needed, and installs its
 // runtime policy for subsequent hot heads and topology operations.
-func (t *Trunks) EnsureChannel(spec ChannelSpec) error {
+func (t *Trunks) ensureChannel(spec ChannelSpec) error {
 	endMutation, err := t.beginTopologyMutation()
 	if err != nil {
 		return err

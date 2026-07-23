@@ -326,7 +326,7 @@ func buildLongTrunk(b *testing.B, records int) (*Trunks, Config, TrunkID, uint64
 	b.Helper()
 	dir := filepath.Join(b.TempDir(), "forest")
 	cfg := benchConfig()
-	trunks, err := CreateTrunks(dir, cfg)
+	trunks, err := createTrunks(dir, cfg)
 	if err != nil {
 		b.Fatal(err)
 	}

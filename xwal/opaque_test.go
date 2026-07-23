@@ -43,7 +43,7 @@ func TestOpaqueChannelExactBytesAcrossCachedReopen(t *testing.T) {
 	spec := ChannelSpec{
 		Name: "translations/provider", Kind: ChannelLog, Opaque: true,
 	}
-	if err := f.EnsureChannel(spec); err != nil {
+	if err := f.ensureChannel(spec); err != nil {
 		t.Fatal(err)
 	}
 	_, mainLT, err := f.Append(trunk, 0, []byte(`"turn"`), nil)
@@ -80,7 +80,7 @@ func TestOpaqueChannelExactBytesAcrossCachedReopen(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenTrunks(dir, withChannelSpec(trunksCfg(), spec))
+	reopened, err := openTrunks(dir, withChannelSpec(trunksCfg(), spec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestOpaqueChannelExactBytesAcrossForks(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	f, trunk := seedTrunk(t, dir)
 	const channel = "translations/provider"
-	if err := f.EnsureChannel(ChannelSpec{Name: channel, Kind: ChannelLog, Opaque: true}); err != nil {
+	if err := f.ensureChannel(ChannelSpec{Name: channel, Kind: ChannelLog, Opaque: true}); err != nil {
 		t.Fatal(err)
 	}
 	_, firstMainLT, err := f.Append(trunk, 0, []byte(`"turn-1"`), nil)
@@ -160,7 +160,7 @@ func TestEnsureChannelRejectsOpaqueChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = f.EnsureChannel(ChannelSpec{Name: "translations", Kind: ChannelLog, Opaque: true})
+	err = f.ensureChannel(ChannelSpec{Name: "translations", Kind: ChannelLog, Opaque: true})
 	if err == nil {
 		t.Fatal("EnsureChannel changed an existing channel to opaque")
 	}

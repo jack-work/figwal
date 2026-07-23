@@ -146,7 +146,7 @@ func TestXWAL_AddChannel(t *testing.T) {
 	m1, _ := x.AppendMain([]byte(`{"a":1}`), nil)
 
 	// Add a translation channel for a newly-seen provider.
-	if err := x.AddChannel(ChannelSpec{Name: "translations/openai", Kind: ChannelLog}); err != nil {
+	if err := x.addChannel(ChannelSpec{Name: "translations/openai", Kind: ChannelLog}); err != nil {
 		t.Fatalf("AddChannel: %v", err)
 	}
 	if _, err := x.Append("translations/openai", m1, []byte(`["wire"]`), nil); err != nil {
@@ -171,7 +171,7 @@ func TestTrunksHeadDetachesBeforeChannelMutation(t *testing.T) {
 			{Name: "translations", Kind: ChannelLog},
 		},
 	}
-	trunks, err := CreateTrunks(dir, cfg)
+	trunks, err := createTrunks(dir, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +188,7 @@ func TestTrunksHeadDetachesBeforeChannelMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := x.AddChannel(ChannelSpec{Name: "translations/openai", Kind: ChannelLog}); err != nil {
+	if err := x.addChannel(ChannelSpec{Name: "translations/openai", Kind: ChannelLog}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := x.Append("translations/openai", mainLT, []byte(`{"wire":1}`), nil); err != nil {

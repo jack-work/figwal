@@ -27,7 +27,7 @@ func trunksCfg() Config {
 // (genesis@1 inherited). Lets the trunk-mechanics tests read identically.
 func seedTrunk(t *testing.T, dir string) (*Trunks, TrunkID) {
 	t.Helper()
-	f, err := CreateTrunks(dir, trunksCfg())
+	f, err := createTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func chalkLast(t *testing.T, x *XWAL) uint64 {
 // shape (genesis@1, loadout-birth@2 inherited).
 func seedTrunkBirth(t *testing.T, dir, stump string) (*Trunks, TrunkID) {
 	t.Helper()
-	f, err := CreateTrunks(dir, trunksCfg())
+	f, err := createTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +234,7 @@ func seedTrunkBirth(t *testing.T, dir, stump string) (*Trunks, TrunkID) {
 
 func TestTrunks_Stumps(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	f, err := CreateTrunks(dir, trunksCfg())
+	f, err := createTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +289,7 @@ func TestTrunks_Stumps(t *testing.T) {
 		}
 	}
 	// Reopen from disk: stumps + trunks resolve.
-	r2, err := OpenTrunks(dir, trunksCfg())
+	r2, err := openTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +362,7 @@ func TestTrunks_ReSplitBelow(t *testing.T) {
 		t.Fatalf("re-split must mint a distinct sibling trunk, got %q", sib)
 	}
 	// Everyone still resolves + folds after the re-split, and from disk.
-	r2, err := OpenTrunks(dir, trunksCfg())
+	r2, err := openTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,7 +437,7 @@ func TestTrunks_Remove(t *testing.T) {
 		t.Fatal("alt should be gone")
 	}
 	// Reopen from disk: alt stays gone, conv resolves, stump intact.
-	r2, _ := OpenTrunks(dir, trunksCfg())
+	r2, _ := openTrunks(dir, trunksCfg())
 	cleanupTrunks(t, r2)
 	if x, err := r2.Head(conv); err != nil {
 		t.Fatalf("conv missing after reopen: %v", err)
@@ -470,7 +470,7 @@ func TestTrunks_Remove(t *testing.T) {
 
 func TestVersion_MonotonicOnOpen(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	f, err := CreateTrunks(dir, trunksCfg())
+	f, err := createTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -482,7 +482,7 @@ func TestVersion_MonotonicOnOpen(t *testing.T) {
 
 	// Reopen: the reopened instance starts its own counter but must
 	// also be non-zero (OpenTrunks rebuilds once).
-	r, err := OpenTrunks(dir, trunksCfg())
+	r, err := openTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -494,7 +494,7 @@ func TestVersion_MonotonicOnOpen(t *testing.T) {
 
 func TestVersion_BumpsOnMutations(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	f, err := CreateTrunks(dir, trunksCfg())
+	f, err := createTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -725,7 +725,7 @@ func TestTopologyMutationSeesRetiredOpenHead(t *testing.T) {
 		t.Fatal(err)
 	}
 	spec := ChannelSpec{Name: "scratch", Kind: ChannelLog}
-	if err := mutator.AddChannel(spec); err != nil {
+	if err := mutator.addChannel(spec); err != nil {
 		stale.Close()
 		mutator.Close()
 		t.Fatalf("AddChannel with retired head: %v", err)

@@ -31,7 +31,7 @@ func TestEnsureChannelValidatesBeforePendingPlan(t *testing.T) {
 		t.Run(spec.Name, func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "f")
 			f, _ := seedTrunk(t, dir)
-			if err := f.EnsureChannel(spec); err == nil {
+			if err := f.ensureChannel(spec); err == nil {
 				t.Fatal("EnsureChannel accepted invalid spec")
 			}
 			if pathExists(filepath.Join(dir, channelPendingName)) {
@@ -64,7 +64,7 @@ func TestReservedChannelComponentsRejectedAtCreateAndEnsure(t *testing.T) {
 
 			storeDir := filepath.Join(t.TempDir(), "ensure")
 			f, _ := seedTrunk(t, storeDir)
-			if err := f.EnsureChannel(ChannelSpec{Name: name, Kind: ChannelLog}); err == nil {
+			if err := f.ensureChannel(ChannelSpec{Name: name, Kind: ChannelLog}); err == nil {
 				t.Fatal("EnsureChannel accepted reserved channel path")
 			}
 			if pathExists(filepath.Join(storeDir, channelPendingName)) {
@@ -114,7 +114,7 @@ func TestAddChannelRetiresPostPublicationGeneration(t *testing.T) {
 	}
 	defer x.Close()
 	spec := ChannelSpec{Name: "translations/barrier", Kind: ChannelLog, Opaque: true}
-	if err := x.AddChannel(spec); err != nil {
+	if err := x.addChannel(spec); err != nil {
 		t.Fatal(err)
 	}
 	f.hotMu.Lock()
@@ -171,7 +171,7 @@ func TestForkPreflightRepairsMissingRehomeMarker(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	f, trunk := seedTrunk(t, dir)
 	spec := ChannelSpec{Name: "turn-wal", Kind: ChannelLog, Opaque: true}
-	if err := f.EnsureChannel(spec); err != nil {
+	if err := f.ensureChannel(spec); err != nil {
 		t.Fatal(err)
 	}
 	_, atMainLT, err := f.Append(trunk, 0, []byte(`"one"`), nil)

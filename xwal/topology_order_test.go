@@ -31,7 +31,7 @@ func TestTopologyLocksBeforePublishingRootMutation(t *testing.T) {
 			name: "ensure-channel",
 			setup: func(_ *testing.T, f *Trunks) func() error {
 				return func() error {
-					return f.EnsureChannel(ChannelSpec{
+					return f.ensureChannel(ChannelSpec{
 						Name: "turn-wal/ordered", Kind: ChannelLog,
 						Opaque: true,
 					})

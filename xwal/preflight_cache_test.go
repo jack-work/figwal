@@ -40,7 +40,7 @@ func TestForkPreflightRepairBudget(t *testing.T) {
 
 func BenchmarkForkPreflightCached(b *testing.B) {
 	dir := filepath.Join(b.TempDir(), "f")
-	f, err := CreateTrunks(dir, trunksCfg())
+	f, err := createTrunks(dir, trunksCfg())
 	if err != nil {
 		b.Fatal(err)
 	}

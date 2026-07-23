@@ -14,7 +14,7 @@ import (
 
 func TestWorkload212c263aEnsureChannelLaterTopology(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	f, err := CreateTrunks(dir, trunksCfg())
+	f, err := createTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func TestWorkload212c263aEnsureChannelLaterTopology(t *testing.T) {
 		{Name: "translations/anthropic", Kind: ChannelLog, Opaque: true},
 		{Name: "turn-state", Kind: ChannelReducible, Reducer: "jsonmerge"},
 	} {
-		if err := f.EnsureChannel(spec); err != nil {
+		if err := f.ensureChannel(spec); err != nil {
 			t.Fatalf("EnsureChannel(%q): %v", spec.Name, err)
 		}
 	}
@@ -57,10 +57,10 @@ func TestWorkload212c263aEnsureChannelRuntimePolicy(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	f, trunk := seedTrunk(t, dir)
 	spec := ChannelSpec{Name: "turn-wal", Kind: ChannelLog, Opaque: true}
-	if err := f.EnsureChannel(spec); err != nil {
+	if err := f.ensureChannel(spec); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.EnsureChannel(spec); err != nil {
+	if err := f.ensureChannel(spec); err != nil {
 		t.Fatalf("idempotent EnsureChannel: %v", err)
 	}
 
@@ -113,7 +113,7 @@ func TestWorkload212c263aEnsureChannelRuntimePolicy(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenTrunks(dir, reopenCfg)
+	reopened, err := openTrunks(dir, reopenCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestWorkload212c263aEnsureChannelRuntimePolicy(t *testing.T) {
 	x, _ := triune(t, addDir)
 	defer x.Close()
 	added := ChannelSpec{Name: "manual-added", Kind: ChannelLog, Opaque: true}
-	if err := x.AddChannel(added); err != nil {
+	if err := x.addChannel(added); err != nil {
 		t.Fatal(err)
 	}
 	if !x.chans[added.Name].opaque {
@@ -140,7 +140,7 @@ func TestWorkload212c263aLatestDuplicateAcrossFork(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	f, trunk := seedTrunk(t, dir)
 	const channel = "turn-wal"
-	if err := f.EnsureChannel(ChannelSpec{Name: channel, Kind: ChannelLog, Opaque: true}); err != nil {
+	if err := f.ensureChannel(ChannelSpec{Name: channel, Kind: ChannelLog, Opaque: true}); err != nil {
 		t.Fatal(err)
 	}
 	_, mainLT, err := f.Append(trunk, 0, []byte(`"turn"`), nil)
@@ -185,7 +185,7 @@ func TestWorkload212c263aLatestDuplicateAcrossFork(t *testing.T) {
 
 func TestWorkload212c263aConcurrentLineagesAndTopology(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	f, err := CreateTrunks(dir, trunksCfg())
+	f, err := createTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestWorkload212c263aConcurrentLineagesAndTopology(t *testing.T) {
 		t.Fatal(err)
 	}
 	const channel = "turn-wal"
-	if err := f.EnsureChannel(ChannelSpec{Name: channel, Kind: ChannelLog, Opaque: true}); err != nil {
+	if err := f.ensureChannel(ChannelSpec{Name: channel, Kind: ChannelLog, Opaque: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -317,7 +317,7 @@ func TestConcurrentAppendsWithTopologyMutations(t *testing.T) {
 			setup: func(_ *testing.T, f *Trunks) func() error {
 				return func() error {
 					for i := 0; i < 8; i++ {
-						err := f.EnsureChannel(ChannelSpec{
+						err := f.ensureChannel(ChannelSpec{
 							Name: fmt.Sprintf("turn-wal/%d", i), Kind: ChannelLog,
 							Opaque: true,
 						})

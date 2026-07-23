@@ -23,7 +23,7 @@ func TestOpenTrunksCompletesPendingChannelBeforeManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened, err := OpenTrunks(dir, withChannelSpec(trunksCfg(), spec))
+	reopened, err := openTrunks(dir, withChannelSpec(trunksCfg(), spec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestOpenTrunksCompletesPartialReducibleBackfill(t *testing.T) {
 	}
 
 	cfg := withChannelSpec(trunksCfg(), spec)
-	reopened, err := OpenTrunks(dir, cfg)
+	reopened, err := openTrunks(dir, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestOpenTrunksRepairsLegacyManifestAuthoritativeChannel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened, err := OpenTrunks(dir, withChannelSpec(trunksCfg(), spec))
+	reopened, err := openTrunks(dir, withChannelSpec(trunksCfg(), spec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +154,7 @@ func TestReplacementRecoveryPhases(t *testing.T) {
 func TestRootTopologyMutationRejectsPeerBorrowedHead(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	first, trunk := seedTrunk(t, dir)
-	peer, err := OpenTrunks(dir, trunksCfg())
+	peer, err := openTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestRootTopologyMutationRejectsPeerBorrowedHead(t *testing.T) {
 		t.Fatal(err)
 	}
 	spec := ChannelSpec{Name: "turn-wal", Kind: ChannelLog, Opaque: true}
-	if err := first.EnsureChannel(spec); !isTopologyTimeout(err) {
+	if err := first.ensureChannel(spec); !isTopologyTimeout(err) {
 		head.Close()
 		t.Fatalf("EnsureChannel error = %v, want bounded-wait timeout", err)
 	}
@@ -178,7 +178,7 @@ func TestRootTopologyMutationRejectsPeerBorrowedHead(t *testing.T) {
 	if err := head.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := first.EnsureChannel(spec); err != nil {
+	if err := first.ensureChannel(spec); err != nil {
 		t.Fatalf("EnsureChannel after peer release: %v", err)
 	}
 }
@@ -186,7 +186,7 @@ func TestRootTopologyMutationRejectsPeerBorrowedHead(t *testing.T) {
 func TestRootTopologyMutationRefreshesPeerTopology(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	first, _ := seedTrunk(t, dir)
-	peer, err := OpenTrunks(dir, trunksCfg())
+	peer, err := openTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestRootTopologyMutationRefreshesPeerTopology(t *testing.T) {
 func TestPeerTailAppendRefreshesStaleHead(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	first, trunk := seedTrunk(t, dir)
-	peer, err := OpenTrunks(dir, trunksCfg())
+	peer, err := openTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +246,7 @@ func TestPeerTailAppendRefreshesStaleHead(t *testing.T) {
 func TestConcurrentPeerAppendsShareLineageWriter(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	first, trunk := seedTrunk(t, dir)
-	peer, err := OpenTrunks(dir, trunksCfg())
+	peer, err := openTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +294,7 @@ func TestConcurrentPeerAppendsShareLineageWriter(t *testing.T) {
 func TestPeerAppendRefreshesTopologyAfterFork(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	first, trunk := seedTrunk(t, dir)
-	peer, err := OpenTrunks(dir, trunksCfg())
+	peer, err := openTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +334,7 @@ func TestPeerAppendRefreshesTopologyAfterFork(t *testing.T) {
 func TestPeerForkWaitsForLineageAppend(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	first, trunk := seedTrunk(t, dir)
-	peer, err := OpenTrunks(dir, trunksCfg())
+	peer, err := openTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}

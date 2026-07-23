@@ -32,7 +32,7 @@ func TestEnsureExistingReduciblePreservesForkBases(t *testing.T) {
 		t.Fatal(err)
 	}
 	spec := ChannelSpec{Name: "chalkboard", Kind: ChannelReducible, Reducer: "jsonmerge"}
-	if err := f.EnsureChannel(spec); err != nil {
+	if err := f.ensureChannel(spec); err != nil {
 		t.Fatal(err)
 	}
 	assertNoBaseOneWatermarkUnderLaterFork(t, filepath.Join(dir, "chalkboard"))
@@ -41,7 +41,7 @@ func TestEnsureExistingReduciblePreservesForkBases(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenTrunks(dir, cfg)
+	reopened, err := openTrunks(dir, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestEnsureNewReducibleRepairsMissingForkWatermark(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	f, trunk := seedTrunk(t, dir)
 	spec := ChannelSpec{Name: "turn-state", Kind: ChannelReducible, Reducer: "jsonmerge"}
-	if err := f.EnsureChannel(spec); err != nil {
+	if err := f.ensureChannel(spec); err != nil {
 		t.Fatal(err)
 	}
 	_, mainLT, err := f.Append(trunk, 0, []byte(`"turn"`), nil)
@@ -107,7 +107,7 @@ func TestEnsureNewReducibleRepairsMissingForkWatermark(t *testing.T) {
 	if err := os.Remove(watermarkPath(nodeDir, base, codec)); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.EnsureChannel(spec); err != nil {
+	if err := f.ensureChannel(spec); err != nil {
 		t.Fatalf("repair incomplete backfill: %v", err)
 	}
 	if !pathExists(watermarkPath(nodeDir, base, codec)) {
@@ -121,7 +121,7 @@ func TestEnsureNewReducibleRepairsMissingForkWatermark(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenTrunks(dir, cfg)
+	reopened, err := openTrunks(dir, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +358,7 @@ func TestForkPreflightRepairsSafeLegacyChannel(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	f, trunk := seedTrunk(t, dir)
 	spec := ChannelSpec{Name: "translations/legacy", Kind: ChannelLog, Opaque: true}
-	if err := f.EnsureChannel(spec); err != nil {
+	if err := f.ensureChannel(spec); err != nil {
 		t.Fatal(err)
 	}
 	_, mainLT, err := f.Append(trunk, 0, []byte(`"turn"`), nil)
@@ -405,7 +405,7 @@ func TestForkPreflightRepairsSafeLegacyChannel(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenTrunks(dir, cfg)
+	reopened, err := openTrunks(dir, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +420,7 @@ func TestInteriorForkRejectsAmbiguousLegacyFuture(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	f, trunk := seedTrunk(t, dir)
 	spec := ChannelSpec{Name: "translations/legacy-interior", Kind: ChannelLog, Opaque: true}
-	if err := f.EnsureChannel(spec); err != nil {
+	if err := f.ensureChannel(spec); err != nil {
 		t.Fatal(err)
 	}
 	_, mainLT2, err := f.Append(trunk, 0, []byte(`"turn-1"`), nil)
@@ -453,7 +453,7 @@ func TestInteriorForkRejectsAmbiguousLegacyFuture(t *testing.T) {
 	if _, err := f.ForkAt(trunk, mainLT2); !errors.Is(err, ErrTopologyIncomplete) {
 		t.Fatalf("fork error = %v, want ErrTopologyIncomplete", err)
 	}
-	if err := f.EnsureChannel(spec); !errors.Is(err, ErrTopologyIncomplete) {
+	if err := f.ensureChannel(spec); !errors.Is(err, ErrTopologyIncomplete) {
 		t.Fatalf("EnsureChannel error = %v, want ambiguous topology rejection", err)
 	}
 	if pathExists(filepath.Join(dir, forkPendingName)) {
@@ -476,7 +476,7 @@ func TestEnsureRepairsReducibleArtifactsBeforeFork(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "f")
 			f, trunk := seedTrunk(t, dir)
 			spec := ChannelSpec{Name: "turn-state", Kind: ChannelReducible, Reducer: "jsonmerge"}
-			if err := f.EnsureChannel(spec); err != nil {
+			if err := f.ensureChannel(spec); err != nil {
 				t.Fatal(err)
 			}
 			_, mainLT, err := f.Append(trunk, 0, []byte(`"turn"`), nil)
@@ -536,7 +536,7 @@ func TestEnsureRepairsReducibleArtifactsBeforeFork(t *testing.T) {
 			if _, err := f.ForkTail(trunk); err != nil {
 				t.Fatalf("fork after repairing %s: %v", fault, err)
 			}
-			if err := f.EnsureChannel(spec); err != nil {
+			if err := f.ensureChannel(spec); err != nil {
 				t.Fatalf("idempotent EnsureChannel after %s: %v", fault, err)
 			}
 			repairedBase, err := readForkBaseFile(filepath.Join(nodeDir, ".fork"))
@@ -622,7 +622,7 @@ func TestForkPreservesEmptyClearedChannelRoot(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	f, trunk := seedTrunk(t, dir)
 	spec := ChannelSpec{Name: "translations/clear", Kind: ChannelLog, Opaque: true}
-	if err := f.EnsureChannel(spec); err != nil {
+	if err := f.ensureChannel(spec); err != nil {
 		t.Fatal(err)
 	}
 	_, mainLT, err := f.Append(trunk, 0, []byte(`"turn"`), nil)

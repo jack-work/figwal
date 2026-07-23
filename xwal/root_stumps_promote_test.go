@@ -28,7 +28,7 @@ func relDirs(t *testing.T, base string) []string {
 
 func TestAddChannel_RootAndBackfill(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
-	f, err := CreateTrunks(dir, trunksCfg())
+	f, err := createTrunks(dir, trunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestAddChannel_RootAndBackfill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := x.AddChannel(ChannelSpec{Name: ch, Kind: ChannelLog}); err != nil {
+	if err := x.addChannel(ChannelSpec{Name: ch, Kind: ChannelLog}); err != nil {
 		t.Fatalf("add channel: %v", err)
 	}
 	x.Close()
@@ -152,7 +152,7 @@ func TestAddChannel_BackfillReducible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := x.AddChannel(ChannelSpec{Name: "scratch", Kind: ChannelReducible, Reducer: "jsonmerge"}); err != nil {
+	if err := x.addChannel(ChannelSpec{Name: "scratch", Kind: ChannelReducible, Reducer: "jsonmerge"}); err != nil {
 		t.Fatalf("add reducible: %v", err)
 	}
 	x.Close()
@@ -188,7 +188,7 @@ func TestAddChannel_ForkAfterBackfill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := x.AddChannel(ChannelSpec{Name: ch, Kind: ChannelLog}); err != nil {
+	if err := x.addChannel(ChannelSpec{Name: ch, Kind: ChannelLog}); err != nil {
 		t.Fatal(err)
 	}
 	x.Close()
@@ -260,7 +260,7 @@ func TestStumps_OwnerAndBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r2, _ := OpenTrunks(dir, trunksCfg())
+	r2, _ := openTrunks(dir, trunksCfg())
 	cleanupTrunks(t, r2)
 	if ti := findTrunk(r2.List(), rootTrunk); ti == nil || ti.Stump != "" {
 		t.Fatalf("loadoutless trunk should have no stump: %+v", ti)
@@ -359,7 +359,7 @@ func TestPromote_ClimbsAndStopsAtStump(t *testing.T) {
 		}
 	}
 	checkReads(f)
-	r2, _ := OpenTrunks(dir, trunksCfg())
+	r2, _ := openTrunks(dir, trunksCfg())
 	cleanupTrunks(t, r2)
 	checkReads(r2)
 	if _, isStump := parentRun(t, r2, a); !isStump {

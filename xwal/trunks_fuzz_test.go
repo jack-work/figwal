@@ -95,7 +95,7 @@ func TestForest_FuzzSequential(t *testing.T) {
 
 	// Reopen-from-disk consistency.
 	before := snapshotTrunks(t, f, trunks)
-	f2, err := OpenTrunks(dir, mapTrunksCfg())
+	f2, err := openTrunks(dir, mapTrunksCfg())
 	if err != nil {
 		t.Fatal(err)
 	}

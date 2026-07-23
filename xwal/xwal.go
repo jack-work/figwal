@@ -1028,7 +1028,7 @@ func (x *XWAL) Clear(channelName string) error {
 // forkBases are recomputed for an empty channel (every fork lands at the
 // channel's own first index), never copied from the main channel — the index
 // spaces differ. Reducible channels must name a registered reducer.
-func (x *XWAL) AddChannel(spec ChannelSpec) error {
+func (x *XWAL) addChannel(spec ChannelSpec) error {
 	if err := x.ensurePrivate(); err != nil {
 		return err
 	}

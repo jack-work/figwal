@@ -43,7 +43,21 @@ func main() {
 func registry() map[string]xwal.Reducer {
 	return map[string]xwal.Reducer{
 		"jsonmerge": {Reduce: jsonMerge, Initial: []byte("{}")},
+		"map":       xwal.MapReducer(),
 	}
+}
+
+// cliReducers binds the built-in reducers under both their registry names
+// and the conventional channel names, so legacy and new-style manifests
+// both resolve without extra flags.
+func cliReducers() map[string]xwal.Reducer {
+	out := map[string]xwal.Reducer{}
+	for name, r := range registry() {
+		out[name] = r
+	}
+	out["chalkboard"] = xwal.MapReducer()
+	out["state"] = xwal.MapReducer()
+	return out
 }
 
 // jsonMerge applies {"set":{...},"remove":[...]} to a flat JSON object.
@@ -188,25 +202,21 @@ func runXWAL(args []string) {
 			usageXWAL()
 		}
 		main := rest[0]
-		cfg := xwal.Config{Main: main, Registry: registry(), Codec: codec}
-		seen := false
+		opts := xwal.StoreOptions{Main: main, Codec: codec, Reducers: map[string]xwal.Reducer{}}
 		for _, spec := range rest[1:] {
 			name, reducer, isRed := strings.Cut(spec, ":")
-			ch := xwal.ChannelSpec{Name: name, Kind: xwal.ChannelLog}
-			if isRed {
-				ch.Kind = xwal.ChannelReducible
-				ch.Reducer = reducer
+			if !isRed {
+				continue // plain log channels auto-create on first append
 			}
-			if name == main {
-				seen = true
+			r, ok := registry()[reducer]
+			if !ok {
+				r = xwal.MapReducer()
 			}
-			cfg.Channels = append(cfg.Channels, ch)
+			opts.Reducers[name] = r
 		}
-		if !seen {
-			cfg.Channels = append([]xwal.ChannelSpec{{Name: main, Kind: xwal.ChannelLog}}, cfg.Channels...)
-		}
-		_, err := xwal.CreateTrunks(dir, cfg)
+		s, err := xwal.OpenStore(dir, opts)
 		check(err)
+		check(s.Close())
 		fmt.Printf("initialized xwal %s (main=%s); root is markerless — create stumps with `xwal stump`\n", dir, main)
 		return
 	}
@@ -227,6 +237,7 @@ func runXWAL(args []string) {
 	}
 
 	cfg := xwal.Config{Registry: registry(), SegmentSize: segSize}
+	sopts := xwal.StoreOptions{SegmentSize: segSize, Reducers: cliReducers()}
 
 	// Trunk-level verbs — these mirror figaro (a trunk is the addressable
 	// handle; appending at an interior LT forks). They operate on the joint
@@ -238,8 +249,9 @@ func runXWAL(args []string) {
 		if len(pos) < 1 || len(pos) > 2 {
 			usageXWAL()
 		}
-		f, err := xwal.OpenTrunks(dir, cfg)
+		f, err := xwal.OpenStore(dir, sopts)
 		check(err)
+		defer f.Close()
 		check(f.CreateStump(pos[0]))
 		if len(pos) == 2 {
 			sx, err := f.StumpHead(pos[0])
@@ -255,16 +267,18 @@ func runXWAL(args []string) {
 		if len(pos) != 1 {
 			usageXWAL()
 		}
-		f, err := xwal.OpenTrunks(dir, cfg)
+		f, err := xwal.OpenStore(dir, sopts)
 		check(err)
+		defer f.Close()
 		id, err := f.SpawnUnderStump(pos[0])
 		check(err)
 		fmt.Printf("spawned trunk %s under stump %q\n", id, pos[0])
 		return
 	case "spawn-root":
 		// spawn-root <dir>  — mint a top-level trunk directly under the root.
-		f, err := xwal.OpenTrunks(dir, cfg)
+		f, err := xwal.OpenStore(dir, sopts)
 		check(err)
+		defer f.Close()
 		id, err := f.SpawnUnderRoot()
 		check(err)
 		fmt.Printf("spawned trunk %s under root\n", id)
@@ -278,8 +292,9 @@ func runXWAL(args []string) {
 		if len(pos) == 2 {
 			levels = int(mustU64(pos[1]))
 		}
-		f, err := xwal.OpenTrunks(dir, cfg)
+		f, err := xwal.OpenStore(dir, sopts)
 		check(err)
+		defer f.Close()
 		climbed, err := f.Promote(pos[0], levels)
 		if err == xwal.ErrAtStump {
 			fmt.Printf("trunk %s is rooted at a stump — cannot promote further\n", pos[0])
@@ -288,26 +303,10 @@ func runXWAL(args []string) {
 		check(err)
 		fmt.Printf("promoted trunk %s by %d level(s)\n", pos[0], climbed)
 		return
-	case "add-channel":
-		// add-channel <dir> <name[:reducer]>  — add + backfill a channel.
-		if len(pos) != 1 {
-			usageXWAL()
-		}
-		name, reducer, isRed := strings.Cut(pos[0], ":")
-		spec := xwal.ChannelSpec{Name: name, Kind: xwal.ChannelLog}
-		if isRed {
-			spec.Kind = xwal.ChannelReducible
-			spec.Reducer = reducer
-		}
-		x, err := xwal.Open(dir, cfg)
-		check(err)
-		check(x.AddChannel(spec))
-		x.Close()
-		fmt.Printf("added + backfilled channel %q\n", name)
-		return
 	case "stumps":
-		f, err := xwal.OpenTrunks(dir, cfg)
+		f, err := xwal.OpenStore(dir, sopts)
 		check(err)
+		defer f.Close()
 		for _, s := range f.Stumps() {
 			fmt.Printf("  %-24s  children=%v\n", s.Name, s.Children)
 		}
@@ -317,22 +316,29 @@ func runXWAL(args []string) {
 			usageXWAL()
 		}
 		trunk, at := parseTrunkLT(pos[0])
-		f, err := xwal.OpenTrunks(dir, cfg)
+		f, err := xwal.OpenStore(dir, sopts)
 		check(err)
-		res, lt, err := f.Append(trunk, at, []byte(pos[1]), nil)
+		defer f.Close()
+		target := trunk
+		if at > 0 {
+			target, err = f.Fork(trunk, at)
+			check(err)
+		}
+		_, lt, err := f.Trunks.Append(target, 0, []byte(pos[1]), nil)
 		check(err)
-		if res == trunk {
+		if target == trunk {
 			fmt.Printf("appended to trunk %s @ main-lt %d\n", trunk, lt)
 		} else {
-			fmt.Printf("forked trunk %s -> new trunk %s @ main-lt %d (existing trunk retained)\n", trunk, res, lt)
+			fmt.Printf("forked trunk %s -> new trunk %s @ main-lt %d (existing trunk retained)\n", trunk, target, lt)
 		}
 		return
 	case "fork":
 		if len(pos) != 1 {
 			usageXWAL()
 		}
-		f, err := xwal.OpenTrunks(dir, cfg)
+		f, err := xwal.OpenStore(dir, sopts)
 		check(err)
+		defer f.Close()
 		alt, err := f.ForkTail(pos[0])
 		check(err)
 		fmt.Printf("fork-tail %s -> trunk %s continues (new head), new alternative trunk %s\n", pos[0], pos[0], alt)
@@ -343,9 +349,10 @@ func runXWAL(args []string) {
 		if len(pos) != 3 {
 			usageXWAL()
 		}
-		f, err := xwal.OpenTrunks(dir, cfg)
+		f, err := xwal.OpenStore(dir, sopts)
 		check(err)
-		ch := reducibleChannel(f, pos[0])
+		defer f.Close()
+		ch := reducibleChannel(f.Trunks, pos[0])
 		patch, err := xwal.MapSetPatch(splitPath(pos[1]), jsonOrString(pos[2]))
 		check(err)
 		lt, err := f.AppendChannel(pos[0], ch, setMainLT(mainLT), patch, nil)
@@ -356,9 +363,10 @@ func runXWAL(args []string) {
 		if len(pos) != 2 {
 			usageXWAL()
 		}
-		f, err := xwal.OpenTrunks(dir, cfg)
+		f, err := xwal.OpenStore(dir, sopts)
 		check(err)
-		ch := reducibleChannel(f, pos[0])
+		defer f.Close()
+		ch := reducibleChannel(f.Trunks, pos[0])
 		patch, err := xwal.MapRemovePatch(splitPath(pos[1]))
 		check(err)
 		lt, err := f.AppendChannel(pos[0], ch, setMainLT(mainLT), patch, nil)
@@ -367,8 +375,9 @@ func runXWAL(args []string) {
 		return
 	case "state":
 		if len(pos) == 1 { // trunk-level folded reducible state
-			f, err := xwal.OpenTrunks(dir, cfg)
+			f, err := xwal.OpenStore(dir, sopts)
 			check(err)
+			defer f.Close()
 			x, err := f.Head(pos[0])
 			check(err)
 			defer x.Close()
@@ -380,19 +389,22 @@ func runXWAL(args []string) {
 			return
 		}
 	case "trunks":
-		f, err := xwal.OpenTrunks(dir, cfg)
+		f, err := xwal.OpenStore(dir, sopts)
 		check(err)
-		printTrunks(f)
+		defer f.Close()
+		printTrunks(f.Trunks)
 		return
 	case "nodes":
-		f, err := xwal.OpenTrunks(dir, cfg)
+		f, err := xwal.OpenStore(dir, sopts)
 		check(err)
-		printNodes(f)
+		defer f.Close()
+		printNodes(f.Trunks)
 		return
 	case "dump":
 		if len(pos) == 1 { // dump a trunk (by id)
-			f, err := xwal.OpenTrunks(dir, cfg)
+			f, err := xwal.OpenStore(dir, sopts)
 			check(err)
+			defer f.Close()
 			x, err := f.Head(pos[0])
 			check(err)
 			defer x.Close()
@@ -772,10 +784,9 @@ trunk verbs (mirror figaro — a trunk is the addressable handle; no attendance)
   stumps                          list stumps and their trunk children
   promote <trunk> [levels]        climb a trunk up N stump-bounded levels by
                                   relabeling .trunk markers (stops at a stump)
-  add-channel <name[:reducer]>    add + backfill a channel (mirrors the main tree)
-  send  <trunk>[:<LT>] <data>     append to a trunk; <LT> < tail FORKS a new trunk
-                                  there and appends (existing trunk retained), else
-                                  appends at the tail
+  send  <trunk>[:<LT>] <data>     append to a trunk's tail; with <LT>, fork a new
+                                  trunk there first and append to it (channels
+                                  auto-create on first append)
   fork  <trunk>                   tail-only: bisect the present (trunk continues on a
                                   new head; a new alternative trunk is founded)
   set   <trunk> <dot.path> <val>  set a nested value in the trunk's reducible map;
