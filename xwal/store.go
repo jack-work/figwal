@@ -54,6 +54,7 @@ func OpenStore(root string, opts StoreOptions) (*Store, error) {
 		return nil, err
 	}
 	cfg := opts.config()
+	wasUnclean := pathExists(uncleanPath(root))
 	var t *Trunks
 	if pathExists(filepath.Join(root, manifestName)) {
 		t, err = OpenTrunks(root, cfg)
@@ -61,6 +62,18 @@ func OpenStore(root string, opts StoreOptions) (*Store, error) {
 		t, err = CreateTrunks(root, cfg)
 	}
 	if err != nil {
+		unlockRoot(lockFile)
+		return nil, err
+	}
+	if wasUnclean {
+		if err := repairCoherentCuts(t); err != nil {
+			t.Close()
+			unlockRoot(lockFile)
+			return nil, err
+		}
+	}
+	if err := markUnclean(root); err != nil {
+		t.Close()
 		unlockRoot(lockFile)
 		return nil, err
 	}
@@ -259,6 +272,9 @@ func (s *Store) Close() error {
 		<-s.done
 		s.flushDirty()
 		s.closeErr = s.Trunks.Close()
+		if s.closeErr == nil {
+			s.closeErr = clearUnclean(s.Trunks.root)
+		}
 		if err := unlockRoot(s.lockFile); err != nil && s.closeErr == nil {
 			s.closeErr = err
 		}
