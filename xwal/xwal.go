@@ -249,7 +249,7 @@ func open(dir string, cfg Config, store *log.Store, branch ...string) (*XWAL, er
 		switch mc.Kind {
 		case "reducible":
 			ch.kind = ChannelReducible
-			r, ok := resolveReducer(cfg, mc.Reducer)
+			r, ok := resolveReducer(cfg, mc.Reducer, mc.Name)
 			if !ok || r.Reduce == nil {
 				return nil, fmt.Errorf("xwal: no reducer %q registered for channel %q", mc.Reducer, mc.Name)
 			}
@@ -423,7 +423,7 @@ func prepareInitialChannels(dir string, cfg Config, m manifest) error {
 		if mc.Kind != ChannelReducible.String() {
 			continue
 		}
-		reducer, ok := resolveReducer(cfg, mc.Reducer)
+		reducer, ok := resolveReducer(cfg, mc.Reducer, mc.Name)
 		if !ok || reducer.Reduce == nil {
 			return fmt.Errorf("xwal: no reducer %q registered for channel %q", mc.Reducer, mc.Name)
 		}
@@ -461,7 +461,7 @@ func validateChannelSpec(root string, cfg Config, man manifest, spec ChannelSpec
 		if spec.Reducer == "" {
 			return fmt.Errorf("xwal: reducible channel %q needs a reducer name", spec.Name)
 		}
-		reducer, ok := resolveReducer(cfg, spec.Reducer)
+		reducer, ok := resolveReducer(cfg, spec.Reducer, spec.Name)
 		if !ok || reducer.Reduce == nil {
 			return fmt.Errorf("xwal: no reducer %q registered for channel %q", spec.Reducer, spec.Name)
 		}
@@ -612,7 +612,7 @@ func channelFromManifest(cfg Config, mc manifestChannel) (*channel, error) {
 		return ch, nil
 	}
 	ch.kind = ChannelReducible
-	reducer, ok := resolveReducer(cfg, ch.rname)
+	reducer, ok := resolveReducer(cfg, ch.rname, ch.name)
 	if !ok || reducer.Reduce == nil {
 		return nil, fmt.Errorf("xwal: no reducer %q registered for channel %q", ch.rname, ch.name)
 	}
@@ -1052,7 +1052,7 @@ func (x *XWAL) addChannel(spec ChannelSpec) error {
 		name: spec.Name, kind: spec.Kind, rname: spec.Reducer, opaque: spec.Opaque,
 	}
 	if spec.Kind == ChannelReducible {
-		r, ok := resolveReducer(x.cfg, spec.Reducer)
+		r, ok := resolveReducer(x.cfg, spec.Reducer, spec.Name)
 		if !ok || r.Reduce == nil {
 			return fmt.Errorf("xwal: no reducer %q registered for channel %q", spec.Reducer, spec.Name)
 		}

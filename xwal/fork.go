@@ -287,7 +287,7 @@ func recoverFork(root string, cfg Config, man manifest, plan forkPlan) error {
 			SegmentSize: cfg.SegmentSize,
 		}
 		if mc.Kind == "reducible" {
-			r, ok := resolveReducer(cfg, mc.Reducer)
+			r, ok := resolveReducer(cfg, mc.Reducer, mc.Name)
 			if !ok || r.Reduce == nil {
 				return nil, nil, fmt.Errorf("no reducer %q for channel %q", mc.Reducer, e.Name)
 			}
