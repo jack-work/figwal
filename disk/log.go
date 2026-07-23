@@ -798,6 +798,42 @@ func (l *Log) loadSegments() error {
 			l.sealed = append(l.sealed, s)
 		}
 	}
+	return l.reseedEmptyActiveHeader()
+}
+
+// reseedEmptyActiveHeader repairs a crash artifact: a rotation can die
+// between creating the next active segment and writing its watermark
+// header, leaving a zero-frame file. Without the header, the next
+// append's record would be misread as the watermark on a later open,
+// silently swallowing it and shifting every subsequent index down one.
+func (l *Log) reseedEmptyActiveHeader() error {
+	if l.opts.OnSegmentOpen == nil || l.active == nil || l.readOnly ||
+		l.active.Count() != 0 || l.active.Size() != 0 || l.active.ReadOnly() {
+		return nil
+	}
+	var prevHeader []byte
+	var sealed [][]byte
+	if n := len(l.sealed); n > 0 {
+		prev := l.sealed[n-1]
+		prevHeader = prev.Header()
+		var err error
+		sealed, err = segPayloads(prev)
+		if err != nil {
+			return err
+		}
+	}
+	header, err := l.opts.OnSegmentOpen(prevHeader, sealed)
+	if err != nil {
+		return err
+	}
+	if err := l.active.WriteHeader(header); err != nil {
+		return err
+	}
+	if err := l.active.Sync(); err != nil {
+		return err
+	}
+	slog.Warn("log repaired headerless active segment",
+		"dir", l.dir, "base", l.active.BaseIndex())
 	return nil
 }
 

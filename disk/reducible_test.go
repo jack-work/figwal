@@ -2,6 +2,8 @@ package disk
 
 import (
 	"encoding/binary"
+	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -316,4 +318,87 @@ func TestReducible_Fork(t *testing.T) {
 			t.Fatalf("old-future state at %d = %d, want %d", n, got, want)
 		}
 	}
+}
+
+func TestReopenRepairsHeaderlessActiveSegment(t *testing.T) {
+	dir := t.TempDir()
+	fold := func(prev []byte, sealed [][]byte) ([]byte, error) {
+		if len(sealed) == 0 {
+			if prev == nil {
+				return []byte(`{}`), nil
+			}
+			return prev, nil
+		}
+		return sealed[len(sealed)-1], nil
+	}
+	opts := Options{Codec: segment.JSONLCodec{}, SegmentSize: 256, OnSegmentOpen: fold}
+	l, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := func(i uint64) []byte { return []byte(fmt.Sprintf(`{"i":%d,"pad":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}`, i)) }
+	last := uint64(0)
+	for i := uint64(1); len(l.SegmentBaseIndexes()) < 3; i++ {
+		if err := l.Write(i, payload(i)); err != nil {
+			t.Fatal(err)
+		}
+		last = i
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a crash between rotation's segment.Create and WriteHeader:
+	// the newest segment file exists but is empty.
+	bases := func() []uint64 {
+		l2, err := Open(dir, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l2.Close()
+		return l2.SegmentBaseIndexes()
+	}()
+	newest := bases[len(bases)-1]
+	newestPath := filepath.Join(dir, fmt.Sprintf("%020d.jsonl", newest))
+	if err := os.Truncate(newestPath, 0); err != nil {
+		t.Fatal(err)
+	}
+	lostFrom := newest // entries in the emptied segment are gone (crash-lost)
+
+	l3, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := l3.LastIndex(); got != lostFrom-1 {
+		l3.Close()
+		t.Fatalf("tail after crash artifact: %d, want %d", got, lostFrom-1)
+	}
+	newA := payload(900)
+	newB := payload(901)
+	if err := l3.Write(lostFrom, newA); err != nil {
+		t.Fatal(err)
+	}
+	if err := l3.Write(lostFrom+1, newB); err != nil {
+		t.Fatal(err)
+	}
+	if err := l3.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	l4, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l4.Close()
+	if got := l4.LastIndex(); got != lostFrom+1 {
+		t.Fatalf("tail after reopen: %d, want %d (record swallowed as header?)", got, lostFrom+1)
+	}
+	gotA, err := l4.Read(lostFrom)
+	if err != nil || string(gotA) != string(newA) {
+		t.Fatalf("entry %d shifted: %s err=%v", lostFrom, gotA, err)
+	}
+	if _, err := l4.StateAt(lostFrom); err != nil {
+		t.Fatalf("StateAt over repaired segment: %v", err)
+	}
+	_ = last
 }
