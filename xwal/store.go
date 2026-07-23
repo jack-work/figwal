@@ -11,14 +11,15 @@ import (
 )
 
 type StoreOptions struct {
-	Main          string
-	FlushInterval time.Duration
-	Reducers      map[string]Reducer
-	Opaque        []string
-	Codec         string
-	SegmentSize   int64
-	Genesis       []byte
-	MintTrunkID   func() string
+	Main              string
+	FlushInterval     time.Duration
+	MaxUnflushedBytes int64
+	Reducers          map[string]Reducer
+	Opaque            []string
+	Codec             string
+	SegmentSize       int64
+	Genesis           []byte
+	MintTrunkID       func() string
 }
 
 type Store struct {
@@ -139,12 +140,13 @@ func (s *Store) flushLineage(trunk string) error {
 
 func (o StoreOptions) config() Config {
 	cfg := Config{
-		Main:        o.Main,
-		Registry:    o.Reducers,
-		Codec:       o.Codec,
-		SegmentSize: o.SegmentSize,
-		Genesis:     o.Genesis,
-		MintTrunkID: o.MintTrunkID,
+		Main:              o.Main,
+		Registry:          o.Reducers,
+		Codec:             o.Codec,
+		SegmentSize:       o.SegmentSize,
+		MaxUnflushedBytes: o.MaxUnflushedBytes,
+		Genesis:           o.Genesis,
+		MintTrunkID:       o.MintTrunkID,
 	}
 	opaque := make(map[string]bool, len(o.Opaque))
 	for _, name := range o.Opaque {

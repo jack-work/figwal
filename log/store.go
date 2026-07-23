@@ -112,7 +112,7 @@ func (s *Store) open(abs string, opts Options) (*Log, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := &Log{inner: inner, shared: true}
+	l := &Log{inner: inner, shared: true, maxLag: maxLagFor(opts)}
 	l.snap.Store(snap)
 	return l, nil
 }

@@ -44,15 +44,19 @@ type Options = disk.Options
 // shares the underlying entry array), and the child gets a fresh
 // snapshot whose parent pointer is the truncated trunk. Sibling forks
 // share parent state by pointer.
+const defaultMaxUnflushedBytes = 64 << 20
+
 type Log struct {
 	inner  *disk.Log
 	wmu    sync.Mutex
 	fmu    sync.Mutex
 	snap   atomic.Pointer[cacheSnapshot]
 	shared bool
+	maxLag int64
 
 	pending      [][]byte
 	pendingFirst uint64
+	pendingBytes int64
 }
 
 func (s *cacheSnapshot) scanFromEnd(from uint64, fn func(idx uint64, payload []byte) error) error {
@@ -105,7 +109,7 @@ func Open(dir string, opts Options) (*Log, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := &Log{inner: inner}
+	l := &Log{inner: inner, maxLag: maxLagFor(opts)}
 	snap, err := buildSnapshotFromDisk(inner)
 	if err != nil {
 		inner.Close()
@@ -190,9 +194,30 @@ func (l *Log) LastIndex() uint64 {
 	return 0
 }
 
+func maxLagFor(opts Options) int64 {
+	if opts.MaxUnflushedBytes > 0 {
+		return opts.MaxUnflushedBytes
+	}
+	return defaultMaxUnflushedBytes
+}
+
 // Write appends an entry to the in-memory snapshot and buffers it for
-// the next Flush. It returns without touching disk.
+// the next Flush. It touches disk only when the unflushed lag exceeds
+// the byte bound, in which case it flushes inline before returning.
 func (l *Log) Write(idx uint64, payload []byte) error {
+	if err := l.write(idx, payload); err != nil {
+		return err
+	}
+	l.wmu.Lock()
+	over := l.pendingBytes > l.maxLag
+	l.wmu.Unlock()
+	if over {
+		return l.FlushTo(idx)
+	}
+	return nil
+}
+
+func (l *Log) write(idx uint64, payload []byte) error {
 	l.wmu.Lock()
 	defer l.wmu.Unlock()
 
@@ -220,6 +245,7 @@ func (l *Log) Write(idx uint64, payload []byte) error {
 		l.pendingFirst = idx
 	}
 	l.pending = append(l.pending, cp)
+	l.pendingBytes += int64(len(cp))
 	l.snap.Store(&cacheSnapshot{
 		firstIdx: firstIdx,
 		entries:  entries,
@@ -235,6 +261,9 @@ func (l *Log) Write(idx uint64, payload []byte) error {
 func (l *Log) Flush() error { return l.FlushTo(^uint64(0)) }
 
 // FlushTo persists buffered entries with index <= target and fsyncs.
+// The buffer is trimmed only after the fsync succeeds, so a failed
+// flush retries safely: entries that did reach disk before the failure
+// are skipped on the next attempt.
 func (l *Log) FlushTo(target uint64) error {
 	l.fmu.Lock()
 	defer l.fmu.Unlock()
@@ -252,8 +281,13 @@ func (l *Log) FlushTo(target uint64) error {
 	if n == 0 {
 		return nil
 	}
+	durable := l.inner.LastIndex()
 	for i, p := range batch {
-		if err := l.inner.Write(first+uint64(i), p); err != nil {
+		idx := first + uint64(i)
+		if idx <= durable {
+			continue
+		}
+		if err := l.inner.Write(idx, p); err != nil {
 			return err
 		}
 	}
@@ -263,6 +297,9 @@ func (l *Log) FlushTo(target uint64) error {
 	l.wmu.Lock()
 	l.pending = l.pending[n:]
 	l.pendingFirst = first + uint64(n)
+	for _, p := range batch {
+		l.pendingBytes -= int64(len(p))
+	}
 	l.wmu.Unlock()
 	return nil
 }

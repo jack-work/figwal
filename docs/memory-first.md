@@ -2,14 +2,16 @@
 
 The store is an in-memory append-only WAL; disk is a follower with bounded
 lag. One writer goroutine per store persists dirty lineages on a timer.
-Appends never block on disk.
+Appends block on disk only when a channel's unflushed lag exceeds
+MaxUnflushedBytes; the over-cap append performs an inline bounded flush.
 
 ## Surface (the whole thing a client sees)
 
 ```go
 s, err := xwal.OpenStore(root, xwal.StoreOptions{
-    FlushInterval: time.Second,            // loss window; 0 = default 1s
-    Reducers:      map[string]Reducer{…},  // reducible channels only
+    FlushInterval:     time.Second,            // loss window; 0 = default 1s
+    MaxUnflushedBytes: 64 << 20,               // lag bound per channel; 0 = default 64MB
+    Reducers:          map[string]Reducer{…},  // reducible channels only
 })
 
 lt, err := s.Append(trunk, channel, mainLT, payload, meta)
@@ -29,6 +31,9 @@ No sync modes. No EnsureChannel. No journal types. No per-channel policy.
 ## Contract
 
 - Append durability: within FlushInterval of the append (sooner after Kick).
+- Flush lag is bounded in bytes as well as time: a channel never holds more
+  than MaxUnflushedBytes of unflushed entries; the append that would exceed
+  the bound flushes inline (brief, bounded block) instead of growing it.
 - Cooperative shutdown (Close) loses nothing.
 - Hard crash loses at most the flush lag; what survives is a
   lineage-coherent prefix: a related-channel record never survives without

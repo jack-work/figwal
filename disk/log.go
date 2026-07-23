@@ -33,6 +33,9 @@ var (
 type Options struct {
 	SegmentSize int64                // 0 = default
 	Codec       segment.SegmentCodec // nil = segment.BinaryCodec{}
+	// MaxUnflushedBytes bounds the caller-side write buffer (used by the
+	// caching log wrapper, ignored here); 0 = its default.
+	MaxUnflushedBytes int64
 	// Parent, if non-nil, is the log this dir was forked from. When nil
 	// and the dir contains a .fork marker file, Open auto-walks `..` to
 	// resolve the parent. Use a Store if you need to deduplicate parent

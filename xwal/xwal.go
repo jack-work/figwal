@@ -72,8 +72,9 @@ type Config struct {
 	Main        string
 	Channels    []ChannelSpec
 	Registry    map[string]Reducer
-	Codec       string // "jsonl" (default) | "binary"; persisted in the manifest
-	SegmentSize int64
+	Codec             string // "jsonl" (default) | "binary"; persisted in the manifest
+	SegmentSize       int64
+	MaxUnflushedBytes int64
 	// Genesis is the main-channel genesis payload written by CreateTrunks
 	// (the root trunk's first entry, which every trunk inherits). Lets the
 	// caller use its own genesis encoding instead of the default marker.
@@ -248,7 +249,9 @@ func open(dir string, cfg Config, store *log.Store, branch ...string) (*XWAL, er
 		default:
 			ch.kind = ChannelLog
 		}
-		opts := disk.Options{Codec: codec, SegmentSize: cfg.SegmentSize}
+		opts := disk.Options{
+			Codec: codec, SegmentSize: cfg.SegmentSize, MaxUnflushedBytes: cfg.MaxUnflushedBytes,
+		}
 		if ch.kind == ChannelReducible {
 			opts.OnSegmentOpen = reducibleFold(ch.reduce, ch.initial)
 		}
@@ -955,7 +958,9 @@ func (x *XWAL) channelTopologyNeedsRepair(ch *channel) (bool, error) {
 }
 
 func (x *XWAL) channelOpts(ch *channel) disk.Options {
-	opts := disk.Options{Codec: x.codec, SegmentSize: x.cfg.SegmentSize}
+	opts := disk.Options{
+		Codec: x.codec, SegmentSize: x.cfg.SegmentSize, MaxUnflushedBytes: x.cfg.MaxUnflushedBytes,
+	}
 	if ch.kind == ChannelReducible {
 		opts.OnSegmentOpen = reducibleFold(ch.reduce, ch.initial)
 	}
