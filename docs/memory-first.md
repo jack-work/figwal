@@ -38,8 +38,10 @@ No sync modes. No EnsureChannel. No journal types. No per-channel policy.
 - Cooperative shutdown (Close) loses nothing.
 - Hard crash loses at most the flush lag; what survives is a
   lineage-coherent prefix: a related-channel record never survives without
-  the main-channel record it references, and a reducible watermark never
-  runs ahead of its main channel.
+  the main-channel record it references. Reducible channels get exactly
+  one turn of slack: a patch keyed one ahead of the main tail (the
+  upcoming-turn convention) is durable within the flush bound and
+  survives a crash; anything further ahead is trimmed at open.
 - Open repairs before serving: crash artifacts are always repaired —
   interrupted fork/channel plans are consumed (rolled back to the pre-fork
   layout, then re-applied, trunk markers included), torn active-segment

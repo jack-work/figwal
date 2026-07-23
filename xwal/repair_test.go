@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/jack-work/figwal/segment"
 )
@@ -92,8 +93,10 @@ func TestOpenRepairsIncoherentLineage(t *testing.T) {
 	if err != nil || !ok || string(rec.Payload) != "wire" {
 		t.Fatalf("translations kept LT: %+v ok=%v err=%v", rec, ok, err)
 	}
-	if _, ok, err := s2.Lookup(tr, "chalkboard", lost); err != nil || ok {
-		t.Fatalf("chalkboard patch for lost main LT survived: ok=%v err=%v", ok, err)
+	// Reducible one-ahead convention: the patch keyed to the lost turn is
+	// exactly one ahead of the recovered main tail, so it SURVIVES.
+	if _, ok, err := s2.Lookup(tr, "chalkboard", lost); err != nil || !ok {
+		t.Fatalf("one-ahead chalkboard patch should survive: ok=%v err=%v", ok, err)
 	}
 	chans, err := s2.Channels(tr)
 	if err != nil {
@@ -107,8 +110,8 @@ func TestOpenRepairsIncoherentLineage(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := field(t, state, "turn"); got != itoa(kept) {
-			t.Fatalf("chalkboard state ahead of main: turn=%s want %s", got, itoa(kept))
+		if got := field(t, state, "turn"); got != itoa(lost) {
+			t.Fatalf("chalkboard one-ahead patch not folded: turn=%s want %s", got, itoa(lost))
 		}
 	}
 	lt, err := s2.Append(tr, "ir", 0, []byte(`{"turn":99}`), nil)
@@ -131,5 +134,58 @@ func TestCleanCloseSkipsRepairMarker(t *testing.T) {
 	}
 	if pathExists(uncleanPath(dir)) {
 		t.Fatal("clean close left the unclean marker")
+	}
+}
+
+func TestOneAheadPatchDurableAndCrashSafe(t *testing.T) {
+	dir := t.TempDir()
+	opts := testStoreOptions()
+	opts.FlushInterval = 20 * time.Millisecond
+	s, err := OpenStore(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := s.SpawnUnderRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch, _ := MapSetPatch([]string{"boot"}, []byte(`"sentinel-boot-value"`))
+	clt, err := s.Append(tr, "chalkboard", 0, patch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 5*time.Second, "one-ahead patch on disk", func() bool {
+		found := false
+		filepath.Walk(filepath.Join(dir, "chalkboard"), func(p string, info os.FileInfo, err error) error {
+			if err == nil && !info.IsDir() {
+				if b, rerr := os.ReadFile(p); rerr == nil && containsBytes(b, []byte("sentinel-boot-value")) {
+					found = true
+				}
+			}
+			return nil
+		})
+		return found
+	})
+
+	// Simulated SIGKILL: stop the flusher, drop the flock, abandon the
+	// store without Close (.unclean stays, triggering open repair).
+	close(s.stop)
+	<-s.done
+	if err := unlockRoot(s.lockFile); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := OpenStore(dir, testStoreOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	state, err := s2.StateAt(tr, "chalkboard", clt)
+	if err != nil {
+		t.Fatalf("one-ahead patch lost to crash: %v", err)
+	}
+	if got := field(t, state, "boot"); got != `"sentinel-boot-value"` {
+		t.Fatalf("state after crash = %s", state)
 	}
 }

@@ -1680,13 +1680,20 @@ func (x *XWAL) flushCoherent() error {
 	return nil
 }
 
-// coherentTarget is the highest pending index whose record references a
-// main-LT at or below mainTail. Records are main-LT-non-decreasing, so
-// everything at or below it is safe to persist.
+// coherentTarget is the highest pending index whose record may persist
+// under the lineage cut: main-LT at or below mainTail, plus exactly one
+// ahead for reducible channels (the one-ahead patch convention — a
+// patch for the upcoming turn is durable within the flush bound and the
+// open-time trim preserves the same slack). Records are main-LT-non-
+// decreasing, so everything at or below the target is safe.
 func coherentTarget(ch *channel, mainTail uint64) (uint64, error) {
 	first, last, ok := ch.log.PendingBounds()
 	if !ok {
 		return 0, nil
+	}
+	limit := mainTail
+	if ch.kind == ChannelReducible {
+		limit++
 	}
 	for idx := last; idx >= first; idx-- {
 		f, err := ch.log.Read(idx)
@@ -1697,7 +1704,7 @@ func coherentTarget(ch *channel, mainTail uint64) (uint64, error) {
 		if err != nil {
 			return 0, err
 		}
-		if m <= mainTail {
+		if m <= limit {
 			return idx, nil
 		}
 		if idx == first {
