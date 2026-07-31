@@ -17,12 +17,12 @@ import (
 // Frozen is derived (len(Children) > 0), never stored, so it cannot disagree
 // with the forest.
 type NodeInfo struct {
-	Branch   []string // path segments; key is strings.Join(Branch, "/")
-	Trunk    string   // owning trunk id; "" for the root and for stumps
-	Parent   string   // parent key; "" for the root
-	Children []string // child keys
-	IsRoot   bool
-	IsStump  bool // markerless depth-1 child of the root (cauterization boundary)
+	Branch   []string `json:"branch"`             // key is strings.Join(Branch, "/")
+	Trunk    string   `json:"trunk,omitempty"`    // "" for the root and for stumps
+	Parent   string   `json:"parent"`             // "" for the root
+	Children []string `json:"children,omitempty"`
+	IsRoot   bool     `json:"root,omitempty"`
+	IsStump  bool     `json:"stump,omitempty"` // markerless depth-1 child of the root
 }
 
 func (n *NodeInfo) Frozen() bool { return len(n.Children) > 0 }
@@ -59,7 +59,6 @@ func (n *NodeInfo) stumpName() string {
 type TopologyIndex interface {
 	Node(key string) (*NodeInfo, bool)
 	Head(trunk string) (key string, ok bool)
-	Walk(func(key string, n *NodeInfo) bool)
 	// All is a point-in-time copy, for the cold paths that iterate the forest
 	// (promote, remove, lineage). Hot paths use Node/Head.
 	All() map[string]*NodeInfo
@@ -68,7 +67,6 @@ type TopologyIndex interface {
 	Version() uint64
 
 	Spawn(parent, child, trunk string, isStump bool) error
-	Reassign(trunkByNodeKey map[string]string) error
 	Drop(nodeKeys, trunkIDs []string) error
 	RebuildFrom(mainDir string) error
 
@@ -127,20 +125,6 @@ func (m *memIndex) Head(trunk string) (string, bool) {
 	return k, ok
 }
 
-func (m *memIndex) Walk(fn func(string, *NodeInfo) bool) {
-	m.mu.RLock()
-	snapshot := make(map[string]*NodeInfo, len(m.nodes))
-	for k, v := range m.nodes {
-		snapshot[k] = v
-	}
-	m.mu.RUnlock()
-	for k, v := range snapshot {
-		if !fn(k, v) {
-			return
-		}
-	}
-}
-
 func (m *memIndex) All() map[string]*NodeInfo {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -193,27 +177,6 @@ func (m *memIndex) Spawn(parent, child, trunk string, isStump bool) error {
 		m.heads[trunk] = child
 	}
 	m.bumpSeqsLocked(child, trunk)
-	m.version.Add(1)
-	return nil
-}
-
-func (m *memIndex) Reassign(trunkByNodeKey map[string]string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	touched := map[string]bool{}
-	for key, trunk := range trunkByNodeKey {
-		n := m.nodes[key]
-		if n == nil {
-			return fmt.Errorf("xwal: reassign unknown node %q", key)
-		}
-		touched[n.Trunk], touched[trunk] = true, true
-		n.Trunk = trunk
-	}
-	for trunk := range touched {
-		if trunk != "" {
-			m.reheadLocked(trunk)
-		}
-	}
 	m.version.Add(1)
 	return nil
 }

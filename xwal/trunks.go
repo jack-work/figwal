@@ -1832,7 +1832,7 @@ func (t *Trunks) List() []TrunkInfo {
 		return nil
 	}
 	defer endRead()
-	ids := t.orderedTrunkIDsLocked()
+	ids := t.idx.LiveTrunks()
 	out := make([]TrunkInfo, 0, len(ids))
 	for _, id := range ids {
 		unlockLineage := t.lockLineage(id)
@@ -1902,7 +1902,7 @@ func (t *Trunks) ListLight() []TrunkInfo {
 	}
 	defer endRead()
 	out := make([]TrunkInfo, 0, len(t.idx.LiveTrunks()))
-	for _, id := range t.orderedTrunkIDsLocked() {
+	for _, id := range t.idx.LiveTrunks() {
 		key := t.head(id)
 		ti := TrunkInfo{ID: id, Head: t.node(key).Branch}
 		ti.Parent, ti.Stump, ti.BranchedLT = t.lineage(id)
@@ -1911,9 +1911,6 @@ func (t *Trunks) ListLight() []TrunkInfo {
 	return out
 }
 
-// orderedTrunkIDsLocked returns live trunk ids in stable display order.
-// Caller holds t.mu.
-func (t *Trunks) orderedTrunkIDsLocked() []string { return t.idx.LiveTrunks() }
 
 // Nodes returns every node (debug), root first. NodeInfo lives in
 // topology_index.go; Frozen is a method there, derived from Children.
