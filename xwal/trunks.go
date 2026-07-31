@@ -1751,12 +1751,15 @@ func (t *Trunks) Stumps() []StumpInfo {
 	}
 	defer endRead()
 	var out []StumpInfo
-	for _, n := range t.idx.All() {
+	for key, n := range t.idx.All() {
 		if n.Kind != "loadout" {
 			continue
 		}
-		si := StumpInfo{Name: n.stumpName()}
-		for _, ck := range t.idx.ChildrenOf(n.stumpName()) {
+		// Range the key: a loadout node is named by its key, and recovering
+		// it from stumpName() returns "" for an empty Branch, which then
+		// asks for the ROOT's children.
+		si := StumpInfo{Name: key}
+		for _, ck := range t.idx.ChildrenOf(key) {
 			if c := t.node(ck); c != nil && c.Trunk != "" {
 				si.Children = append(si.Children, c.Trunk)
 			}

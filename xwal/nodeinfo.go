@@ -2,7 +2,6 @@ package xwal
 
 // NodeInfo is one node of the fork forest. Treat it as immutable: readers may
 // hold it while a mutation runs.
-
 type NodeInfo struct {
 	Branch []string `json:"branch"`          // key is strings.Join(Branch, "/")
 	Trunk  string   `json:"trunk,omitempty"` // "" for the root and for stumps
