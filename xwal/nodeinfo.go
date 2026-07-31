@@ -11,7 +11,6 @@ type NodeInfo struct {
 	Parent   string   `json:"parent"`          // "" for the root
 	Children []string `json:"children,omitempty"`
 	IsRoot   bool     `json:"root,omitempty"`
-	IsStump  bool     `json:"stump,omitempty"` // markerless depth-1 child of the root
 
 	// Flat lineage. From is the node forked from; empty only for the root.
 	From string `json:"from,omitempty"`
@@ -21,7 +20,7 @@ type NodeInfo struct {
 func (n *NodeInfo) Frozen() bool { return len(n.Children) > 0 }
 
 func (n *NodeInfo) stumpName() string {
-	if n.IsStump && len(n.Branch) == 1 {
+	if n.Kind == "loadout" && len(n.Branch) == 1 {
 		return n.Branch[0]
 	}
 	return ""

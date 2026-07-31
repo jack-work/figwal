@@ -190,7 +190,7 @@ func (x *Index) addLocked(dir, key string, isRoot bool) error {
 		kind = "null"
 	}
 	trunkID, _ := readTrunkID(dir)
-	n := &NodeInfo{Trunk: trunkID, IsRoot: isRoot, From: from, Kind: kind, IsStump: kind == "loadout"}
+	n := &NodeInfo{Trunk: trunkID, IsRoot: isRoot, From: from, Kind: kind}
 	if !isRoot {
 		n.Branch = []string{key}
 	}

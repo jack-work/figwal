@@ -1691,7 +1691,7 @@ func (t *Trunks) Promote(trunk TrunkID, levels int) (int, error) {
 	for climbed < levels {
 		f := t.node(foundKey)
 		p := t.node(f.Parent)
-		if f.IsRoot || p == nil || p.IsRoot || p.IsStump {
+		if f.IsRoot || p == nil || p.IsRoot || p.Kind == "loadout" {
 			break // ceremonial boundary above — cannot climb further
 		}
 		parentID := p.Trunk
@@ -1700,7 +1700,7 @@ func (t *Trunks) Promote(trunk TrunkID, levels int) (int, error) {
 		runTop := f.Parent
 		for {
 			up := t.node(t.node(runTop).Parent)
-			if up == nil || up.IsRoot || up.IsStump || up.Trunk != parentID {
+			if up == nil || up.IsRoot || up.Kind == "loadout" || up.Trunk != parentID {
 				break
 			}
 			runTop = t.node(runTop).Parent
@@ -1752,7 +1752,7 @@ func (t *Trunks) Stumps() []StumpInfo {
 	defer endRead()
 	var out []StumpInfo
 	for _, n := range t.idx.All() {
-		if !n.IsStump {
+		if n.Kind != "loadout" {
 			continue
 		}
 		si := StumpInfo{Name: n.stumpName()}
@@ -1869,23 +1869,17 @@ func (t *Trunks) List() []TrunkInfo {
 // parent is a stump), and the LT it branched at.
 func (t *Trunks) lineage(trunk string) (parent, stump string, bl uint64) {
 	n := t.node(t.head(trunk))
-	for {
-		if n.IsRoot {
-			return "", "", 0
-		}
-		p := t.node(n.Parent)
-		if p == nil {
-			return "", "", 0
-		}
-		if p.Trunk != trunk {
-			// n is the founding node; p is its parent (trunk, stump, or root).
-			// BranchedLT is n's fork base — read the tiny .fork marker directly
-			// instead of opening the log (which would scan the segment). Equal
-			// to mainForkBase(open(n)), but O(1) file read, not O(entries).
-			return p.Trunk, p.stumpName(), t.forkBaseOf(n.Branch)
-		}
-		n = p
+	if n == nil || n.IsRoot {
+		return "", "", 0
 	}
+	// Flat: one node per trunk, so the head IS the founding node and its
+	// parent is From. The old climb walked a continuation chain that a flat
+	// fork never builds.
+	p := t.node(n.From)
+	if p == nil {
+		return "", "", 0
+	}
+	return p.Trunk, p.stumpName(), t.forkBaseOf(n.Branch)
 }
 
 // forkBaseOf reads a node's main-channel .fork base (the LT it forked at)

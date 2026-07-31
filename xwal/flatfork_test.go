@@ -198,3 +198,28 @@ func TestRebuildKeepsAForkedParentLive(t *testing.T) {
 		t.Errorf("child trunk %q has no head after rebuild", alt)
 	}
 }
+
+// lineage climbed n.Parent, which no flat writer sets, so every trunk
+// reported no parent and no stump.
+func TestLineageReadsTheFlatParent(t *testing.T) {
+	f, trunk := seedTrunk(t, filepath.Join(t.TempDir(), "f"))
+	if _, stump, _ := f.lineage(string(trunk)); stump != "s" {
+		t.Errorf("trunk under stump: stump = %q, want %q", stump, "s")
+	}
+	for range 3 {
+		if _, _, err := f.Append(trunk, 0, []byte(`"turn"`), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alt, err := f.ForkTail(trunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, _, bl := f.lineage(string(alt))
+	if parent != string(trunk) {
+		t.Errorf("forked trunk: parent = %q, want %q", parent, trunk)
+	}
+	if bl == 0 {
+		t.Error("forked trunk: branched-at LT = 0")
+	}
+}

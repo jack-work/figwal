@@ -290,7 +290,7 @@ func parentRun(t *testing.T, f *Trunks, trunk TrunkID) (TrunkID, bool) {
 		t.Fatalf("no founding node for %s", trunk)
 	}
 	p := f.node(f.node(fk).Parent)
-	return p.Trunk, p.IsStump
+	return p.Trunk, p.Kind == "loadout"
 }
 
 func TestPromote_ClimbsAndStopsAtStump(t *testing.T) {
