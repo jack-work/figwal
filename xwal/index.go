@@ -1,18 +1,12 @@
-// index.go: the node/trunk index, kept in a persistent tree.
+// index.go: the node/trunk index.
 //
 // Trunks used to derive this by walking every node directory and reading a
-// .trunk marker, twice per spawn, at roughly 0.9ms per existing node on a
-// cold filesystem. Minting node 400 was a function of nodes 1 through 399.
-//
-// pstate gives O(log n) apply by path copying, lock-free readers, and a
-// background writer that never blocks a caller. The .trunk markers stay
-// ground truth; this is a maintained cache of them and RebuildFrom recovers
-// it, which is why a failed index write is survivable and why it needs no
-// write-ahead log.
+// .trunk marker, twice per spawn, at roughly 0.9ms per existing node on a cold
+// filesystem. Minting node 400 was a function of nodes 1 through 399. Now a
+// spawn patches the index with the delta it already knows and never walks.
 package xwal
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,207 +15,149 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-
-	"github.com/jack-work/pstate"
 )
 
-// Two namespaces in one tree, so a single Apply keeps them consistent. Parent
-// and child are written together and therefore cannot disagree.
-const (
-	nodePfx  = "node/"
-	trunkPfx = "trunk/"
-)
-
-// Index is the node/trunk index over a pstate model.
+// Index is the node/trunk index: the forest shape, and where each trunk's
+// live head is.
 //
-// seqMu guards only the mint counters. The tree itself needs no lock: readers
-// take a root pointer, writers CAS a new one.
+// Readers (Node, Head, All, LiveTrunks, Version) run on RPC goroutines while
+// a mutation is in flight, so they take the read lock. Mutators run under the
+// topology lock and need not be safe against each other.
+//
+// The .trunk markers on disk stay ground truth; this is a derived cache and
+// RebuildFrom recovers it.
 type Index struct {
-	m *pstate.Model
-	// rebuilds counts full marker walks. A spawn must not cause one; the
-	// test asserts on it because the cost is syscalls, which a wall-clock
-	// assertion only catches on a slow filesystem.
-	rebuilds atomic.Uint64
-	seqMu    sync.Mutex
+	mu       sync.RWMutex
+	nodes    map[string]*NodeInfo
+	heads    map[string]string // trunk id -> its one live leaf
 	nodeSeq  int
 	trunkSeq int
+	version  atomic.Uint64
+	// rebuilds counts full marker walks. A spawn must cause none; the test
+	// asserts on the count because the cost is syscalls, which a wall-clock
+	// assertion only catches on a slow filesystem.
+	rebuilds atomic.Uint64
 	mintID   func() string
 }
 
-// newIndex returns an empty index. Open fills it by walking the markers.
-//
-// It is deliberately memory-only. pstate can persist a Model, and an earlier
-// pass did, but nothing read the file back: trusting a loaded index needs a
-// validity marker so a reader can tell "lagging after a crash" from "current",
-// and without one every reader would have to answer that for itself. The file
-// was write-only, so it went. Re-add it with the marker, not before.
 func newIndex(mintTrunkID func() string) *Index {
-	return &Index{m: pstate.NewModel(pstate.Tree{}, nil), mintID: mintTrunkID}
+	return &Index{nodes: map[string]*NodeInfo{}, heads: map[string]string{}, mintID: mintTrunkID}
 }
 
-func (x *Index) Close() error { return x.m.Close() }
-
-// Version increases on every published change AND on every rebuild.
-//
-// pstate does not advance its version when a patch changes nothing, which is
-// right for a data store and wrong for a topology cookie: Refresh means "I
-// re-read the disk", and a consumer caching against this must invalidate even
-// when the re-read found the same forest.
-func (x *Index) Version() uint64 { return x.m.Snapshot().Version() + x.rebuilds.Load() }
-
 func (x *Index) Node(key string) (*NodeInfo, bool) {
-	v, ok := x.m.Get(nodePfx + key)
-	if !ok {
-		return nil, false
-	}
-	return toInfo(v)
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	n, ok := x.nodes[key]
+	return n, ok
 }
 
 func (x *Index) Head(trunk string) (string, bool) {
-	v, ok := x.m.Get(trunkPfx + trunk)
-	if !ok {
-		return "", false
-	}
-	var head string
-	if json.Unmarshal(v.Raw(), &head) != nil {
-		return "", false
-	}
-	return head, true
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	k, ok := x.heads[trunk]
+	return k, ok
 }
 
+// All is a point-in-time copy, for the cold paths that iterate the forest
+// (promote, remove, lineage). Hot paths use Node/Head.
 func (x *Index) All() map[string]*NodeInfo {
-	out := map[string]*NodeInfo{}
-	x.m.Snapshot().Range(func(k string, v pstate.Value) bool {
-		if strings.HasPrefix(k, nodePfx) {
-			if n, ok := toInfo(v); ok {
-				out[strings.TrimPrefix(k, nodePfx)] = n
-			}
-		}
-		return true
-	})
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	out := make(map[string]*NodeInfo, len(x.nodes))
+	for k, v := range x.nodes {
+		out[k] = v
+	}
 	return out
 }
 
-// LiveTrunks is every trunk with a live head, in stable (lexical) order.
-// figaro mints opaque hex ids, so there is no numeric ordering to preserve.
+// LiveTrunks is every trunk with a head, in stable display order: numeric for
+// sequential t<N> ids so t2 precedes t10, lexical for caller-minted ids.
 func (x *Index) LiveTrunks() []string {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
 	var ids []string
-	x.m.Snapshot().Range(func(k string, _ pstate.Value) bool {
-		if strings.HasPrefix(k, trunkPfx) {
-			ids = append(ids, strings.TrimPrefix(k, trunkPfx))
+	if x.mintID != nil {
+		for id := range x.heads {
+			ids = append(ids, id)
 		}
-		return true
-	})
-	sort.Strings(ids)
+		sort.Strings(ids)
+		return ids
+	}
+	for i := 0; i < x.trunkSeq; i++ {
+		if id := "t" + strconv.Itoa(i); x.heads[id] != "" {
+			ids = append(ids, id)
+		}
+	}
 	return ids
 }
 
-// Spawn adds one leaf: the child node, the parent gaining it, and the child
-// trunk's head. One Apply, so a reader never sees half of it.
+// Version increases on every change AND on every rebuild. Consumers cache
+// derived state against it; Refresh means "I re-read the disk", so it must
+// invalidate even when the forest came back identical.
+func (x *Index) Version() uint64 { return x.version.Load() }
+
+// Spawn adds one leaf: the child, the parent gaining it, and the child
+// trunk's head. The parent stops being a head the moment it has a child.
 func (x *Index) Spawn(parent, child, trunk string, isStump bool) error {
-	snap := x.m.Snapshot()
-	p := pstate.Patch{}
-	if pn, ok := getNode(snap, parent); ok && !contains(pn.Children, child) {
-		pn.Children = append(pn.Children, child)
-		p = setNode(p, parent, pn)
-		if pn.Trunk != "" && pn.Trunk != trunk {
-			p = p.Delete(trunkPfx + pn.Trunk) // no longer a live head
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if p := x.nodes[parent]; p != nil && !contains(p.Children, child) {
+		p.Children = append(p.Children, child)
+		if p.Trunk != "" {
+			delete(x.heads, p.Trunk)
+			if p.Trunk != trunk {
+				x.reheadLocked(p.Trunk)
+			}
 		}
 	}
-	p = setNode(p, child, NodeInfo{Branch: strings.Split(child, "/"), Trunk: trunk, Parent: parent, IsStump: isStump})
-	if trunk != "" {
-		p = p.Set(trunkPfx+trunk, val(child))
+	x.nodes[child] = &NodeInfo{
+		Branch: strings.Split(child, "/"), Trunk: trunk, Parent: parent, IsStump: isStump,
 	}
-	x.bumpSeqs(child, trunk)
-	_, err := x.m.Apply(p)
-	return err
+	if trunk != "" {
+		x.heads[trunk] = child
+	}
+	x.bumpSeqsLocked(child, trunk)
+	x.version.Add(1)
+	return nil
 }
 
 func (x *Index) Drop(nodeKeys, trunkIDs []string) error {
-	snap := x.m.Snapshot()
-	p := pstate.Patch{}
+	x.mu.Lock()
+	defer x.mu.Unlock()
 	for _, key := range nodeKeys {
-		if n, ok := getNode(snap, key); ok {
-			if pn, ok := getNode(snap, n.Parent); ok {
-				pn.Children = remove(pn.Children, key)
-				p = setNode(p, n.Parent, pn)
+		if n := x.nodes[key]; n != nil {
+			if p := x.nodes[n.Parent]; p != nil {
+				p.Children = remove(p.Children, key)
 			}
 		}
-		p = p.Delete(nodePfx + key)
+		delete(x.nodes, key)
 	}
 	for _, id := range trunkIDs {
-		p = p.Delete(trunkPfx + id)
+		delete(x.heads, id)
 	}
-	next := snap.Tree().Apply(p)
-	seen := map[string]bool{}
-	rangeNodes(next, func(_ string, n NodeInfo) bool {
-		if n.Trunk != "" && !seen[n.Trunk] {
-			seen[n.Trunk] = true
-			p = rehead(p, next, n.Trunk)
+	for key, n := range x.nodes {
+		if n.Trunk != "" && !n.Frozen() {
+			x.heads[n.Trunk] = key
 		}
-		return true
-	})
-	_, err := x.m.Apply(p)
-	return err
+	}
+	x.version.Add(1)
+	return nil
 }
 
-// RebuildFrom re-derives everything from the markers. The only path that walks.
-func (x *Index) RebuildFrom(mainDir string) error {
-	x.rebuilds.Add(1)
-	fresh := pstate.Tree{}
-	heads := map[string]string{}
-	var walk func(dir string, branch []string, parentKey string, isRoot bool) error
-	walk = func(dir string, branch []string, parentKey string, isRoot bool) error {
-		key := strings.Join(branch, "/")
-		trunkID, _ := readTrunkID(dir)
-		ents, err := os.ReadDir(dir)
-		if err != nil {
-			return err
+// reheadLocked points trunk at its one live leaf, or drops it if it has none.
+func (x *Index) reheadLocked(trunk string) {
+	delete(x.heads, trunk)
+	for key, n := range x.nodes {
+		if n.Trunk == trunk && !n.Frozen() {
+			x.heads[trunk] = key
+			return
 		}
-		var kids []string
-		for _, e := range ents {
-			if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
-				kids = append(kids, e.Name())
-			}
-		}
-		n := NodeInfo{
-			Branch: append([]string(nil), branch...), Trunk: trunkID, Parent: parentKey,
-			IsRoot: isRoot, IsStump: !isRoot && trunkID == "" && len(branch) == 1,
-		}
-		for _, k := range kids {
-			n.Children = append(n.Children, joinKey(branch, k))
-		}
-		fresh = fresh.Set(nodePfx+key, val(n))
-		x.bumpSeqs(key, trunkID)
-		if len(n.Children) == 0 && trunkID != "" {
-			if prev, dup := heads[trunkID]; dup {
-				return fmt.Errorf("xwal: trunk %q has multiple live heads %q and %q", trunkID, prev, key)
-			}
-			heads[trunkID] = key
-			fresh = fresh.Set(trunkPfx+trunkID, val(key))
-		}
-		for _, k := range kids {
-			if err := walk(filepath.Join(dir, k), append(append([]string(nil), branch...), k), key, false); err != nil {
-				return err
-			}
-		}
-		return nil
 	}
-	x.resetSeqs()
-	if err := walk(mainDir, nil, "", true); err != nil {
-		return err
-	}
-	// Replace wholesale: a rebuild is a repair, so anything not on disk is gone.
-	p := pstate.Patch{}
-	x.m.Snapshot().Range(func(k string, _ pstate.Value) bool { p = p.Delete(k); return true })
-	fresh.Range(func(k string, v pstate.Value) bool { p = p.Set(k, v); return true })
-	_, err := x.m.Apply(p)
-	return err
 }
 
 func (x *Index) MintNode() string {
-	x.seqMu.Lock()
-	defer x.seqMu.Unlock()
+	x.mu.Lock()
+	defer x.mu.Unlock()
 	id := "n" + strconv.Itoa(x.nodeSeq)
 	x.nodeSeq++
 	return id
@@ -229,114 +165,93 @@ func (x *Index) MintNode() string {
 
 // MintNode and MintTrunk do not persist their counters and cannot fail.
 //
-// The alternative is a durable sequence, so a crash between minting an id and
-// creating its directory cannot leak it. We are not doing that. MintNode's
-// counter is recovered at open by RebuildFrom, which reads the n<N> suffixes
-// off directory names; a leaked id costs one skipped integer per crash and is
-// corrected on the next open. A durable counter would put a synchronous write
-// on the create path, which is the path this exists to make cheap, to close a
-// gap in a sequence nobody reads for meaning. Ids are opaque; gaps are not a
-// defect. That is also why neither returns an error.
+// A durable sequence would stop a crash between minting an id and creating its
+// directory from leaking that id. The counters are recovered instead by
+// RebuildFrom, off the n<N>/t<N> suffixes of directory names, so a leak costs
+// one skipped integer and is corrected on the next open. A durable counter
+// would put a synchronous write on the create path, which is the path this
+// exists to make cheap, to close a gap in a sequence nobody reads for meaning.
+// Ids are opaque; gaps are not a defect.
 func (x *Index) MintTrunk() string {
 	if x.mintID != nil {
 		return x.mintID()
 	}
-	x.seqMu.Lock()
-	defer x.seqMu.Unlock()
+	x.mu.Lock()
+	defer x.mu.Unlock()
 	id := "t" + strconv.Itoa(x.trunkSeq)
 	x.trunkSeq++
 	return id
 }
 
-func (x *Index) resetSeqs() {
-	x.seqMu.Lock()
+// RebuildFrom re-derives everything from the markers. The only path that walks.
+func (x *Index) RebuildFrom(mainDir string) error {
+	x.rebuilds.Add(1)
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.nodes, x.heads = map[string]*NodeInfo{}, map[string]string{}
 	x.nodeSeq, x.trunkSeq = 0, 0
-	x.seqMu.Unlock()
+	if err := x.walkLocked(mainDir, nil, "", true); err != nil {
+		return err
+	}
+	x.version.Add(1)
+	return nil
 }
 
-func (x *Index) bumpSeqs(key, trunkID string) {
-	x.seqMu.Lock()
-	defer x.seqMu.Unlock()
+func (x *Index) walkLocked(dir string, branch []string, parentKey string, isRoot bool) error {
+	key := strings.Join(branch, "/")
+	trunkID, _ := readTrunkID(dir)
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	var kids []string
+	for _, e := range ents {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			kids = append(kids, e.Name())
+		}
+	}
+	// Node class is positional plus marker-based: the root is the channel dir
+	// itself; a stump is a markerless depth-1 child of it; anything with a
+	// .trunk marker is a trunk.
+	n := &NodeInfo{
+		Branch: append([]string(nil), branch...), Trunk: trunkID, Parent: parentKey,
+		IsRoot: isRoot, IsStump: !isRoot && trunkID == "" && len(branch) == 1,
+	}
+	for _, k := range kids {
+		n.Children = append(n.Children, joinKey(branch, k))
+	}
+	x.nodes[key] = n
+	x.bumpSeqsLocked(key, trunkID)
+	if !n.Frozen() && trunkID != "" {
+		if previous, exists := x.heads[trunkID]; exists {
+			return fmt.Errorf("xwal: trunk %q has multiple live heads %q and %q", trunkID, previous, key)
+		}
+		x.heads[trunkID] = key
+	}
+	for _, k := range kids {
+		if err := x.walkLocked(filepath.Join(dir, k), append(append([]string(nil), branch...), k), key, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (x *Index) bumpSeqsLocked(key, trunkID string) {
 	if key != "" {
 		seg := key
 		if i := strings.LastIndex(key, "/"); i >= 0 {
 			seg = key[i+1:]
 		}
-		if n := suffixNum(seg, 'n'); n+1 > x.nodeSeq {
+		if n := numSuffix(seg, 'n'); n+1 > x.nodeSeq {
 			x.nodeSeq = n + 1
 		}
 	}
-	// Recover the trunk counter too. Dropping this reissued t0 after a
-	// restart, so two nodes claimed one trunk and every open failed with
-	// "multiple live heads" — which is what the crash harness caught.
-	if n := suffixNum(trunkID, 't'); n+1 > x.trunkSeq {
+	// Recovering the TRUNK counter matters as much as the node one: dropping
+	// it reissued t0 after a restart, two nodes claimed one trunk, and every
+	// open failed with "multiple live heads". The crash harness caught it.
+	if n := numSuffix(trunkID, 't'); n+1 > x.trunkSeq {
 		x.trunkSeq = n + 1
 	}
-}
-
-// --- helpers ---
-
-func val(v any) pstate.Value { pv, _ := pstate.EncodeValue(v); return pv }
-
-func setNode(p pstate.Patch, key string, n NodeInfo) pstate.Patch {
-	return p.Set(nodePfx+key, val(n))
-}
-
-func getNode(s pstate.Snapshot, key string) (NodeInfo, bool) {
-	v, ok := s.Get(nodePfx + key)
-	if !ok {
-		return NodeInfo{}, false
-	}
-	var n NodeInfo
-	return n, json.Unmarshal(v.Raw(), &n) == nil
-}
-
-func rangeNodes(t pstate.Tree, fn func(string, NodeInfo) bool) {
-	t.Range(func(k string, v pstate.Value) bool {
-		if !strings.HasPrefix(k, nodePfx) {
-			return true
-		}
-		var n NodeInfo
-		if json.Unmarshal(v.Raw(), &n) != nil {
-			return true
-		}
-		return fn(strings.TrimPrefix(k, nodePfx), n)
-	})
-}
-
-// rehead points trunk at its one live leaf, or drops it when it has none.
-func rehead(p pstate.Patch, next pstate.Tree, trunk string) pstate.Patch {
-	found := ""
-	rangeNodes(next, func(key string, n NodeInfo) bool {
-		if n.Trunk == trunk && len(n.Children) == 0 {
-			found = key
-			return false
-		}
-		return true
-	})
-	if found == "" {
-		return p.Delete(trunkPfx + trunk)
-	}
-	return p.Set(trunkPfx+trunk, val(found))
-}
-
-func toInfo(v pstate.Value) (*NodeInfo, bool) {
-	var n NodeInfo
-	if json.Unmarshal(v.Raw(), &n) != nil {
-		return nil, false
-	}
-	return &n, true
-}
-
-func suffixNum(s string, p byte) int {
-	if len(s) < 2 || s[0] != p {
-		return -1
-	}
-	n, err := strconv.Atoi(s[1:])
-	if err != nil {
-		return -1
-	}
-	return n
 }
 
 func contains(s []string, v string) bool {

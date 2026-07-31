@@ -1025,12 +1025,6 @@ func (t *Trunks) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	// The index persists in the background, so close is the one place that
-	// must wait for it: otherwise the last mutations are memory-only and the
-	// next open rebuilds them from the markers.
-	if err := t.idx.Close(); err != nil {
-		errs = append(errs, err)
-	}
 	return errors.Join(errs...)
 }
 
