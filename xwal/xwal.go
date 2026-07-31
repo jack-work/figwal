@@ -85,10 +85,6 @@ type Config struct {
 	// consumer use opaque ids; not persisted directly — the ids land in
 	// the .trunk markers.
 	MintTrunkID func() string
-	// TopologyPath persists the node/trunk index. Empty keeps it in memory,
-	// which is what tests and one-shot tools want; a real store names a file
-	// so a restart does not have to re-walk the markers to find anything.
-	TopologyPath string
 }
 
 var errStopRange = errors.New("xwal: stop range")

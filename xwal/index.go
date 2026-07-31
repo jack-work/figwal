@@ -48,44 +48,15 @@ type Index struct {
 	mintID   func() string
 }
 
-// newIndex returns an index persisting to path. An empty path keeps it purely
-// in memory (pstate.NewModel with a nil writer does no I/O), which is what
-// tests and one-shot tools want. A missing file is an empty index; Open calls
-// RebuildFrom, which fills it from the markers.
-func newIndex(path string, mintTrunkID func() string) *Index {
-	var initial pstate.Tree
-	var writer pstate.Writer
-	if path != "" {
-		if s, err := pstate.Open(path); err == nil {
-			if snap, rerr := s.Read(); rerr == nil {
-				initial = snap.Tree()
-			}
-		}
-		writer = pstate.WriterFunc(func(s pstate.Snapshot) error { return write(path, s) })
-	}
-	// Seqs are recovered by RebuildFrom, which Open calls.
-	return &Index{m: pstate.NewModel(initial, writer), mintID: mintTrunkID}
-}
-
-func write(path string, s pstate.Snapshot) error {
-	st, err := pstate.Open(path)
-	if err != nil {
-		return err
-	}
-	patch := pstate.Patch{}
-	cur, err := st.Read()
-	if err != nil {
-		return err
-	}
-	cur.Range(func(k string, _ pstate.Value) bool {
-		if _, ok := s.Get(k); !ok {
-			patch = patch.Delete(k)
-		}
-		return true
-	})
-	s.Range(func(k string, v pstate.Value) bool { patch = patch.Set(k, v); return true })
-	_, err = st.Apply(patch)
-	return err
+// newIndex returns an empty index. Open fills it by walking the markers.
+//
+// It is deliberately memory-only. pstate can persist a Model, and an earlier
+// pass did, but nothing read the file back: trusting a loaded index needs a
+// validity marker so a reader can tell "lagging after a crash" from "current",
+// and without one every reader would have to answer that for itself. The file
+// was write-only, so it went. Re-add it with the marker, not before.
+func newIndex(mintTrunkID func() string) *Index {
+	return &Index{m: pstate.NewModel(pstate.Tree{}, nil), mintID: mintTrunkID}
 }
 
 func (x *Index) Close() error { return x.m.Close() }

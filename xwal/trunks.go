@@ -177,7 +177,7 @@ func createTrunks(dir string, cfg Config) (*Trunks, error) {
 	}
 	x.Close()
 
-	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: cfg.Main, idx: newIndex(cfg.TopologyPath, cfg.MintTrunkID)}
+	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: cfg.Main, idx: newIndex(cfg.MintTrunkID)}
 	if err := t.rebuild(); err != nil {
 		return nil, err
 	}
@@ -230,7 +230,7 @@ func openTrunks(dir string, cfg Config) (*Trunks, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: main, idx: newIndex(cfg.TopologyPath, cfg.MintTrunkID)}
+	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: main, idx: newIndex(cfg.MintTrunkID)}
 	if err := t.rebuild(); err != nil {
 		return nil, err
 	}
@@ -241,10 +241,6 @@ func openTrunks(dir string, cfg Config) (*Trunks, error) {
 	return t, nil
 }
 
-// rebuild walks the main channel's directory tree and reconstructs the
-// node + trunk cache from disk (dirs + .trunk markers). Source of truth.
-// Every completed rebuild bumps the version counter so external
-// consumers can probe for topology changes without a walk of their own.
 // node and head read the index; node returns nil when absent, matching the
 // map lookup this replaced.
 func (t *Trunks) node(key string) *NodeInfo { n, _ := t.idx.Node(key); return n }
@@ -266,21 +262,15 @@ func (t *Trunks) rebuild() error {
 }
 
 // Version returns the current topology version. It increases (never
-// resets) every time the in-memory index is rebuilt from disk, which
-// happens after every mutating public call (Fork, ForkAt, Promote,
-// Remove, SpawnChild, CreateStump…) and at Open / Refresh time.
+// resets) every time the in-memory index is rebuilt from disk.
 //
 // Consumers cache derived state (e.g. head-of-trunk lookups, node
 // listings) against the version they last observed; if Version()
 // changes, the cache is stale. Cheap: one atomic load, no lock.
 func (t *Trunks) Version() uint64 { return t.idx.Version() }
 
-// Refresh re-scans the on-disk trunk marker layout and re-derives the
-// in-memory index. In single-process land it is redundant — every
-// mutating call already rebuilds — but it is the escape hatch for a
-// future cross-process story where another writer may have relabeled
-// markers under our feet. Bumps Version() by one if anything changes
-// (and even if nothing did, because rebuild is unconditional).
+// Refresh re-scans the on-disk markers and re-derives the index. The escape
+// hatch for a store another process has mutated.
 func (t *Trunks) Refresh() error {
 	endMutation, err := t.beginTopologyMutation()
 	if err != nil {

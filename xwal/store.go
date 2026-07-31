@@ -24,8 +24,6 @@ type StoreOptions struct {
 	SegmentSize int64
 	Genesis     []byte
 	MintTrunkID func() string
-	// TopologyPath persists the node/trunk index; empty keeps it in memory.
-	TopologyPath string
 }
 
 type Store struct {
@@ -364,7 +362,6 @@ func (o StoreOptions) config() Config {
 		MaxUnflushedBytes: o.MaxUnflushedBytes,
 		Genesis:           o.Genesis,
 		MintTrunkID:       o.MintTrunkID,
-		TopologyPath:      o.TopologyPath,
 	}
 	opaque := make(map[string]bool, len(o.Opaque))
 	for _, name := range o.Opaque {
