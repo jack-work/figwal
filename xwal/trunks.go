@@ -43,9 +43,9 @@ type Trunks struct {
 	registryRoot string
 
 	mu sync.RWMutex
-	// idx is the node/trunk index. Default memIndex walks the markers, as
-	// this type used to inline; Config.Index swaps in a maintained one.
-	idx TopologyIndex
+	// idx is the node/trunk index, kept in a persistent tree (index.go).
+	// Trunks used to inline these maps and re-derive them by walking markers.
+	idx *Index
 
 	// version is the local rebuild cookie; rootEpoch tracks mutations made
 	// through any in-process peer for the same canonical root.
@@ -121,7 +121,6 @@ type (
 	TrunkID = string
 )
 
-
 const trunkMarker = ".trunk"
 
 // ErrAtStump is returned by Promote when a trunk cannot climb further: the
@@ -178,7 +177,7 @@ func createTrunks(dir string, cfg Config) (*Trunks, error) {
 	}
 	x.Close()
 
-	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: cfg.Main, idx: pickIndex(cfg)}
+	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: cfg.Main, idx: newIndex(cfg.TopologyPath, cfg.MintTrunkID)}
 	if err := t.rebuild(); err != nil {
 		return nil, err
 	}
@@ -231,7 +230,7 @@ func openTrunks(dir string, cfg Config) (*Trunks, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: main, idx: pickIndex(cfg)}
+	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: main, idx: newIndex(cfg.TopologyPath, cfg.MintTrunkID)}
 	if err := t.rebuild(); err != nil {
 		return nil, err
 	}
@@ -291,8 +290,6 @@ func (t *Trunks) Refresh() error {
 	t.invalidateTopologyValidation()
 	return t.rebuild()
 }
-
-
 
 // --- accessors ---
 
@@ -755,9 +752,10 @@ func (t *Trunks) beginTopologyMutation() (func(), error) {
 			t.mu.Unlock()
 			return nil, fmt.Errorf("xwal: refusing topology mutation, hot flush failing: %w", err)
 		}
-		// Re-read the forest only if a peer moved it. end() stamps the new
-		// epoch onto us, so after our own mutations we are already current;
-		// rebuilding unconditionally re-walked every node to learn nothing.
+		// Re-read the forest only when a PEER moved it. end() stamps the new
+		// epoch onto us, so after our own mutation we are already current and
+		// walking again teaches nothing. A repair that rewrites markers calls
+		// Refresh itself (see openForkSource).
 		if epoch := rootTopologyEpoch(t.registryRoot); t.rootEpoch.Load() != epoch {
 			if err := t.rebuild(); err != nil {
 				end()
@@ -965,6 +963,11 @@ func (t *Trunks) openForkSource(branch []string) (*XWAL, error) {
 		if err := repairRehomeDescendants(t.root, t.cfg, branch); err != nil {
 			return nil, err
 		}
+		// A repair rewrote markers, so the index describes a forest that no
+		// longer exists. Pay the walk here, where the disk actually moved.
+		if err := t.rebuild(); err != nil {
+			return nil, err
+		}
 		t.markForkPreflightValidated(branch)
 	}
 	return Open(t.root, t.cfg, branch...)
@@ -1031,6 +1034,12 @@ func (t *Trunks) Close() error {
 		if err := h.store.Close(); err != nil {
 			errs = append(errs, err)
 		}
+	}
+	// The index persists in the background, so close is the one place that
+	// must wait for it: otherwise the last mutations are memory-only and the
+	// next open rebuilds them from the markers.
+	if err := t.idx.Close(); err != nil {
+		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }
@@ -1556,10 +1565,10 @@ func (t *Trunks) spawnTrunkAt(parentBranch []string) (TrunkID, error) {
 	if err != nil {
 		return "", fmt.Errorf("xwal: spawn: %w", err)
 	}
-	// Incremental, not rebuild: a spawn adds one leaf under a known parent and
-	// that delta was known before any I/O. Re-walking the forest to learn it
-	// cost ~0.9ms per existing node on every mint. Index goes last, after the
-	// marker is durable, per the TopologyIndex contract.
+	// Incremental, not a rebuild: a spawn adds one leaf under a known parent,
+	// and that delta is fully known before any I/O. Re-walking the forest to
+	// learn it cost ~0.9ms per existing node on every mint. The index update
+	// goes last, after the marker is durable.
 	if err := t.idx.Spawn(strings.Join(parentBranch, "/"), strings.Join(childBranch, "/"), childTrunk, false); err != nil {
 		return "", err
 	}
@@ -1911,9 +1920,8 @@ func (t *Trunks) ListLight() []TrunkInfo {
 	return out
 }
 
-
 // Nodes returns every node (debug), root first. NodeInfo lives in
-// topology_index.go; Frozen is a method there, derived from Children.
+// index.go; Frozen is a method there, derived from Children.
 func (t *Trunks) Nodes() []NodeInfo {
 	endRead, err := t.beginTrackedRead()
 	if err != nil {

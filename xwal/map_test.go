@@ -87,7 +87,6 @@ func mapTrunksCfg() Config {
 	}
 }
 
-
 // seedMapTrunk seeds a store (map reducer cfg) with a birthless stump and a
 // trunk under it (own range from LT 2), the migration of the old root-trunk.
 func seedMapTrunk(t *testing.T, dir string) (*Trunks, TrunkID) {

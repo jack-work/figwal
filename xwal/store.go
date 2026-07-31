@@ -24,9 +24,8 @@ type StoreOptions struct {
 	SegmentSize int64
 	Genesis     []byte
 	MintTrunkID func() string
-	// Index supplies a maintained topology index instead of the default,
-	// which re-walks the marker tree. See TopologyIndex.
-	Index TopologyIndex
+	// TopologyPath persists the node/trunk index; empty keeps it in memory.
+	TopologyPath string
 }
 
 type Store struct {
@@ -40,8 +39,8 @@ type Store struct {
 	lineageFails map[string]int
 	lineageErr   map[string]error
 	kick         chan struct{}
-	stop       chan struct{}
-	done       chan struct{}
+	stop         chan struct{}
+	done         chan struct{}
 
 	closeOnce sync.Once
 	closeErr  error
@@ -365,7 +364,7 @@ func (o StoreOptions) config() Config {
 		MaxUnflushedBytes: o.MaxUnflushedBytes,
 		Genesis:           o.Genesis,
 		MintTrunkID:       o.MintTrunkID,
-		Index:             o.Index,
+		TopologyPath:      o.TopologyPath,
 	}
 	opaque := make(map[string]bool, len(o.Opaque))
 	for _, name := range o.Opaque {

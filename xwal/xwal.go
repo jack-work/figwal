@@ -69,9 +69,9 @@ type ChannelSpec struct {
 // resolves reducer names to functions on every open (functions and sync modes
 // are not persisted).
 type Config struct {
-	Main        string
-	Channels    []ChannelSpec
-	Registry    map[string]Reducer
+	Main              string
+	Channels          []ChannelSpec
+	Registry          map[string]Reducer
 	Codec             string // "jsonl" (default) | "binary"; persisted in the manifest
 	SegmentSize       int64
 	MaxUnflushedBytes int64
@@ -85,9 +85,10 @@ type Config struct {
 	// consumer use opaque ids; not persisted directly — the ids land in
 	// the .trunk markers.
 	MintTrunkID func() string
-	// Index supplies a maintained node/trunk index instead of the default,
-	// which re-walks the marker tree on every mutation. See TopologyIndex.
-	Index TopologyIndex
+	// TopologyPath persists the node/trunk index. Empty keeps it in memory,
+	// which is what tests and one-shot tools want; a real store names a file
+	// so a restart does not have to re-walk the markers to find anything.
+	TopologyPath string
 }
 
 var errStopRange = errors.New("xwal: stop range")
