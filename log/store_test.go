@@ -7,7 +7,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/jack-work/figwal/disk"
 	"github.com/jack-work/figwal/segment"
 )
 
@@ -122,22 +121,4 @@ func TestStoreConcurrentReadAppend(t *testing.T) {
 	wg.Wait()
 	close(stop)
 	<-writerDone
-}
-
-func TestStoreRejectsCallerOwnedParent(t *testing.T) {
-	parent, err := disk.Open(t.TempDir(), disk.Options{Codec: segment.JSONLCodec{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer parent.Close()
-
-	store := NewStore()
-	defer store.Close()
-	_, err = store.Open(filepath.Join(t.TempDir(), "child"), Options{
-		Codec:  segment.JSONLCodec{},
-		Parent: parent,
-	})
-	if !errors.Is(err, ErrStoreExplicitParent) {
-		t.Fatalf("Store.Open with explicit parent = %v, want ErrStoreExplicitParent", err)
-	}
 }

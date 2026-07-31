@@ -85,6 +85,8 @@ type Config struct {
 	// consumer use opaque ids; not persisted directly — the ids land in
 	// the .trunk markers.
 	MintTrunkID func() string
+	// ParentOf resolves a flat node's logical parent. Empty means none.
+	ParentOf func(node string) string
 }
 
 var errStopRange = errors.New("xwal: stop range")
@@ -103,6 +105,8 @@ type XWAL struct {
 	cfg    Config
 	codec  segment.SegmentCodec
 	shared bool
+	// flatParents are ancestor logs this XWAL opened and must close.
+	flatParents []*log.Log
 
 	closeOnce      sync.Once
 	closeErr       error
@@ -265,6 +269,17 @@ func open(dir string, cfg Config, store *log.Store, branch ...string) (*XWAL, er
 			opts.OnSegmentOpen = reducibleFold(ch.reduce, ch.initial)
 		}
 		cdir := x.channelDir(mc.Name)
+		// Flat nodes name their parent; nested ones let disk walk "..".
+		if cfg.ParentOf != nil && len(branch) == 1 {
+			p, perr := x.openFlatParent(mc.Name, cfg.ParentOf(branch[0]), opts, store)
+			if perr != nil {
+				x.Close()
+				return nil, perr
+			}
+			if p != nil {
+				opts.Parent = p.Disk()
+			}
+		}
 		var l *log.Log
 		if store == nil {
 			l, err = log.Open(cdir, opts)
@@ -1960,6 +1975,12 @@ func (x *XWAL) Close() error {
 				}
 			}
 		}
+		for _, l := range x.flatParents {
+			if err := l.Close(); err != nil && x.closeErr == nil {
+				x.closeErr = err
+			}
+		}
+		x.flatParents = nil
 		if x.releaseRoot != nil {
 			x.releaseRoot()
 			x.releaseRoot = nil
@@ -2240,4 +2261,37 @@ func jsonValueEnd(b []byte, start int) (int, bool) {
 		}
 		return 0, false
 	}
+}
+
+// openFlatParent opens node's channel log, recursing up the lineage. Opened
+// ancestors are tracked so Close releases them.
+func (x *XWAL) openFlatParent(chName, node string, opts disk.Options, store *log.Store) (*log.Log, error) {
+	if node == "" {
+		return nil, nil
+	}
+	opts.Parent = nil
+	if up := x.cfg.ParentOf(node); up != "" {
+		p, err := x.openFlatParent(chName, up, opts, store)
+		if err != nil {
+			return nil, err
+		}
+		if p != nil {
+			opts.Parent = p.Disk()
+		}
+	}
+	dir := filepath.Join(x.root, chName, node)
+	var l *log.Log
+	var err error
+	if store == nil {
+		l, err = log.Open(dir, opts)
+	} else {
+		l, err = store.Open(dir, opts)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if store == nil {
+		x.flatParents = append(x.flatParents, l)
+	}
+	return l, nil
 }

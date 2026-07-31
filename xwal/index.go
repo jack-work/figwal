@@ -97,6 +97,31 @@ func (x *Index) LiveTrunks() []string {
 // invalidate even when the forest came back identical.
 func (x *Index) Version() uint64 { return x.version.Load() }
 
+// SpawnFlat records a sibling node forked from parent at LT. The parent is
+// not touched: no child list, no freeze, no continuation.
+func (x *Index) SpawnFlat(parent, child, trunk, kind string) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.nodes[child] = &NodeInfo{
+		Branch: []string{child}, Trunk: trunk, From: parent, Kind: kind,
+	}
+	if trunk != "" {
+		x.heads[trunk] = child
+	}
+	x.bumpSeqsLocked(child, trunk)
+	x.version.Add(1)
+}
+
+// ParentOf is the flat lineage link, for xwal.Config.ParentOf.
+func (x *Index) ParentOf(node string) string {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	if n := x.nodes[node]; n != nil {
+		return n.From
+	}
+	return ""
+}
+
 // Spawn adds one leaf: the child, the parent gaining it, and the child
 // trunk's head. The parent stops being a head the moment it has a child.
 func (x *Index) Spawn(parent, child, trunk string, isStump bool) error {
@@ -217,12 +242,20 @@ func (x *Index) walkLocked(dir string, branch []string, parentKey string, isRoot
 			kids = append(kids, e.Name())
 		}
 	}
-	// Node class is positional plus marker-based: the root is the channel dir
-	// itself; a stump is a markerless depth-1 child of it; anything with a
-	// .trunk marker is a trunk.
+	// Flat: .from names the parent and the kind. Its absence marks the null
+	// root. A node with neither .from nor root position is an unfinished
+	// fork; skip it rather than invent a stump from its position.
+	from, kind, flat := readFlatMarker(dir)
+	if !flat && !isRoot {
+		return nil
+	}
+	if kind == "" && isRoot {
+		kind = "null"
+	}
 	n := &NodeInfo{
 		Branch: append([]string(nil), branch...), Trunk: trunkID, Parent: parentKey,
-		IsRoot: isRoot, IsStump: !isRoot && trunkID == "" && len(branch) == 1,
+		IsRoot: isRoot, From: from, Kind: kind,
+		IsStump: kind == "loadout",
 	}
 	for _, k := range kids {
 		n.Children = append(n.Children, joinKey(branch, k))
@@ -278,4 +311,26 @@ func remove(s []string, v string) []string {
 		}
 	}
 	return out
+}
+
+// .from is "<parent>\n<kind>\n". Its absence marks the null root.
+// At is not stored: it is the channel's own .fork base minus one.
+const flatMarkerName = ".from"
+
+func writeFlatMarker(dir, parent, kind string) error {
+	return writeSyncedFile(filepath.Join(dir, flatMarkerName), fmt.Appendf(nil, "%s\n%s\n", parent, kind))
+}
+
+func readFlatMarker(dir string) (string, string, bool) {
+	b, err := os.ReadFile(filepath.Join(dir, flatMarkerName))
+	if err != nil {
+		return "", "", false
+	}
+	// Split before trimming: an empty parent leaves a leading newline that
+	// TrimSpace would eat, collapsing two fields into one.
+	parts := strings.SplitN(string(b), "\n", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), true
 }

@@ -178,6 +178,7 @@ func createTrunks(dir string, cfg Config) (*Trunks, error) {
 	x.Close()
 
 	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: cfg.Main, idx: newIndex(cfg.MintTrunkID)}
+	t.cfg.ParentOf = t.idx.ParentOf
 	if err := t.rebuild(); err != nil {
 		return nil, err
 	}
@@ -231,6 +232,7 @@ func openTrunks(dir string, cfg Config) (*Trunks, error) {
 		return nil, err
 	}
 	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: main, idx: newIndex(cfg.MintTrunkID)}
+	t.cfg.ParentOf = t.idx.ParentOf
 	if err := t.rebuild(); err != nil {
 		return nil, err
 	}
@@ -1227,59 +1229,90 @@ func (t *Trunks) forkTailLocked(trunk string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("%w %q", ErrUnknownTrunk, trunk)
 	}
-	head := t.node(headKey)
-	x, err := t.openHotTopology(head.Branch)
+	return t.forkFlat(headKey, "conversation", true)
+}
+
+// forkFlat mints a depth-1 sibling sharing the parent prefix. Nothing the
+// parent owns is written: no freeze, no continuation, no rehome.
+//
+// .trunk is the commit point, written last. A conversation without it is an
+// unfinished fork; the walk skips it.
+func (t *Trunks) forkFlat(parentKey, kind string, mintTrunk bool) (string, error) {
+	child := t.mintNode()
+	var trunk string
+	if mintTrunk {
+		trunk = t.mintTrunk()
+	}
+	bases, err := t.channelTails(parentKey)
 	if err != nil {
 		return "", err
 	}
-	tail := mainTail(x)
-	empty := isEmptyHead(x)
-	fb := mainForkBase(x)
-	x.Close()
-	t.retireRootHotPreservingValidation()
-
-	if empty {
-		// Redirect to an N-ary fork of the parent at the head's fork point.
-		if head.IsRoot {
-			return "", fmt.Errorf("xwal: cannot fork an empty root trunk")
-		}
-		pbranch := t.node(head.Parent).Branch
-		altDir := t.mintNode()
-		altTrunk := t.mintTrunk()
-		px, err := t.openForkSource(pbranch)
-		if err != nil {
+	for name, base := range bases {
+		dir := filepath.Join(t.root, name, child)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return "", err
 		}
-		// N-ary add-one at the parent's fork point (no old-future).
-		altX, ferr := px.forkJoint(fb, altDir, "", &forkCommit{ChildTrunk: altTrunk})
-		px.Close()
-		if ferr != nil {
-			return "", fmt.Errorf("fork-tail (empty head, via parent): %w", ferr)
+		if err := writeSyncedFile(filepath.Join(dir, ".fork"), fmt.Appendf(nil, "base=%d\n", base)); err != nil {
+			return "", err
 		}
-		t.markForkResultValidated(pbranch, altDir)
-		altX.Close()
-		return altTrunk, t.rebuild()
 	}
-
-	// Head has content: freeze it; one fork creates both children at tail+1
-	// (alt = child, cont = old-future) — both empty, inheriting the full
-	// prefix in every channel (always-materialize → write isolation).
-	altDir := t.mintNode()
-	contDir := t.mintNode()
-	altTrunk := t.mintTrunk()
-	fx, err := t.openForkSource(head.Branch)
-	if err != nil {
+	if err := writeFlatMarker(t.irDir([]string{child}), parentKey, kind); err != nil {
 		return "", err
 	}
-	child, ferr := fx.forkJoint(tail+1, altDir, contDir,
-		&forkCommit{SourceTrunk: head.Trunk, ChildTrunk: altTrunk})
-	fx.Close()
-	if ferr != nil {
-		return "", fmt.Errorf("fork-tail: %w", ferr)
+	if mintTrunk {
+		if err := writeTrunkID(t.irDir([]string{child}), trunk); err != nil {
+			return "", err
+		}
 	}
-	t.markForkResultValidated(head.Branch, altDir, contDir)
-	child.Close()
-	return altTrunk, t.rebuild()
+	t.idx.SpawnFlat(parentKey, child, trunk, kind)
+	if !mintTrunk {
+		return child, nil
+	}
+	return trunk, nil
+}
+
+// forkFlatNamed is forkFlat with a caller-chosen node name (stumps).
+func (t *Trunks) forkFlatNamed(parentKey, name, kind string) error {
+	bases, err := t.channelTails(parentKey)
+	if err != nil {
+		return err
+	}
+	for chName, base := range bases {
+		dir := filepath.Join(t.root, chName, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		if err := writeSyncedFile(filepath.Join(dir, ".fork"), fmt.Appendf(nil, "base=%d\n", base)); err != nil {
+			return err
+		}
+	}
+	if err := writeFlatMarker(t.irDir([]string{name}), parentKey, kind); err != nil {
+		return err
+	}
+	t.idx.SpawnFlat(parentKey, name, "", kind)
+	return nil
+}
+
+// channelTails is each channel's next index at node, i.e. its fork base.
+func (t *Trunks) channelTails(node string) (map[string]uint64, error) {
+	branch := []string(nil)
+	if node != "" {
+		branch = []string{node}
+	}
+	x, err := t.openHotTopology(branch)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]uint64{}
+	for _, c := range x.Channels() {
+		base := c.Last + 1
+		if base < c.First {
+			base = c.First // channel empty here; inherit from the ancestor
+		}
+		out[c.Name] = base
+	}
+	x.Close()
+	return out, nil
 }
 
 // ForkAt forks a trunk at an interior main-LT WITHOUT appending: it shares
@@ -1314,28 +1347,71 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 		return t.forkTailLocked(trunk)
 	}
 	if atMainLT < ownFirst {
-		// Re-split-below: fork the ancestor that owns atMainLT.
+		// Flat: fork the ancestor that owns atMainLT, in place.
 		t.retireRootHotPreservingValidation()
-		return t.resplitBelow(branch, atMainLT)
+		owner, oerr := t.ownerOf(branch, atMainLT)
+		if oerr != nil {
+			return "", oerr
+		}
+		return t.forkFlatAt(strings.Join(owner, "/"), atMainLT)
 	}
 
-	altDir := t.mintNode()
-	contDir := t.mintNode()
-	altTrunk := t.mintTrunk()
-	fx, err := t.openForkSource(branch)
+	// Interior fork: a sibling sharing [1..atMainLT]. The parent keeps its
+	// suffix; nothing it owns is rewritten.
+	return t.forkFlatAt(strings.Join(branch, "/"), atMainLT)
+}
+
+// forkFlatAt is forkFlat sharing a prefix that ends at an interior main LT.
+// Related channels share up to their last entry keyed at or below it.
+func (t *Trunks) forkFlatAt(parentKey string, atMainLT uint64) (string, error) {
+	child := t.mintNode()
+	trunk := t.mintTrunk()
+	branch := []string(nil)
+	if parentKey != "" {
+		branch = strings.Split(parentKey, "/")
+	}
+	x, err := t.openHotTopology(branch)
 	if err != nil {
 		return "", err
 	}
-	// child = alt; old-future = cont.
-	child, ferr := fx.forkJoint(atMainLT+1, altDir, contDir,
-		&forkCommit{SourceTrunk: trunk, ChildTrunk: altTrunk})
-	fx.Close()
-	if ferr != nil {
-		return "", ferr
+	bases := map[string]uint64{}
+	for _, c := range x.Channels() {
+		if c.Name == t.main {
+			bases[c.Name] = atMainLT + 1
+			continue
+		}
+		lt, ok, lerr := x.chans[c.Name].lookup(atMainLT)
+		if lerr != nil {
+			x.Close()
+			return "", lerr
+		}
+		if !ok {
+			lt = 0
+		}
+		base := lt + 1
+		if base < c.First {
+			base = c.First
+		}
+		bases[c.Name] = base
 	}
-	t.markForkResultValidated(branch, altDir, contDir)
-	child.Close()
-	return altTrunk, t.rebuild()
+	x.Close()
+	for name, base := range bases {
+		dir := filepath.Join(t.root, name, child)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", err
+		}
+		if err := writeSyncedFile(filepath.Join(dir, ".fork"), fmt.Appendf(nil, "base=%d\n", base)); err != nil {
+			return "", err
+		}
+	}
+	if err := writeFlatMarker(t.irDir([]string{child}), parentKey, "conversation"); err != nil {
+		return "", err
+	}
+	if err := writeTrunkID(t.irDir([]string{child}), trunk); err != nil {
+		return "", err
+	}
+	t.idx.SpawnFlat(parentKey, child, trunk, "conversation")
+	return trunk, nil
 }
 
 // Remove deletes a trunk: its founding node's entire subtree, in every
@@ -1439,7 +1515,7 @@ func (t *Trunks) SpawnChild(parent TrunkID) (TrunkID, error) {
 	if !ok {
 		return "", fmt.Errorf("%w %q", ErrUnknownTrunk, parent)
 	}
-	return t.spawnTrunkAt(t.node(nodeKey).Branch)
+	return t.forkFlat(nodeKey, "conversation", true)
 }
 
 // CreateStump mints a markerless, named depth-1 child of the root — the
@@ -1463,12 +1539,10 @@ func (t *Trunks) CreateStump(name string) error {
 	if n := t.node(name); n != nil {
 		return fmt.Errorf("xwal: stump %q already exists", name)
 	}
-	// Fork the root at its tail (N-ary add-one), naming the child `name`,
-	// with no continuation and no trunk marker.
-	if _, err := t.forkChild(nil, name, nil); err != nil {
+	if err := t.forkFlatNamed("", name, "loadout"); err != nil {
 		return fmt.Errorf("xwal: create-stump %q: %w", name, err)
 	}
-	return t.rebuild()
+	return nil
 }
 
 // StumpHead opens a stump's branch for appending its birth content (IR +
@@ -1486,7 +1560,7 @@ func (t *Trunks) StumpHead(name string) (*XWAL, error) {
 	}
 	t.mu.RLock()
 	n := t.node(name)
-	if n == nil || !n.IsStump {
+	if n == nil || n.Kind != "loadout" {
 		t.mu.RUnlock()
 		endRootBorrow(t.registryRoot, t)
 		releaseLineage()
@@ -1518,11 +1592,10 @@ func (t *Trunks) SpawnUnderStump(name string) (TrunkID, error) {
 	if err := t.ensureNoOpenHeads(); err != nil {
 		return "", err
 	}
-	n := t.node(name)
-	if n == nil || !n.IsStump {
+	if n := t.node(name); n == nil || n.Kind != "loadout" {
 		return "", fmt.Errorf("xwal: no stump %q", name)
 	}
-	return t.spawnTrunkAt(n.Branch)
+	return t.forkFlat(name, "conversation", true)
 }
 
 // SpawnUnderRoot mints a new trunk directly under the root (a top-level
@@ -1536,27 +1609,7 @@ func (t *Trunks) SpawnUnderRoot() (TrunkID, error) {
 	if err := t.ensureNoOpenHeads(); err != nil {
 		return "", err
 	}
-	return t.spawnTrunkAt(nil)
-}
-
-// spawnTrunkAt forks the node at parentBranch at its tail (N-ary add-one),
-// mints a fresh trunk id for the child, and writes its .Trunk marker. Caller
-// holds t.mu.
-func (t *Trunks) spawnTrunkAt(parentBranch []string) (TrunkID, error) {
-	childDir := t.mintNode()
-	childTrunk := t.mintTrunk()
-	childBranch, err := t.forkChild(parentBranch, childDir, &forkCommit{ChildTrunk: childTrunk})
-	if err != nil {
-		return "", fmt.Errorf("xwal: spawn: %w", err)
-	}
-	// Incremental, not a rebuild: a spawn adds one leaf under a known parent,
-	// and that delta is fully known before any I/O. Re-walking the forest to
-	// learn it cost ~0.9ms per existing node on every mint. The index update
-	// goes last, after the marker is durable.
-	if err := t.idx.Spawn(strings.Join(parentBranch, "/"), strings.Join(childBranch, "/"), childTrunk, false); err != nil {
-		return "", err
-	}
-	return childTrunk, nil
+	return t.forkFlat("", "conversation", true)
 }
 
 // forkChild forks the node at parentBranch at its tail (N-ary add-one, no

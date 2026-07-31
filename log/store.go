@@ -8,11 +8,6 @@ import (
 	"github.com/jack-work/figwal/disk"
 )
 
-// ErrStoreExplicitParent reports an unsupported attempt to combine the
-// shared store with a caller-owned disk parent. The Store cannot safely
-// deduplicate or track the lifetime of that parent.
-var ErrStoreExplicitParent = errors.New("log store does not support Options.Parent")
-
 // Store owns shared log handles for one physical directory tree. It wraps a
 // disk.Store and creates exactly one immutable cache snapshot per physical
 // log. Fork children point at the same parent snapshot rather than copying
@@ -47,10 +42,9 @@ func NewStore() *Store {
 // Open returns the single shared cached Log for dir. Concurrent opens of the
 // same log wait for one cache construction; sibling opens share the same
 // parent snapshot pointer.
+// Open returns the shared cached Log for dir. An explicit opts.Parent is
+// honoured only for the first open of dir; the cache keys on dir alone.
 func (s *Store) Open(dir string, opts Options) (*Log, error) {
-	if opts.Parent != nil {
-		return nil, ErrStoreExplicitParent
-	}
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, err
@@ -98,11 +92,13 @@ func (s *Store) open(abs string, opts Options) (*Log, error) {
 		return nil, err
 	}
 
+	// Snapshot the parent the DISK log actually has, not filepath.Dir: a flat
+	// node's parent is a sibling named by the caller.
 	var parent *cacheSnapshot
-	if inner.Parent() != nil {
+	if p := inner.Parent(); p != nil {
 		parentOpts := opts
 		parentOpts.Parent = nil
-		parentLog, err := s.Open(filepath.Dir(abs), parentOpts)
+		parentLog, err := s.Open(p.Dir(), parentOpts)
 		if err != nil {
 			return nil, err
 		}

@@ -384,6 +384,9 @@ func (l *Log) TruncateFront(beforeIdx uint64) error {
 	return syncDir(l.dir)
 }
 
+// Dir is the log's directory.
+func (l *Log) Dir() string { return l.dir }
+
 func (l *Log) Read(idx uint64) ([]byte, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
