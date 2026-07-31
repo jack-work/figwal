@@ -217,7 +217,7 @@ func openTrunks(dir string, cfg Config) (*Trunks, error) {
 			return nil, err
 		}
 	}
-	if _, err := recoverManifestTopology(dir, cfg, man); err != nil {
+	if man, err = materializeManifestChannels(dir, cfg, man); err != nil {
 		return nil, err
 	}
 	x, err := Open(dir, cfg)

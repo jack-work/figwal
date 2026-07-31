@@ -121,3 +121,31 @@ func TestResplitBelowForksTheOwner(t *testing.T) {
 		}
 	}
 }
+
+// Reopening a flat store must not walk the directory tree as if it were
+// the lineage. A reducible channel's fork base belongs to a sibling
+// parent, so the open-time repair resolved it against the root and failed.
+func TestFlatStoreReopens(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "f")
+	f, trunk := seedTrunk(t, dir)
+	for range 4 {
+		_, lt, err := f.Append(trunk, 0, []byte(`"turn"`), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.AppendChannel(string(trunk), "chalkboard", lt, []byte(`{"a":1}`), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.ForkTail(trunk); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	g, err := openTrunks(dir, trunksCfg())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	g.Close()
+}

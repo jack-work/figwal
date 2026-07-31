@@ -636,32 +636,21 @@ func channelFromManifest(cfg Config, mc manifestChannel) (*channel, error) {
 	return ch, nil
 }
 
-func recoverManifestTopology(root string, cfg Config, man manifest) (manifest, error) {
-	codec, err := codecByName(man.Codec)
-	if err != nil {
-		return man, err
-	}
+// materializeManifestChannels backfills a channel the manifest declares but
+// disk never got: a store written before the channel existed, or a crash
+// between the manifest write and the backfill with no sentinel left behind.
+// A partial backfill is the sentinel's job, so the root dir is the whole
+// test — no forest walk.
+func materializeManifestChannels(root string, cfg Config, man manifest) (manifest, error) {
 	for _, mc := range man.Channels {
-		if mc.Name == man.Main {
-			continue
-		}
-		ch, err := channelFromManifest(cfg, mc)
-		if err != nil {
-			return man, err
-		}
-		recovery := &XWAL{root: root, main: man.Main, cfg: cfg, codec: codec}
-		needsRepair, err := recovery.channelTopologyNeedsRepair(ch)
-		if err != nil {
-			return man, err
-		}
-		if !needsRepair {
+		if mc.Name == man.Main || pathExists(filepath.Join(root, mc.Name)) {
 			continue
 		}
 		if err := writeChannelPending(root, channelPendingPlan{Channel: mc}); err != nil {
 			return man, err
 		}
-		man, err = recoverChannelPending(root, cfg, man)
-		if err != nil {
+		var err error
+		if man, err = recoverChannelPending(root, cfg, man); err != nil {
 			return man, err
 		}
 	}
@@ -918,67 +907,6 @@ func branchChannelNeedsRepair(
 		parentDir = dir
 	}
 	return false, nil
-}
-
-func (x *XWAL) channelTopologyNeedsRepair(ch *channel) (bool, error) {
-	mainBase := filepath.Join(x.root, x.main)
-	chBase := filepath.Join(x.root, ch.name)
-	var walk func(mainDir, chDir, parentChDir string, depth int) (bool, error)
-	walk = func(mainDir, chDir, parentChDir string, depth int) (bool, error) {
-		info, err := os.Stat(chDir)
-		if errors.Is(err, os.ErrNotExist) || err == nil && !info.IsDir() {
-			return true, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		if depth == 0 {
-			if ch.kind == ChannelReducible {
-				valid, err := validateWatermark(chDir, 1, x.codec, ch.initial)
-				if err != nil || !valid {
-					return true, nil
-				}
-			}
-		} else {
-			base, markerErr := readForkBaseFile(filepath.Join(chDir, ".fork"))
-			if markerErr != nil {
-				if first, ok, segmentErr := firstSegmentBase(chDir, x.codec); segmentErr != nil {
-					return false, segmentErr
-				} else if !ok || first != 1 {
-					return true, nil
-				}
-			} else if ch.kind == ChannelReducible {
-				state, err := x.backfillWatermarkState(parentChDir, base, ch)
-				if err != nil {
-					return false, err
-				}
-				valid, err := validateWatermark(chDir, base, x.codec, state)
-				if err != nil || !valid {
-					return true, nil
-				}
-			}
-		}
-		entries, err := os.ReadDir(mainDir)
-		if err != nil {
-			return false, err
-		}
-		for _, entry := range entries {
-			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
-				continue
-			}
-			needsRepair, err := walk(
-				filepath.Join(mainDir, entry.Name()),
-				filepath.Join(chDir, entry.Name()),
-				chDir,
-				depth+1,
-			)
-			if err != nil || needsRepair {
-				return needsRepair, err
-			}
-		}
-		return false, nil
-	}
-	return walk(mainBase, chBase, "", 0)
 }
 
 func (x *XWAL) channelOpts(ch *channel) disk.Options {
