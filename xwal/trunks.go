@@ -1139,7 +1139,10 @@ func (t *Trunks) Append(trunk string, atMainLT uint64, payload, meta []byte) (st
 // a path walk sees only the node itself and falls through to the root.
 // The root owns [1..]; it is returned as "".
 func (t *Trunks) ownerOf(node string, atMainLT uint64) (string, error) {
-	for node != "" {
+	for hops := t.idx.Len(); node != ""; node = t.idx.ParentOf(node) {
+		if hops--; hops < 0 {
+			return "", fmt.Errorf("xwal: lineage cycle below %q", node)
+		}
 		fb, err := t.readForkBase([]string{node})
 		if err != nil {
 			return "", err
@@ -1147,7 +1150,6 @@ func (t *Trunks) ownerOf(node string, atMainLT uint64) (string, error) {
 		if fb <= atMainLT {
 			return node, nil
 		}
-		node = t.idx.ParentOf(node)
 	}
 	return "", nil
 }

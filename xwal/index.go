@@ -112,6 +112,13 @@ func (x *Index) SpawnFlat(parent, child, trunk, kind string) {
 	x.version.Add(1)
 }
 
+// Len is the node count, a bound for lineage climbs.
+func (x *Index) Len() int {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	return len(x.nodes)
+}
+
 // ParentOf is the flat lineage link, for xwal.Config.ParentOf.
 func (x *Index) ParentOf(node string) string {
 	x.mu.RLock()

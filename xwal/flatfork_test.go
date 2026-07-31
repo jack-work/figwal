@@ -149,3 +149,20 @@ func TestFlatStoreReopens(t *testing.T) {
 	}
 	g.Close()
 }
+
+// A .from that points at itself must be an error, not a hung daemon.
+func TestOwnerOfRefusesALineageCycle(t *testing.T) {
+	f, trunk := seedTrunk(t, filepath.Join(t.TempDir(), "f"))
+	head, _ := f.idx.Head(trunk)
+	stump := f.idx.ParentOf(head)
+	n, _ := f.idx.Node(stump)
+	cycled := *n
+	cycled.From = stump
+	f.idx.mu.Lock()
+	f.idx.nodes[stump] = &cycled
+	f.idx.mu.Unlock()
+
+	if _, err := f.ownerOf(head, 1); err == nil {
+		t.Fatal("a self-referencing lineage climbed clean")
+	}
+}
