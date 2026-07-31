@@ -289,7 +289,7 @@ func parentRun(t *testing.T, f *Trunks, trunk TrunkID) (TrunkID, bool) {
 	if !ok {
 		t.Fatalf("no founding node for %s", trunk)
 	}
-	p := f.node(f.node(fk).Parent)
+	p := f.node(f.node(fk).From)
 	return p.Trunk, p.Kind == "loadout"
 }
 

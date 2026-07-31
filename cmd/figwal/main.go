@@ -495,12 +495,8 @@ func printTrunks(f *xwal.Trunks) {
 }
 
 func printNodes(f *xwal.Trunks) {
-	fmt.Printf("  %-20s %-8s %-7s %-6s %s\n", "NODE(branch)", "TRUNK", "FROZEN", "CLASS", "CHILDREN")
+	fmt.Printf("  %-20s %-8s %-8s %-6s %s\n", "NODE(branch)", "TRUNK", "KIND", "CLASS", "FROM")
 	for _, n := range f.Nodes() {
-		fr := ""
-		if n.Frozen() {
-			fr = "frozen"
-		}
 		id := branchJoin(n.Branch)
 		class := "trunk"
 		if id == "" {
@@ -508,7 +504,7 @@ func printNodes(f *xwal.Trunks) {
 		} else if n.Trunk == "" {
 			class = "stump"
 		}
-		fmt.Printf("  %-20s %-8s %-7s %-6s %d\n", id, n.Trunk, fr, class, len(n.Children))
+		fmt.Printf("  %-20s %-8s %-8s %-6s %s\n", id, n.Trunk, n.Kind, class, dash(n.From))
 	}
 }
 

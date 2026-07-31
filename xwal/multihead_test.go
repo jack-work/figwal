@@ -5,11 +5,12 @@ import (
 	"testing"
 )
 
-// liveLeaves returns the live (unfrozen) leaf node keys carrying a trunk id.
+// liveLeaves returns the node keys carrying a trunk id. A flat fork never
+// freezes a parent, so every such node is live.
 func liveLeaves(t *Trunks, trunk string) []string {
 	var out []string
 	for k, n := range t.idx.All() {
-		if n.Trunk == trunk && !n.Frozen() {
+		if n.Trunk == trunk {
 			out = append(out, k)
 		}
 	}

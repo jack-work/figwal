@@ -46,7 +46,7 @@ func repairCoherentCuts(t *Trunks) error {
 		return err
 	}
 	for key, n := range t.idx.All() {
-		if len(n.Children) > 0 {
+		if len(t.idx.ChildrenOf(key)) > 0 {
 			continue
 		}
 		mainTail, err := nodeMainTail(filepath.Join(append([]string{t.root, man.Main}, n.Branch...)...), codec)

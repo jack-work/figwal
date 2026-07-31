@@ -111,6 +111,21 @@ func (x *Index) SpawnFlat(parent, child, trunk, kind string) {
 	x.version.Add(1)
 }
 
+// ChildrenOf is every node forked from key. Derived, not stored: a flat
+// fork writes only the child's own .from, so the parent has no list.
+func (x *Index) ChildrenOf(key string) []string {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	var out []string
+	for k, n := range x.nodes {
+		if n.From == key {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Len is the node count, a bound for lineage climbs.
 func (x *Index) Len() int {
 	x.mu.RLock()

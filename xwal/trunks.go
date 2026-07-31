@@ -1415,7 +1415,7 @@ func (t *Trunks) remove(trunk string, recursive bool) ([]TrunkID, error) {
 		if n.IsRoot {
 			return nil, fmt.Errorf("xwal: cannot remove the root trunk %q", trunk)
 		}
-		if p := t.node(n.Parent); p == nil || p.Trunk != trunk {
+		if p := t.node(n.From); p == nil || p.Trunk != trunk {
 			foundKey, ok = key, true
 			break
 		}
@@ -1435,7 +1435,7 @@ func (t *Trunks) remove(trunk string, recursive bool) ([]TrunkID, error) {
 		if n.Trunk != "" {
 			sub[n.Trunk] = true
 		}
-		for _, c := range n.Children {
+		for _, c := range t.idx.ChildrenOf(key) {
 			walk(c)
 		}
 	}
@@ -1690,23 +1690,23 @@ func (t *Trunks) Promote(trunk TrunkID, levels int) (int, error) {
 	climbed := 0
 	for climbed < levels {
 		f := t.node(foundKey)
-		p := t.node(f.Parent)
+		p := t.node(f.From)
 		if f.IsRoot || p == nil || p.IsRoot || p.Kind == "loadout" {
 			break // ceremonial boundary above — cannot climb further
 		}
 		parentID := p.Trunk
 		// Walk up from p (toward the root) through the consecutive same-id run,
 		// stopping when the node above has a different id (or is a stump/root).
-		runTop := f.Parent
+		runTop := f.From
 		for {
-			up := t.node(t.node(runTop).Parent)
+			up := t.node(t.node(runTop).From)
 			if up == nil || up.IsRoot || up.Kind == "loadout" || up.Trunk != parentID {
 				break
 			}
-			runTop = t.node(runTop).Parent
+			runTop = t.node(runTop).From
 		}
 		// Relabel the run [runTop .. p] to the promoted id on disk.
-		for cur := f.Parent; ; cur = t.node(cur).Parent {
+		for cur := f.From; ; cur = t.node(cur).From {
 			if err := writeTrunkID(t.irDir(t.node(cur).Branch), trunk); err != nil {
 				return climbed, err
 			}
@@ -1730,7 +1730,7 @@ func (t *Trunks) foundingNode(trunk TrunkID) (string, bool) {
 		if n.Trunk != trunk {
 			continue
 		}
-		if p := t.node(n.Parent); p == nil || p.Trunk != trunk {
+		if p := t.node(n.From); p == nil || p.Trunk != trunk {
 			return key, true
 		}
 	}
@@ -1756,7 +1756,7 @@ func (t *Trunks) Stumps() []StumpInfo {
 			continue
 		}
 		si := StumpInfo{Name: n.stumpName()}
-		for _, ck := range n.Children {
+		for _, ck := range t.idx.ChildrenOf(n.stumpName()) {
 			if c := t.node(ck); c != nil && c.Trunk != "" {
 				si.Children = append(si.Children, c.Trunk)
 			}

@@ -80,7 +80,7 @@ func TestForest_FuzzSequential(t *testing.T) {
 			// sibling continuations.)
 			n := 0
 			for k, nd := range f.idx.All() {
-				if nd.Trunk == tk && !nd.Frozen() {
+				if nd.Trunk == tk {
 					n++
 					if f.head(tk) != k {
 						t.Fatalf("trunk %s: live leaf %s is not the head (%s)", tk, k, f.head(tk))
