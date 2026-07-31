@@ -117,6 +117,7 @@ func runCycles(t *testing.T, md verifyMode) {
 		}
 		m, vs := reconcile(dir, salt, md)
 		report(t, gaps, fmt.Sprintf("seed=%d store=%d baseline", seed, si), vs)
+		wrecked := false
 		for ci := 0; ci < perStore; ci++ {
 			total++
 			childSeed := rng.Int63()
@@ -126,12 +127,13 @@ func runCycles(t *testing.T, md verifyMode) {
 			cutoff, err := runChildOnce(dir, childSeed, salt, delay, m)
 			if err != nil {
 				keepStore(t, dir, ctx+" child-error")
-				if md == modeCorrupt {
-					// The prefix this store shares was deliberately wrecked;
-					// a child that cannot run against it is the expected
-					// outcome, not a defect. Abandon it like any other
-					// corruption casualty. modeKill stays fatal.
-					t.Logf("%s: child cannot run against the corrupted store: %v", ctx, err)
+				if wrecked {
+					// THIS store has had a segment deliberately overwritten.
+					// Prefix sharing means a child is exactly as sound as its
+					// parent's prefix, so a child that cannot run is the
+					// damage we caused. Only then; every other child error,
+					// in either mode, is still a defect.
+					t.Logf("%s: child cannot run against the wrecked store: %v", ctx, err)
 					break
 				}
 				t.Fatalf("%s: %v", ctx, err)
@@ -145,6 +147,9 @@ func runCycles(t *testing.T, md verifyMode) {
 				hit, err := corruptTail(rng, dir, cycleStart)
 				if err != nil {
 					t.Fatalf("%s: corrupt: %v", ctx, err)
+				}
+				if len(hit) > 0 {
+					wrecked = true
 				}
 				ctx = fmt.Sprintf("%s corrupted=%v", ctx, hit)
 			}
