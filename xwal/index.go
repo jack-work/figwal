@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -102,11 +103,16 @@ func (x *Index) Spawn(parent, child, trunk string, isStump bool) error {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	if p := x.nodes[parent]; p != nil && !contains(p.Children, child) {
-		p.Children = append(p.Children, child)
-		if p.Trunk != "" {
-			delete(x.heads, p.Trunk)
-			if p.Trunk != trunk {
-				x.reheadLocked(p.Trunk)
+		// Replace, do not mutate: Node hands callers the live pointer, and a
+		// reader holding one reads it without the lock. Appending in place
+		// made "treat NodeInfo as immutable" a promise the writer broke.
+		next := *p
+		next.Children = append(slices.Clone(p.Children), child)
+		x.nodes[parent] = &next
+		if next.Trunk != "" {
+			delete(x.heads, next.Trunk)
+			if next.Trunk != trunk {
+				x.reheadLocked(next.Trunk)
 			}
 		}
 	}
@@ -124,20 +130,26 @@ func (x *Index) Spawn(parent, child, trunk string, isStump bool) error {
 func (x *Index) Drop(nodeKeys, trunkIDs []string) error {
 	x.mu.Lock()
 	defer x.mu.Unlock()
+	touched := map[string]bool{}
 	for _, key := range nodeKeys {
 		if n := x.nodes[key]; n != nil {
+			touched[n.Trunk] = true
 			if p := x.nodes[n.Parent]; p != nil {
-				p.Children = remove(p.Children, key)
+				next := *p
+				next.Children = remove(p.Children, key)
+				x.nodes[n.Parent] = &next
+				touched[next.Trunk] = true
 			}
 		}
 		delete(x.nodes, key)
 	}
 	for _, id := range trunkIDs {
 		delete(x.heads, id)
+		touched[id] = true
 	}
-	for key, n := range x.nodes {
-		if n.Trunk != "" && !n.Frozen() {
-			x.heads[n.Trunk] = key
+	for id := range touched {
+		if id != "" {
+			x.reheadLocked(id)
 		}
 	}
 	x.version.Add(1)
@@ -155,6 +167,10 @@ func (x *Index) reheadLocked(trunk string) {
 	}
 }
 
+// MintNode and MintTrunk do not persist their counters and cannot fail.
+// RebuildFrom recovers them from the n<N>/t<N> suffixes of directory names, so
+// a crash between minting an id and creating its directory leaks one integer
+// and self-corrects. Ids are opaque; gaps are not a defect.
 func (x *Index) MintNode() string {
 	x.mu.Lock()
 	defer x.mu.Unlock()
@@ -163,15 +179,6 @@ func (x *Index) MintNode() string {
 	return id
 }
 
-// MintNode and MintTrunk do not persist their counters and cannot fail.
-//
-// A durable sequence would stop a crash between minting an id and creating its
-// directory from leaking that id. The counters are recovered instead by
-// RebuildFrom, off the n<N>/t<N> suffixes of directory names, so a leak costs
-// one skipped integer and is corrected on the next open. A durable counter
-// would put a synchronous write on the create path, which is the path this
-// exists to make cheap, to close a gap in a sequence nobody reads for meaning.
-// Ids are opaque; gaps are not a defect.
 func (x *Index) MintTrunk() string {
 	if x.mintID != nil {
 		return x.mintID()
