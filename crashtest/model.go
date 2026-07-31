@@ -58,6 +58,12 @@ func (cm *chanModel) lastLT() uint64 {
 }
 
 type model struct {
+	// lenient re-bases a channel instead of failing when the child numbers
+	// above the model. Only modeCorrupt sets it: corrupting a shared prefix
+	// retroactively invalidates every descendant's fork base, which is the
+	// point of the mode. modeKill stays strict — that strictness is what
+	// caught every real fork-base defect.
+	lenient         bool
 	trunks          map[string]map[string]*chanModel
 	baselineOnly    map[string]bool
 	pendingFork     map[string]uint64
@@ -115,8 +121,11 @@ func (m *model) apply(line string) error {
 			cm.base = clt
 		}
 		if clt != cm.base+uint64(len(cm.recs)) {
-			return fmt.Errorf("model divergence on %q: next chanLT %d, child reports %d",
-				line, cm.base+uint64(len(cm.recs)), clt)
+			if !m.lenient {
+				return fmt.Errorf("model divergence on %q: next chanLT %d, child reports %d",
+					line, cm.base+uint64(len(cm.recs)), clt)
+			}
+			cm.base, cm.recs, cm.synced = clt, nil, 0
 		}
 		cm.recs = append(cm.recs, entry{mainLT: mlt, q: q, stamp: stamp, g: trunk, reported: true})
 		return nil
@@ -328,8 +337,9 @@ func verifyModeled(trunk, ch string, recs []Rec, cm *chanModel, salt string, md 
 	return vs
 }
 
-func reconcile(dir string, salt string) (*model, []violation) {
+func reconcile(dir, salt string, md verifyMode) (*model, []violation) {
 	m := newModel()
+	m.lenient = md == modeCorrupt
 	st, err := openStore(dir)
 	if err != nil {
 		return m, []violation{{class: vOpenFailed, detail: "reconcile: " + err.Error()}}

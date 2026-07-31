@@ -8,8 +8,8 @@ import (
 	"log/slog"
 	"math/rand"
 	"os"
-	"sync"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -115,7 +115,7 @@ func runCycles(t *testing.T, md verifyMode) {
 		if err := st.Close(); err != nil {
 			t.Fatalf("seed=%d store=%d close: %v", seed, si, err)
 		}
-		m, vs := reconcile(dir, salt)
+		m, vs := reconcile(dir, salt, md)
 		report(t, gaps, fmt.Sprintf("seed=%d store=%d baseline", seed, si), vs)
 		for ci := 0; ci < perStore; ci++ {
 			total++
@@ -125,6 +125,7 @@ func runCycles(t *testing.T, md verifyMode) {
 			cycleStart := time.Now()
 			cutoff, err := runChildOnce(dir, childSeed, salt, delay, m)
 			if err != nil {
+				keepStore(t, dir, ctx+" child-error")
 				t.Fatalf("%s: %v", ctx, err)
 			}
 			if m.closedClean {
@@ -155,7 +156,7 @@ func runCycles(t *testing.T, md verifyMode) {
 			}
 			cycleVs := verify(dir, m, salt, md, cutoff)
 			report(t, g, ctx, cycleVs)
-			m, vs = reconcile(dir, salt)
+			m, vs = reconcile(dir, salt, md)
 			report(t, g, ctx+" reconcile", vs)
 			for _, v := range append(append([]violation(nil), cycleVs...), vs...) {
 				if !g[v.class] {
