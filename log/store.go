@@ -41,9 +41,8 @@ func NewStore() *Store {
 
 // Open returns the single shared cached Log for dir. Concurrent opens of the
 // same log wait for one cache construction; sibling opens share the same
-// parent snapshot pointer.
-// Open returns the shared cached Log for dir. An explicit opts.Parent is
-// honoured only for the first open of dir; the cache keys on dir alone.
+// parent snapshot pointer. An explicit opts.Parent is honoured only for the
+// first open of dir; the cache keys on dir alone.
 func (s *Store) Open(dir string, opts Options) (*Log, error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {

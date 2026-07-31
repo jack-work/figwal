@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -129,76 +128,6 @@ func (x *Index) ParentOf(node string) string {
 	return ""
 }
 
-// Spawn adds one leaf: the child, the parent gaining it, and the child
-// trunk's head. The parent stops being a head the moment it has a child.
-func (x *Index) Spawn(parent, child, trunk string, isStump bool) error {
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	if p := x.nodes[parent]; p != nil && !contains(p.Children, child) {
-		// Replace, do not mutate: Node hands callers the live pointer, and a
-		// reader holding one reads it without the lock. Appending in place
-		// made "treat NodeInfo as immutable" a promise the writer broke.
-		next := *p
-		next.Children = append(slices.Clone(p.Children), child)
-		x.nodes[parent] = &next
-		if next.Trunk != "" {
-			delete(x.heads, next.Trunk)
-			if next.Trunk != trunk {
-				x.reheadLocked(next.Trunk)
-			}
-		}
-	}
-	x.nodes[child] = &NodeInfo{
-		Branch: strings.Split(child, "/"), Trunk: trunk, Parent: parent, IsStump: isStump,
-	}
-	if trunk != "" {
-		x.heads[trunk] = child
-	}
-	x.bumpSeqsLocked(child, trunk)
-	x.version.Add(1)
-	return nil
-}
-
-func (x *Index) Drop(nodeKeys, trunkIDs []string) error {
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	touched := map[string]bool{}
-	for _, key := range nodeKeys {
-		if n := x.nodes[key]; n != nil {
-			touched[n.Trunk] = true
-			if p := x.nodes[n.Parent]; p != nil {
-				next := *p
-				next.Children = remove(p.Children, key)
-				x.nodes[n.Parent] = &next
-				touched[next.Trunk] = true
-			}
-		}
-		delete(x.nodes, key)
-	}
-	for _, id := range trunkIDs {
-		delete(x.heads, id)
-		touched[id] = true
-	}
-	for id := range touched {
-		if id != "" {
-			x.reheadLocked(id)
-		}
-	}
-	x.version.Add(1)
-	return nil
-}
-
-// reheadLocked points trunk at its one live leaf, or drops it if it has none.
-func (x *Index) reheadLocked(trunk string) {
-	delete(x.heads, trunk)
-	for key, n := range x.nodes {
-		if n.Trunk == trunk && !n.Frozen() {
-			x.heads[trunk] = key
-			return
-		}
-	}
-}
-
 // MintNode and MintTrunk do not persist their counters and cannot fail.
 // RebuildFrom recovers them from the n<N>/t<N> suffixes of directory names, so
 // a crash between minting an id and creating its directory leaks one integer
@@ -299,25 +228,6 @@ func (x *Index) bumpSeqsLocked(key, trunkID string) {
 	if n := numSuffix(trunkID, 't'); n+1 > x.trunkSeq {
 		x.trunkSeq = n + 1
 	}
-}
-
-func contains(s []string, v string) bool {
-	for _, x := range s {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}
-
-func remove(s []string, v string) []string {
-	out := make([]string, 0, len(s))
-	for _, x := range s {
-		if x != v {
-			out = append(out, x)
-		}
-	}
-	return out
 }
 
 // .from is "<parent>\n<kind>\n". Its absence marks the null root.
