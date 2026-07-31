@@ -1134,61 +1134,22 @@ func (t *Trunks) Append(trunk string, atMainLT uint64, payload, meta []byte) (st
 	return trunk, lt, nil
 }
 
-// resplitBelow forks the ancestor node along `branch` that OWNS atMainLT (a
-// frozen branch point) at atMainLT+1, minting a new alternative trunk that
-// shares [1..atMainLT]. The owner's original timeline beyond atMainLT — its
-// suffix and ALL its child forks (including the caller's own trunk) — re-homes
-// into the continuation (which keeps the owner's trunk id, the normal
-// continuation-chain behavior). Caller holds t.mu. This is how a fork at an
-// inherited LT (a turn shared with ancestors) produces a sibling branch.
-func (t *Trunks) resplitBelow(branch []string, atMainLT uint64) (string, error) {
-	ownerBranch, err := t.ownerOf(branch, atMainLT)
-	if err != nil {
-		return "", err
-	}
-	altDir := t.mintNode()
-	contDir := t.mintNode()
-	altTrunk := t.mintTrunk()
-	owner := t.node(strings.Join(ownerBranch, "/"))
-	sourceTrunk := ""
-	if owner != nil {
-		sourceTrunk = owner.Trunk
-	}
-	ox, err := t.openForkSource(ownerBranch)
-	if err != nil {
-		return "", err
-	}
-	// child = alt; old-future = cont (re-homes children).
-	child, ferr := ox.forkJoint(atMainLT+1, altDir, contDir,
-		&forkCommit{SourceTrunk: sourceTrunk, ChildTrunk: altTrunk})
-	ox.Close()
-	if ferr != nil {
-		return "", fmt.Errorf("re-split-below: %w", ferr)
-	}
-	t.markForkResultValidated(ownerBranch, altDir, contDir)
-	child.Close()
-	return altTrunk, t.rebuild()
-}
-
-// ownerOf returns the branch of the deepest node along `branch` whose own
-// segments contain atMainLT (the deepest with forkBase <= atMainLT). For an
-// atMainLT below the head's own range this is a strict ancestor — the
-// re-split-below target.
-func (t *Trunks) ownerOf(branch []string, atMainLT uint64) ([]string, error) {
-	owner := []string(nil) // root owns [1..]
-	for i := 1; i <= len(branch); i++ {
-		sub := branch[:i]
-		fb, err := t.readForkBase(sub)
+// ownerOf is the nearest ancestor of node whose own range covers atMainLT.
+// It climbs the LINEAGE, not the directory: every flat node is depth-1, so
+// a path walk sees only the node itself and falls through to the root.
+// The root owns [1..]; it is returned as "".
+func (t *Trunks) ownerOf(node string, atMainLT uint64) (string, error) {
+	for node != "" {
+		fb, err := t.readForkBase([]string{node})
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 		if fb <= atMainLT {
-			owner = append([]string(nil), sub...)
-		} else {
-			break
+			return node, nil
 		}
+		node = t.idx.ParentOf(node)
 	}
-	return owner, nil
+	return "", nil
 }
 
 func (t *Trunks) readForkBase(branch []string) (uint64, error) {
@@ -1349,11 +1310,11 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 	if atMainLT < ownFirst {
 		// Flat: fork the ancestor that owns atMainLT, in place.
 		t.retireRootHotPreservingValidation()
-		owner, oerr := t.ownerOf(branch, atMainLT)
+		owner, oerr := t.ownerOf(strings.Join(branch, "/"), atMainLT)
 		if oerr != nil {
 			return "", oerr
 		}
-		return t.forkFlatAt(strings.Join(owner, "/"), atMainLT)
+		return t.forkFlatAt(owner, atMainLT)
 	}
 
 	// Interior fork: a sibling sharing [1..atMainLT]. The parent keeps its
@@ -1650,11 +1611,11 @@ func (t *Trunks) OwnerTrunk(trunk string, atMainLT uint64) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	ob, err := t.ownerOf(branch, atMainLT)
+	ob, err := t.ownerOf(strings.Join(branch, "/"), atMainLT)
 	if err != nil {
 		return "", err
 	}
-	n := t.node(strings.Join(ob, "/"))
+	n := t.node(ob)
 	if n == nil {
 		return "", fmt.Errorf("xwal: no owner node for main-LT %d on trunk %q", atMainLT, trunk)
 	}
@@ -1682,11 +1643,11 @@ func (t *Trunks) Owner(trunk TrunkID, atMainLT uint64) (Owner, error) {
 	if err != nil {
 		return Owner{}, err
 	}
-	ob, err := t.ownerOf(branch, atMainLT)
+	ob, err := t.ownerOf(strings.Join(branch, "/"), atMainLT)
 	if err != nil {
 		return Owner{}, err
 	}
-	n := t.node(strings.Join(ob, "/"))
+	n := t.node(ob)
 	if n == nil {
 		return Owner{}, fmt.Errorf("xwal: no owner node for main-LT %d on trunk %q", atMainLT, trunk)
 	}

@@ -83,3 +83,41 @@ func TestFlatForkInheritsPrefix(t *testing.T) {
 		t.Fatalf("child cannot read shared LT 2: %v", err)
 	}
 }
+
+// A fork below a node's own first index must fork the ancestor that owns
+// that LT. Walking the directory branch cannot find it: every flat node is
+// depth-1, so the walk falls through to the root and the child ends up
+// numbering above a hole in its own prefix.
+func TestResplitBelowForksTheOwner(t *testing.T) {
+	f, trunk := seedTrunk(t, filepath.Join(t.TempDir(), "f"))
+	for range 6 {
+		if _, _, err := f.Append(trunk, 0, []byte(`"turn"`), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	owner, _ := f.idx.Head(trunk)
+	alt, err := f.ForkTail(trunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const at = 3
+	deep, err := f.ForkAt(alt, at)
+	if err != nil {
+		t.Fatalf("fork at %d: %v", at, err)
+	}
+	key, _ := f.idx.Head(deep)
+	n, _ := f.idx.Node(key)
+	if n.From != owner {
+		t.Errorf("re-split lineage = %q, want the owner %q", n.From, owner)
+	}
+	x, err := f.Head(deep)
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	defer x.Close()
+	for i := uint64(1); i <= at; i++ {
+		if _, err := x.chans[f.main].log.Read(i); err != nil {
+			t.Fatalf("shared prefix LT %d unreadable: %v", i, err)
+		}
+	}
+}
