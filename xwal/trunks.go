@@ -1352,6 +1352,12 @@ func (t *Trunks) forkFlatAt(parentKey string, atMainLT uint64) (string, error) {
 			lt = 0
 		}
 		base := lt + 1
+		// A child can never reach past what its parent itself exposes. lookup
+		// walks the lineage; the parent's own fork base may sever it, and a
+		// base above the parent's tail leaves the child numbering over a hole.
+		if base > c.Last+1 {
+			base = c.Last + 1
+		}
 		if base < c.First {
 			base = c.First
 		}
