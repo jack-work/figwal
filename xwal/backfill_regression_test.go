@@ -91,7 +91,7 @@ func TestEnsureNewReducibleRepairsMissingForkWatermark(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	branch := f.nodes[f.heads[alt]].branch
+	branch := f.node(f.head(alt)).Branch
 	nodeDir := filepath.Join(append([]string{dir, spec.Name}, branch...)...)
 	base, err := readForkBaseFile(filepath.Join(nodeDir, ".fork"))
 	if err != nil {
@@ -173,7 +173,7 @@ func TestForkPreflightRepairsMissingReducibleWatermark(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	branch := append([]string(nil), f.nodes[f.heads[alt]].branch...)
+	branch := append([]string(nil), f.node(f.head(alt)).Branch...)
 	nodeDir := filepath.Join(append([]string{dir, "chalkboard"}, branch...)...)
 	base, err := readForkBaseFile(filepath.Join(nodeDir, ".fork"))
 	if err != nil {
@@ -229,7 +229,7 @@ func TestForkPreflightRepairsDeepEmptyBaseTwoWatermark(t *testing.T) {
 		}
 	}
 
-	branch := append([]string(nil), f.nodes[f.heads[trunk]].branch...)
+	branch := append([]string(nil), f.node(f.head(trunk)).Branch...)
 	targetBranch := branch[:len(branch)-4]
 	nodeDir := filepath.Join(append([]string{dir, "chalkboard"}, targetBranch...)...)
 	base, err := readForkBaseFile(filepath.Join(nodeDir, ".fork"))
@@ -304,7 +304,7 @@ func TestForkPreflightRepairsWatermarkHeaderPreservingEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	branch := append([]string(nil), f.nodes[f.heads[trunk]].branch...)
+	branch := append([]string(nil), f.node(f.head(trunk)).Branch...)
 	nodeDir := filepath.Join(append([]string{dir, "chalkboard"}, branch...)...)
 	base, err := readForkBaseFile(filepath.Join(nodeDir, ".fork"))
 	if err != nil {
@@ -499,7 +499,7 @@ func TestEnsureRepairsReducibleArtifactsBeforeFork(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			branch := f.nodes[f.heads[trunk]].branch
+			branch := f.node(f.head(trunk)).Branch
 			nodeDir := filepath.Join(append([]string{dir, spec.Name}, branch...)...)
 			base, err := readForkBaseFile(filepath.Join(nodeDir, ".fork"))
 			if err != nil {

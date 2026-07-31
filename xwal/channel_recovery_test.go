@@ -39,7 +39,7 @@ func TestOpenTrunksCompletesPendingChannelBeforeManifest(t *testing.T) {
 func TestOpenTrunksCompletesPartialReducibleBackfill(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	f, trunk := seedTrunk(t, dir)
-	branch := append([]string(nil), f.nodes[f.heads[trunk]].branch...)
+	branch := append([]string(nil), f.node(f.head(trunk)).Branch...)
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}

@@ -498,7 +498,7 @@ func printNodes(f *xwal.Trunks) {
 	fmt.Printf("  %-20s %-8s %-7s %-6s %s\n", "NODE(branch)", "TRUNK", "FROZEN", "CLASS", "CHILDREN")
 	for _, n := range f.Nodes() {
 		fr := ""
-		if n.Frozen {
+		if n.Frozen() {
 			fr = "frozen"
 		}
 		id := branchJoin(n.Branch)

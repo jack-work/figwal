@@ -8,8 +8,8 @@ import (
 // liveLeaves returns the live (unfrozen) leaf node keys carrying a trunk id.
 func liveLeaves(t *Trunks, trunk string) []string {
 	var out []string
-	for k, n := range t.nodes {
-		if n.trunk == trunk && !n.frozen {
+	for k, n := range t.idx.All() {
+		if n.Trunk == trunk && !n.Frozen() {
 			out = append(out, k)
 		}
 	}
@@ -48,8 +48,8 @@ func TestForest_RepeatedTailForkOneHead(t *testing.T) {
 
 	}
 	// And the head is the single leaf.
-	if got := liveLeaves(f, conv); len(got) != 1 || f.heads[conv] != got[0] {
-		t.Fatalf("conv head=%s leaves=%v", f.heads[conv], got)
+	if got := liveLeaves(f, conv); len(got) != 1 || f.head(conv) != got[0] {
+		t.Fatalf("conv head=%s leaves=%v", f.head(conv), got)
 	}
 }
 
@@ -60,7 +60,7 @@ func TestOpenRejectsMultipleHeads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondBranch := f.nodes[f.heads[second]].branch
+	secondBranch := f.node(f.head(second)).Branch
 	if err := writeTrunkID(f.irDir(secondBranch), first); err != nil {
 		t.Fatal(err)
 	}

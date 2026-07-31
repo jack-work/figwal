@@ -289,8 +289,8 @@ func parentRun(t *testing.T, f *Trunks, trunk TrunkID) (TrunkID, bool) {
 	if !ok {
 		t.Fatalf("no founding node for %s", trunk)
 	}
-	p := f.nodes[f.nodes[fk].parent]
-	return p.trunk, p.isStump
+	p := f.node(f.node(fk).Parent)
+	return p.Trunk, p.IsStump
 }
 
 func TestPromote_ClimbsAndStopsAtStump(t *testing.T) {

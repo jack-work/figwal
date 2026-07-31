@@ -24,6 +24,9 @@ type StoreOptions struct {
 	SegmentSize int64
 	Genesis     []byte
 	MintTrunkID func() string
+	// Index supplies a maintained topology index instead of the default,
+	// which re-walks the marker tree. See TopologyIndex.
+	Index TopologyIndex
 }
 
 type Store struct {
@@ -362,6 +365,7 @@ func (o StoreOptions) config() Config {
 		MaxUnflushedBytes: o.MaxUnflushedBytes,
 		Genesis:           o.Genesis,
 		MintTrunkID:       o.MintTrunkID,
+		Index:             o.Index,
 	}
 	opaque := make(map[string]bool, len(o.Opaque))
 	for _, name := range o.Opaque {

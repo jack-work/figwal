@@ -85,6 +85,9 @@ type Config struct {
 	// consumer use opaque ids; not persisted directly — the ids land in
 	// the .trunk markers.
 	MintTrunkID func() string
+	// Index supplies a maintained node/trunk index instead of the default,
+	// which re-walks the marker tree on every mutation. See TopologyIndex.
+	Index TopologyIndex
 }
 
 var errStopRange = errors.New("xwal: stop range")

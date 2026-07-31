@@ -21,7 +21,7 @@ func TestForkPreflightRepairBudget(t *testing.T) {
 		t.Fatalf("deep repairs for validated topology = %d, want 0", repairs)
 	}
 
-	branch := f.nodes[f.heads[trunk]].branch
+	branch := f.node(f.head(trunk)).Branch
 	f.retireRootHot()
 	marker := filepath.Join(append([]string{dir, "chalkboard"}, branch...)...)
 	if err := os.Remove(filepath.Join(marker, ".fork")); err != nil {

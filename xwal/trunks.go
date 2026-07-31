@@ -42,15 +42,13 @@ type Trunks struct {
 
 	registryRoot string
 
-	mu       sync.RWMutex
-	nodes    map[string]*tnode // key = branch joined by "/" ("" = root)
-	heads    map[string]string // trunk id -> head node key (the one live leaf)
-	nodeSeq  int               // next "n<N>" dir name
-	trunkSeq int               // next "t<N>" trunk id
+	mu sync.RWMutex
+	// idx is the node/trunk index. Default memIndex walks the markers, as
+	// this type used to inline; Config.Index swaps in a maintained one.
+	idx TopologyIndex
 
 	// version is the local rebuild cookie; rootEpoch tracks mutations made
 	// through any in-process peer for the same canonical root.
-	version   atomic.Uint64
 	rootEpoch atomic.Uint64
 
 	hotMu   sync.Mutex
@@ -123,24 +121,6 @@ type (
 	TrunkID = string
 )
 
-type tnode struct {
-	branch   []string
-	trunk    string
-	frozen   bool     // has child forks
-	children []string // child node keys
-	parent   string   // parent node key ("" = root's absent parent; root key is also "")
-	isRoot   bool
-	isStump  bool // a markerless depth-1 child of the root (cauterization boundary)
-}
-
-// stumpName is the stump's identity: its (single) branch dir name. Empty
-// for non-stumps.
-func (n *tnode) stumpName() string {
-	if n.isStump && len(n.branch) == 1 {
-		return n.branch[0]
-	}
-	return ""
-}
 
 const trunkMarker = ".trunk"
 
@@ -198,7 +178,7 @@ func createTrunks(dir string, cfg Config) (*Trunks, error) {
 	}
 	x.Close()
 
-	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: cfg.Main}
+	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: cfg.Main, idx: pickIndex(cfg)}
 	if err := t.rebuild(); err != nil {
 		return nil, err
 	}
@@ -251,7 +231,7 @@ func openTrunks(dir string, cfg Config) (*Trunks, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: main}
+	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: main, idx: pickIndex(cfg)}
 	if err := t.rebuild(); err != nil {
 		return nil, err
 	}
@@ -266,17 +246,18 @@ func openTrunks(dir string, cfg Config) (*Trunks, error) {
 // node + trunk cache from disk (dirs + .trunk markers). Source of truth.
 // Every completed rebuild bumps the version counter so external
 // consumers can probe for topology changes without a walk of their own.
+// node and head read the index; node returns nil when absent, matching the
+// map lookup this replaced.
+func (t *Trunks) node(key string) *NodeInfo { n, _ := t.idx.Node(key); return n }
+func (t *Trunks) head(trunk string) string  { k, _ := t.idx.Head(trunk); return k }
+
 func (t *Trunks) rebuild() error {
 	oldVersion := t.Version()
 	t.retireRootHotPreservingValidation()
-	t.nodes = map[string]*tnode{}
-	t.heads = map[string]string{}
-	t.nodeSeq, t.trunkSeq = 0, 0
-	base := filepath.Join(t.root, t.main)
-	if err := t.walk(base, nil, "", true); err != nil {
+	if err := t.idx.RebuildFrom(filepath.Join(t.root, t.main)); err != nil {
 		return err
 	}
-	newVersion := t.version.Add(1)
+	newVersion := t.Version()
 	t.validationMu.Lock()
 	if t.validatedTopologyVersion != 0 && t.validatedTopologyVersion == oldVersion {
 		t.validatedTopologyVersion = newVersion
@@ -293,7 +274,7 @@ func (t *Trunks) rebuild() error {
 // Consumers cache derived state (e.g. head-of-trunk lookups, node
 // listings) against the version they last observed; if Version()
 // changes, the cache is stale. Cheap: one atomic load, no lock.
-func (t *Trunks) Version() uint64 { return t.version.Load() }
+func (t *Trunks) Version() uint64 { return t.idx.Version() }
 
 // Refresh re-scans the on-disk trunk marker layout and re-derives the
 // in-memory index. In single-process land it is redundant — every
@@ -311,74 +292,23 @@ func (t *Trunks) Refresh() error {
 	return t.rebuild()
 }
 
-func (t *Trunks) walk(dir string, branch []string, parentKey string, isRoot bool) error {
-	key := strings.Join(branch, "/")
-	trunkID, _ := readTrunkID(dir)
-	ents, err := os.ReadDir(dir)
-	if err != nil {
-		return err
-	}
-	var kids []string
-	for _, e := range ents {
-		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
-			kids = append(kids, e.Name())
-		}
-	}
-	// Node class is positional + marker-based: the root is the channel dir
-	// itself (depth 0, no marker); a stump is a markerless depth-1 child of
-	// the root (named <loadout>@<hash>); everything with a .trunk marker is a
-	// trunk. A markerless node deeper than depth-1 is treated as part of its
-	// parent's trunk's plumbing (shouldn't arise in the new layout).
-	n := &tnode{
-		branch: append([]string(nil), branch...),
-		trunk:  trunkID, frozen: len(kids) > 0, parent: parentKey, isRoot: isRoot,
-		isStump: !isRoot && trunkID == "" && len(branch) == 1,
-	}
-	for _, k := range kids {
-		n.children = append(n.children, joinKey(branch, k))
-	}
-	t.nodes[key] = n
-	t.bumpSeqs(branch, trunkID)
-	if !n.frozen && trunkID != "" {
-		if previous, exists := t.heads[trunkID]; exists {
-			return fmt.Errorf("xwal: trunk %q has multiple live heads %q and %q", trunkID, previous, key)
-		}
-		t.heads[trunkID] = key
-	}
-	for _, k := range kids {
-		if err := t.walk(filepath.Join(dir, k), append(append([]string(nil), branch...), k), key, false); err != nil {
-			return err
-		}
-	}
-	return nil
-}
 
-func (t *Trunks) bumpSeqs(branch []string, trunkID string) {
-	if len(branch) > 0 {
-		if n := numSuffix(branch[len(branch)-1], 'n'); n+1 > t.nodeSeq {
-			t.nodeSeq = n + 1
-		}
-	}
-	if n := numSuffix(trunkID, 't'); n+1 > t.trunkSeq {
-		t.trunkSeq = n + 1
-	}
-}
 
 // --- accessors ---
 
 func (t *Trunks) hasHead(trunk string) bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	_, ok := t.heads[trunk]
+	_, ok := t.idx.Head(trunk)
 	return ok
 }
 
 func (t *Trunks) headBranch(trunk string) ([]string, error) {
-	key, ok := t.heads[trunk]
+	key, ok := t.idx.Head(trunk)
 	if !ok {
 		return nil, fmt.Errorf("%w %q", ErrUnknownTrunk, trunk)
 	}
-	return t.nodes[key].branch, nil
+	return t.node(key).Branch, nil
 }
 
 func (t *Trunks) rootLineage(trunk string) *rootLineageState {
@@ -539,10 +469,10 @@ func (t *Trunks) evictLineage(trunk string) (bool, error) {
 	unlock := t.lockLineage(trunk)
 	defer unlock()
 	t.mu.RLock()
-	headKey, ok := t.heads[trunk]
+	headKey, ok := t.idx.Head(trunk)
 	var branch []string
 	if ok {
-		branch = t.nodes[headKey].branch
+		branch = t.node(headKey).Branch
 	}
 	t.mu.RUnlock()
 	if !ok {
@@ -825,10 +755,16 @@ func (t *Trunks) beginTopologyMutation() (func(), error) {
 			t.mu.Unlock()
 			return nil, fmt.Errorf("xwal: refusing topology mutation, hot flush failing: %w", err)
 		}
-		if err := t.rebuild(); err != nil {
-			end()
-			t.mu.Unlock()
-			return nil, err
+		// Re-read the forest only if a peer moved it. end() stamps the new
+		// epoch onto us, so after our own mutations we are already current;
+		// rebuilding unconditionally re-walked every node to learn nothing.
+		if epoch := rootTopologyEpoch(t.registryRoot); t.rootEpoch.Load() != epoch {
+			if err := t.rebuild(); err != nil {
+				end()
+				t.mu.Unlock()
+				return nil, err
+			}
+			t.rootEpoch.Store(epoch)
 		}
 		return func() {
 			end()
@@ -1218,10 +1154,10 @@ func (t *Trunks) resplitBelow(branch []string, atMainLT uint64) (string, error) 
 	altDir := t.mintNode()
 	contDir := t.mintNode()
 	altTrunk := t.mintTrunk()
-	owner := t.nodes[strings.Join(ownerBranch, "/")]
+	owner := t.node(strings.Join(ownerBranch, "/"))
 	sourceTrunk := ""
 	if owner != nil {
-		sourceTrunk = owner.trunk
+		sourceTrunk = owner.Trunk
 	}
 	ox, err := t.openForkSource(ownerBranch)
 	if err != nil {
@@ -1294,12 +1230,12 @@ func (t *Trunks) forkTailLocked(trunk string) (string, error) {
 	if err := t.ensureNoOpenHeads(); err != nil {
 		return "", err
 	}
-	headKey, ok := t.heads[trunk]
+	headKey, ok := t.idx.Head(trunk)
 	if !ok {
 		return "", fmt.Errorf("%w %q", ErrUnknownTrunk, trunk)
 	}
-	head := t.nodes[headKey]
-	x, err := t.openHotTopology(head.branch)
+	head := t.node(headKey)
+	x, err := t.openHotTopology(head.Branch)
 	if err != nil {
 		return "", err
 	}
@@ -1311,10 +1247,10 @@ func (t *Trunks) forkTailLocked(trunk string) (string, error) {
 
 	if empty {
 		// Redirect to an N-ary fork of the parent at the head's fork point.
-		if head.isRoot {
+		if head.IsRoot {
 			return "", fmt.Errorf("xwal: cannot fork an empty root trunk")
 		}
-		pbranch := t.nodes[head.parent].branch
+		pbranch := t.node(head.Parent).Branch
 		altDir := t.mintNode()
 		altTrunk := t.mintTrunk()
 		px, err := t.openForkSource(pbranch)
@@ -1338,17 +1274,17 @@ func (t *Trunks) forkTailLocked(trunk string) (string, error) {
 	altDir := t.mintNode()
 	contDir := t.mintNode()
 	altTrunk := t.mintTrunk()
-	fx, err := t.openForkSource(head.branch)
+	fx, err := t.openForkSource(head.Branch)
 	if err != nil {
 		return "", err
 	}
 	child, ferr := fx.forkJoint(tail+1, altDir, contDir,
-		&forkCommit{SourceTrunk: head.trunk, ChildTrunk: altTrunk})
+		&forkCommit{SourceTrunk: head.Trunk, ChildTrunk: altTrunk})
 	fx.Close()
 	if ferr != nil {
 		return "", fmt.Errorf("fork-tail: %w", ferr)
 	}
-	t.markForkResultValidated(head.branch, altDir, contDir)
+	t.markForkResultValidated(head.Branch, altDir, contDir)
 	child.Close()
 	return altTrunk, t.rebuild()
 }
@@ -1434,14 +1370,14 @@ func (t *Trunks) remove(trunk string, recursive bool) ([]TrunkID, error) {
 	// The founding node is the shallowest node carrying this trunk (its
 	// parent is in another trunk, or it is the root).
 	foundKey, ok := "", false
-	for key, n := range t.nodes {
-		if n.trunk != trunk {
+	for key, n := range t.idx.All() {
+		if n.Trunk != trunk {
 			continue
 		}
-		if n.isRoot {
+		if n.IsRoot {
 			return nil, fmt.Errorf("xwal: cannot remove the root trunk %q", trunk)
 		}
-		if p := t.nodes[n.parent]; p == nil || p.trunk != trunk {
+		if p := t.node(n.Parent); p == nil || p.Trunk != trunk {
 			foundKey, ok = key, true
 			break
 		}
@@ -1454,14 +1390,14 @@ func (t *Trunks) remove(trunk string, recursive bool) ([]TrunkID, error) {
 	sub := map[string]bool{}
 	var walk func(string)
 	walk = func(key string) {
-		n := t.nodes[key]
+		n := t.node(key)
 		if n == nil {
 			return
 		}
-		if n.trunk != "" {
-			sub[n.trunk] = true
+		if n.Trunk != "" {
+			sub[n.Trunk] = true
 		}
-		for _, c := range n.children {
+		for _, c := range n.Children {
 			walk(c)
 		}
 	}
@@ -1476,7 +1412,7 @@ func (t *Trunks) remove(trunk string, recursive bool) ([]TrunkID, error) {
 	}
 
 	// Delete the founding node's subtree dir in every channel.
-	branch := t.nodes[foundKey].branch
+	branch := t.node(foundKey).Branch
 	names, err := channelNames(t.root)
 	if err != nil {
 		return nil, err
@@ -1510,7 +1446,7 @@ func (t *Trunks) SpawnChild(parent TrunkID) (TrunkID, error) {
 	if !ok {
 		return "", fmt.Errorf("%w %q", ErrUnknownTrunk, parent)
 	}
-	return t.spawnTrunkAt(t.nodes[nodeKey].branch)
+	return t.spawnTrunkAt(t.node(nodeKey).Branch)
 }
 
 // CreateStump mints a markerless, named depth-1 child of the root — the
@@ -1531,7 +1467,7 @@ func (t *Trunks) CreateStump(name string) error {
 	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) || strings.HasPrefix(name, ".") {
 		return fmt.Errorf("xwal: invalid stump name %q", name)
 	}
-	if n := t.nodes[name]; n != nil {
+	if n := t.node(name); n != nil {
 		return fmt.Errorf("xwal: stump %q already exists", name)
 	}
 	// Fork the root at its tail (N-ary add-one), naming the child `name`,
@@ -1556,8 +1492,8 @@ func (t *Trunks) StumpHead(name string) (*XWAL, error) {
 		return nil, err
 	}
 	t.mu.RLock()
-	n := t.nodes[name]
-	if n == nil || !n.isStump {
+	n := t.node(name)
+	if n == nil || !n.IsStump {
 		t.mu.RUnlock()
 		endRootBorrow(t.registryRoot, t)
 		releaseLineage()
@@ -1589,11 +1525,11 @@ func (t *Trunks) SpawnUnderStump(name string) (TrunkID, error) {
 	if err := t.ensureNoOpenHeads(); err != nil {
 		return "", err
 	}
-	n := t.nodes[name]
-	if n == nil || !n.isStump {
+	n := t.node(name)
+	if n == nil || !n.IsStump {
 		return "", fmt.Errorf("xwal: no stump %q", name)
 	}
-	return t.spawnTrunkAt(n.branch)
+	return t.spawnTrunkAt(n.Branch)
 }
 
 // SpawnUnderRoot mints a new trunk directly under the root (a top-level
@@ -1611,20 +1547,28 @@ func (t *Trunks) SpawnUnderRoot() (TrunkID, error) {
 }
 
 // spawnTrunkAt forks the node at parentBranch at its tail (N-ary add-one),
-// mints a fresh trunk id for the child, and writes its .trunk marker. Caller
+// mints a fresh trunk id for the child, and writes its .Trunk marker. Caller
 // holds t.mu.
 func (t *Trunks) spawnTrunkAt(parentBranch []string) (TrunkID, error) {
 	childDir := t.mintNode()
 	childTrunk := t.mintTrunk()
-	if _, err := t.forkChild(parentBranch, childDir, &forkCommit{ChildTrunk: childTrunk}); err != nil {
+	childBranch, err := t.forkChild(parentBranch, childDir, &forkCommit{ChildTrunk: childTrunk})
+	if err != nil {
 		return "", fmt.Errorf("xwal: spawn: %w", err)
 	}
-	return childTrunk, t.rebuild()
+	// Incremental, not rebuild: a spawn adds one leaf under a known parent and
+	// that delta was known before any I/O. Re-walking the forest to learn it
+	// cost ~0.9ms per existing node on every mint. Index goes last, after the
+	// marker is durable, per the TopologyIndex contract.
+	if err := t.idx.Spawn(strings.Join(parentBranch, "/"), strings.Join(childBranch, "/"), childTrunk, false); err != nil {
+		return "", err
+	}
+	return childTrunk, nil
 }
 
 // forkChild forks the node at parentBranch at its tail (N-ary add-one, no
 // continuation), creating an empty child dir named childDir in every channel.
-// Returns the child's branch. Caller holds t.mu and must rebuild afterwards.
+// Returns the child's branch. Caller holds t.mu and updates the index after.
 func (t *Trunks) forkChild(parentBranch []string, childDir string, commit *forkCommit) ([]string, error) {
 	x, err := t.openHotTopology(parentBranch)
 	if err != nil {
@@ -1664,11 +1608,11 @@ func (t *Trunks) OwnerTrunk(trunk string, atMainLT uint64) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	n := t.nodes[strings.Join(ob, "/")]
+	n := t.node(strings.Join(ob, "/"))
 	if n == nil {
 		return "", fmt.Errorf("xwal: no owner node for main-LT %d on trunk %q", atMainLT, trunk)
 	}
-	return n.trunk, nil
+	return n.Trunk, nil
 }
 
 // Owner describes which node owns a main-LT along a trunk's lineage: a
@@ -1696,15 +1640,15 @@ func (t *Trunks) Owner(trunk TrunkID, atMainLT uint64) (Owner, error) {
 	if err != nil {
 		return Owner{}, err
 	}
-	n := t.nodes[strings.Join(ob, "/")]
+	n := t.node(strings.Join(ob, "/"))
 	if n == nil {
 		return Owner{}, fmt.Errorf("xwal: no owner node for main-LT %d on trunk %q", atMainLT, trunk)
 	}
-	return Owner{Trunk: n.trunk, Stump: n.stumpName(), IsRoot: n.isRoot}, nil
+	return Owner{Trunk: n.Trunk, Stump: n.stumpName(), IsRoot: n.IsRoot}, nil
 }
 
 // Promote climbs a trunk up `levels` stump-bounded levels by relabeling the
-// main channel's .trunk markers: the trunk absorbs its parent trunk's run
+// main channel's .Trunk markers: the trunk absorbs its parent trunk's run
 // (the consecutive same-id ancestors above its divergence point), repeated
 // once per level. No data moves — only markers are rewritten, so the other
 // channels follow the unchanged node tree. The climb stops at a stump (the
@@ -1730,25 +1674,25 @@ func (t *Trunks) Promote(trunk TrunkID, levels int) (int, error) {
 	}
 	climbed := 0
 	for climbed < levels {
-		f := t.nodes[foundKey]
-		p := t.nodes[f.parent]
-		if f.isRoot || p == nil || p.isRoot || p.isStump {
+		f := t.node(foundKey)
+		p := t.node(f.Parent)
+		if f.IsRoot || p == nil || p.IsRoot || p.IsStump {
 			break // ceremonial boundary above — cannot climb further
 		}
-		parentID := p.trunk
+		parentID := p.Trunk
 		// Walk up from p (toward the root) through the consecutive same-id run,
 		// stopping when the node above has a different id (or is a stump/root).
-		runTop := f.parent
+		runTop := f.Parent
 		for {
-			up := t.nodes[t.nodes[runTop].parent]
-			if up == nil || up.isRoot || up.isStump || up.trunk != parentID {
+			up := t.node(t.node(runTop).Parent)
+			if up == nil || up.IsRoot || up.IsStump || up.Trunk != parentID {
 				break
 			}
-			runTop = t.nodes[runTop].parent
+			runTop = t.node(runTop).Parent
 		}
 		// Relabel the run [runTop .. p] to the promoted id on disk.
-		for cur := f.parent; ; cur = t.nodes[cur].parent {
-			if err := writeTrunkID(t.irDir(t.nodes[cur].branch), trunk); err != nil {
+		for cur := f.Parent; ; cur = t.node(cur).Parent {
+			if err := writeTrunkID(t.irDir(t.node(cur).Branch), trunk); err != nil {
 				return climbed, err
 			}
 			if cur == runTop {
@@ -1767,11 +1711,11 @@ func (t *Trunks) Promote(trunk TrunkID, levels int) (int, error) {
 // foundingNode returns the shallowest node carrying a trunk id (its parent is
 // in another trunk, a stump, or the root). One exists per live trunk.
 func (t *Trunks) foundingNode(trunk TrunkID) (string, bool) {
-	for key, n := range t.nodes {
-		if n.trunk != trunk {
+	for key, n := range t.idx.All() {
+		if n.Trunk != trunk {
 			continue
 		}
-		if p := t.nodes[n.parent]; p == nil || p.trunk != trunk {
+		if p := t.node(n.Parent); p == nil || p.Trunk != trunk {
 			return key, true
 		}
 	}
@@ -1792,14 +1736,14 @@ func (t *Trunks) Stumps() []StumpInfo {
 	}
 	defer endRead()
 	var out []StumpInfo
-	for _, n := range t.nodes {
-		if !n.isStump {
+	for _, n := range t.idx.All() {
+		if !n.IsStump {
 			continue
 		}
 		si := StumpInfo{Name: n.stumpName()}
-		for _, ck := range n.children {
-			if c := t.nodes[ck]; c != nil && c.trunk != "" {
-				si.Children = append(si.Children, c.trunk)
+		for _, ck := range n.Children {
+			if c := t.node(ck); c != nil && c.Trunk != "" {
+				si.Children = append(si.Children, c.Trunk)
 			}
 		}
 		sort.Strings(si.Children)
@@ -1812,11 +1756,11 @@ func (t *Trunks) Stumps() []StumpInfo {
 // anchorOf returns the node where children of a trunk attach: its live
 // head if it has one, else its (single, frozen) ceremonial node.
 func (t *Trunks) anchorOf(trunk TrunkID) (string, bool) {
-	if k, ok := t.heads[trunk]; ok {
+	if k, ok := t.idx.Head(trunk); ok {
 		return k, true
 	}
-	for k, n := range t.nodes {
-		if n.trunk == trunk {
+	for k, n := range t.idx.All() {
+		if n.Trunk == trunk {
 			return k, true
 		}
 	}
@@ -1892,10 +1836,10 @@ func (t *Trunks) List() []TrunkInfo {
 	out := make([]TrunkInfo, 0, len(ids))
 	for _, id := range ids {
 		unlockLineage := t.lockLineage(id)
-		key := t.heads[id]
-		ti := TrunkInfo{ID: id, Head: t.nodes[key].branch}
+		key := t.head(id)
+		ti := TrunkInfo{ID: id, Head: t.node(key).Branch}
 		ti.Parent, ti.Stump, ti.BranchedLT = t.lineage(id)
-		if x, err := t.openHotTopology(t.nodes[key].branch); err == nil {
+		if x, err := t.openHotTopology(t.node(key).Branch); err == nil {
 			ti.Tip = mainTail(x)
 			x.Close()
 		}
@@ -1909,21 +1853,21 @@ func (t *Trunks) List() []TrunkInfo {
 // trunk), returning its parent trunk id, the stump it is rooted at (if its
 // parent is a stump), and the LT it branched at.
 func (t *Trunks) lineage(trunk string) (parent, stump string, bl uint64) {
-	n := t.nodes[t.heads[trunk]]
+	n := t.node(t.head(trunk))
 	for {
-		if n.isRoot {
+		if n.IsRoot {
 			return "", "", 0
 		}
-		p := t.nodes[n.parent]
+		p := t.node(n.Parent)
 		if p == nil {
 			return "", "", 0
 		}
-		if p.trunk != trunk {
+		if p.Trunk != trunk {
 			// n is the founding node; p is its parent (trunk, stump, or root).
 			// BranchedLT is n's fork base — read the tiny .fork marker directly
 			// instead of opening the log (which would scan the segment). Equal
 			// to mainForkBase(open(n)), but O(1) file read, not O(entries).
-			return p.trunk, p.stumpName(), t.forkBaseOf(n.branch)
+			return p.Trunk, p.stumpName(), t.forkBaseOf(n.Branch)
 		}
 		n = p
 	}
@@ -1957,10 +1901,10 @@ func (t *Trunks) ListLight() []TrunkInfo {
 		return nil
 	}
 	defer endRead()
-	out := make([]TrunkInfo, 0, len(t.heads))
+	out := make([]TrunkInfo, 0, len(t.idx.LiveTrunks()))
 	for _, id := range t.orderedTrunkIDsLocked() {
-		key := t.heads[id]
-		ti := TrunkInfo{ID: id, Head: t.nodes[key].branch}
+		key := t.head(id)
+		ti := TrunkInfo{ID: id, Head: t.node(key).Branch}
 		ti.Parent, ti.Stump, ti.BranchedLT = t.lineage(id)
 		out = append(out, ti)
 	}
@@ -1969,72 +1913,34 @@ func (t *Trunks) ListLight() []TrunkInfo {
 
 // orderedTrunkIDsLocked returns live trunk ids in stable display order.
 // Caller holds t.mu.
-func (t *Trunks) orderedTrunkIDsLocked() []string {
-	var ids []string
-	if t.cfg.MintTrunkID != nil {
-		for id := range t.heads {
-			ids = append(ids, id)
-		}
-		sort.Strings(ids)
-	} else {
-		for i := 0; i < t.trunkSeq; i++ {
-			if id := "t" + strconv.Itoa(i); t.heads[id] != "" {
-				ids = append(ids, id)
-			}
-		}
-	}
-	return ids
-}
+func (t *Trunks) orderedTrunkIDsLocked() []string { return t.idx.LiveTrunks() }
 
-// NodeInfo is a read-only view of a node (debug).
-type NodeInfo struct {
-	Branch   []string
-	Trunk    string
-	Frozen   bool
-	Children []string
-}
-
-// Nodes returns every node (debug), root first.
+// Nodes returns every node (debug), root first. NodeInfo lives in
+// topology_index.go; Frozen is a method there, derived from Children.
 func (t *Trunks) Nodes() []NodeInfo {
 	endRead, err := t.beginTrackedRead()
 	if err != nil {
 		return nil
 	}
 	defer endRead()
-	out := make([]NodeInfo, 0, len(t.nodes))
-	for _, n := range t.nodes {
-		out = append(out, NodeInfo{Branch: n.branch, Trunk: n.trunk, Frozen: n.frozen, Children: n.children})
+	var out []NodeInfo
+	for _, n := range t.idx.All() {
+		out = append(out, *n)
 	}
 	return out
 }
 
 // --- helpers ---
 
-func (t *Trunks) mintNode() string {
-	id := "n" + strconv.Itoa(t.nodeSeq)
-	t.nodeSeq++
-	return id
-}
+func (t *Trunks) mintNode() string { return t.idx.MintNode() }
 
-func (t *Trunks) mintTrunk() string {
-	if t.cfg.MintTrunkID != nil {
-		for {
-			id := t.cfg.MintTrunkID()
-			if id != "" && !t.trunkExists(id) {
-				return id
-			}
-		}
-	}
-	id := "t" + strconv.Itoa(t.trunkSeq)
-	t.trunkSeq++
-	return id
-}
+func (t *Trunks) mintTrunk() string { return t.idx.MintTrunk() }
 
 // trunkExists reports whether any cached node already carries this trunk id
 // (collision check for a custom minter). Caller holds t.mu.
 func (t *Trunks) trunkExists(id string) bool {
-	for _, n := range t.nodes {
-		if n.trunk == id {
+	for _, n := range t.idx.All() {
+		if n.Trunk == id {
 			return true
 		}
 	}

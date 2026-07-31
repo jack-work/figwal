@@ -79,11 +79,11 @@ func TestForest_FuzzSequential(t *testing.T) {
 			// regression where a frozen branch point was re-forked into same-id
 			// sibling continuations.)
 			n := 0
-			for k, nd := range f.nodes {
-				if nd.trunk == tk && !nd.frozen {
+			for k, nd := range f.idx.All() {
+				if nd.Trunk == tk && !nd.Frozen() {
 					n++
-					if f.heads[tk] != k {
-						t.Fatalf("trunk %s: live leaf %s is not the head (%s)", tk, k, f.heads[tk])
+					if f.head(tk) != k {
+						t.Fatalf("trunk %s: live leaf %s is not the head (%s)", tk, k, f.head(tk))
 					}
 				}
 			}

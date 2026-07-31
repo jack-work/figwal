@@ -249,14 +249,14 @@ func TestTrunks_Stumps(t *testing.T) {
 	if err := f.CreateStump("L1@aa"); err == nil {
 		t.Fatal("duplicate stump name must fail")
 	}
-	// Stumps carry no .trunk marker.
+	// Stumps carry no .Trunk marker.
 	for _, s := range []string{"L1@aa", "L2@bb"} {
-		if _, err := os.Stat(filepath.Join(dir, "ir", s, ".trunk")); err == nil {
+		if _, err := os.Stat(filepath.Join(dir, "ir", s, ".Trunk")); err == nil {
 			t.Fatalf("stump %s must be markerless", s)
 		}
 	}
-	// The root sheds its .trunk marker too.
-	if _, err := os.Stat(filepath.Join(dir, "ir", ".trunk")); err == nil {
+	// The root sheds its .Trunk marker too.
+	if _, err := os.Stat(filepath.Join(dir, "ir", ".Trunk")); err == nil {
 		t.Fatal("root must be markerless")
 	}
 	// A stump spawns multiple top-level trunks (conversations).
@@ -615,7 +615,7 @@ func TestPromote_HeadRemainsUsableWithoutClose(t *testing.T) {
 }
 
 // TestVersion_ExternalRewriteBumpsAfterRefresh simulates the
-// cross-process scenario: another process rewrote a .trunk marker (or
+// cross-process scenario: another process rewrote a .Trunk marker (or
 // mutated the tree) while we weren't watching. In-process our Version
 // counter cannot know; but calling Refresh() re-scans disk and picks up
 // the change. This locks in the contract for future multi-process work.
