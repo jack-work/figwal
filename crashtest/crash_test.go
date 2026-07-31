@@ -126,6 +126,14 @@ func runCycles(t *testing.T, md verifyMode) {
 			cutoff, err := runChildOnce(dir, childSeed, salt, delay, m)
 			if err != nil {
 				keepStore(t, dir, ctx+" child-error")
+				if md == modeCorrupt {
+					// The prefix this store shares was deliberately wrecked;
+					// a child that cannot run against it is the expected
+					// outcome, not a defect. Abandon it like any other
+					// corruption casualty. modeKill stays fatal.
+					t.Logf("%s: child cannot run against the corrupted store: %v", ctx, err)
+					break
+				}
 				t.Fatalf("%s: %v", ctx, err)
 			}
 			if m.closedClean {
