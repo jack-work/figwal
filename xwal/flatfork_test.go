@@ -166,3 +166,35 @@ func TestOwnerOfRefusesALineageCycle(t *testing.T) {
 		t.Fatal("a self-referencing lineage climbed clean")
 	}
 }
+
+// A fork does not freeze the parent, so a rebuild from disk must not
+// demote it. The incremental path keeps the parent's head; the walk used
+// the nested rule "a node with subdirectories is frozen" and dropped it.
+func TestRebuildKeepsAForkedParentLive(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "f")
+	f, trunk := seedTrunk(t, dir)
+	for range 3 {
+		if _, _, err := f.Append(trunk, 0, []byte(`"turn"`), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	head, _ := f.idx.Head(trunk)
+	alt, err := f.ForkTail(trunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	g, err := openTrunks(dir, trunksCfg())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	cleanupTrunks(t, g)
+	if k, ok := g.idx.Head(trunk); !ok || k != head {
+		t.Errorf("parent head after rebuild = %q (ok=%v), want %q", k, ok, head)
+	}
+	if _, ok := g.idx.Head(alt); !ok {
+		t.Errorf("child trunk %q has no head after rebuild", alt)
+	}
+}

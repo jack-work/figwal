@@ -1956,10 +1956,6 @@ func (t *Trunks) irDir(branch []string) string {
 	return filepath.Join(append([]string{t.root, t.main}, branch...)...)
 }
 
-func joinKey(branch []string, child string) string {
-	return strings.Join(append(append([]string(nil), branch...), child), "/")
-}
-
 func writeTrunkID(nodeDir, trunkID string) error {
 	if err := writeSyncedFile(filepath.Join(nodeDir, trunkMarker), []byte(trunkID+"\n")); err != nil {
 		return err

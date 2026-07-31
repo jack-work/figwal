@@ -151,64 +151,58 @@ func (x *Index) MintTrunk() string {
 	return id
 }
 
-// RebuildFrom re-derives everything from the markers. The only path that walks.
+// RebuildFrom re-derives everything from the markers. The only path that walks,
+// and it walks one directory: every node is depth-1.
 func (x *Index) RebuildFrom(mainDir string) error {
 	x.rebuilds.Add(1)
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	x.nodes, x.heads = map[string]*NodeInfo{}, map[string]string{}
 	x.nodeSeq, x.trunkSeq = 0, 0
-	if err := x.walkLocked(mainDir, nil, "", true); err != nil {
+	if err := x.addLocked(mainDir, "", true); err != nil {
 		return err
+	}
+	ents, err := os.ReadDir(mainDir)
+	if err != nil {
+		return err
+	}
+	for _, e := range ents {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		if err := x.addLocked(filepath.Join(mainDir, e.Name()), e.Name(), false); err != nil {
+			return err
+		}
 	}
 	x.version.Add(1)
 	return nil
 }
 
-func (x *Index) walkLocked(dir string, branch []string, parentKey string, isRoot bool) error {
-	key := strings.Join(branch, "/")
-	trunkID, _ := readTrunkID(dir)
-	ents, err := os.ReadDir(dir)
-	if err != nil {
-		return err
-	}
-	var kids []string
-	for _, e := range ents {
-		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
-			kids = append(kids, e.Name())
-		}
-	}
-	// Flat: .from names the parent and the kind. Its absence marks the null
-	// root. A node with neither .from nor root position is an unfinished
-	// fork; skip it rather than invent a stump from its position.
+// addLocked records one node from its markers. Lineage is .from; the
+// directory says nothing. A fork does not freeze its parent, so a node
+// with a trunk id is that trunk's live head, forks or no forks.
+func (x *Index) addLocked(dir, key string, isRoot bool) error {
 	from, kind, flat := readFlatMarker(dir)
 	if !flat && !isRoot {
-		return nil
+		return nil // an unfinished fork: .from is the commit point
 	}
-	if kind == "" && isRoot {
+	if isRoot {
 		kind = "null"
 	}
-	n := &NodeInfo{
-		Branch: append([]string(nil), branch...), Trunk: trunkID, Parent: parentKey,
-		IsRoot: isRoot, From: from, Kind: kind,
-		IsStump: kind == "loadout",
-	}
-	for _, k := range kids {
-		n.Children = append(n.Children, joinKey(branch, k))
+	trunkID, _ := readTrunkID(dir)
+	n := &NodeInfo{Trunk: trunkID, IsRoot: isRoot, From: from, Kind: kind, IsStump: kind == "loadout"}
+	if !isRoot {
+		n.Branch = []string{key}
 	}
 	x.nodes[key] = n
 	x.bumpSeqsLocked(key, trunkID)
-	if !n.Frozen() && trunkID != "" {
-		if previous, exists := x.heads[trunkID]; exists {
-			return fmt.Errorf("xwal: trunk %q has multiple live heads %q and %q", trunkID, previous, key)
-		}
-		x.heads[trunkID] = key
+	if trunkID == "" {
+		return nil
 	}
-	for _, k := range kids {
-		if err := x.walkLocked(filepath.Join(dir, k), append(append([]string(nil), branch...), k), key, false); err != nil {
-			return err
-		}
+	if previous, exists := x.heads[trunkID]; exists {
+		return fmt.Errorf("xwal: trunk %q has multiple live heads %q and %q", trunkID, previous, key)
 	}
+	x.heads[trunkID] = key
 	return nil
 }
 
