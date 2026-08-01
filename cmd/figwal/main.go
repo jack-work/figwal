@@ -476,8 +476,8 @@ func printTrunks(f *xwal.Trunks) {
 
 func printNodes(f *xwal.Trunks) {
 	fmt.Printf("  %-20s %-8s %-8s %-6s %s\n", "NODE(branch)", "TRUNK", "KIND", "CLASS", "FROM")
-	for _, n := range f.Nodes() {
-		id := branchJoin(n.Branch)
+	for key, n := range f.Nodes() {
+		id := key
 		class := "trunk"
 		if id == "" {
 			id, class = "(root)", "root"

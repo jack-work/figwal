@@ -217,7 +217,7 @@ func buildLongTrunk(b *testing.B, records int) (*Trunks, Config, TrunkID, uint64
 	if err != nil {
 		b.Fatal(err)
 	}
-	branch, err := trunks.headBranch(trunk)
+	branch, err := trunks.headKey(trunk)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func buildLongTrunk(b *testing.B, records int) (*Trunks, Config, TrunkID, uint64
 			r := cfg.Registry[spec.Reducer]
 			opts.OnSegmentOpen = reducibleFold(r.Reduce, r.Initial)
 		}
-		chDir := filepath.Join(append([]string{dir, spec.Name}, branch...)...)
+		chDir := filepath.Join(dir, spec.Name, branch)
 		if !pathExists(chDir) {
 			chDir = filepath.Join(dir, spec.Name)
 		}

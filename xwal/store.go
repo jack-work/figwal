@@ -233,11 +233,11 @@ func (s *Store) Clear(trunk, channel string) error {
 		return err
 	}
 	s.Trunks.retireRootHotPreservingValidation()
-	branch, err := s.Trunks.headBranch(trunk)
+	branch, err := s.Trunks.headKey(trunk)
 	if err != nil {
 		return err
 	}
-	x, err := Open(s.Trunks.root, s.Trunks.cfg, branch...)
+	x, err := Open(s.Trunks.root, s.Trunks.cfg, branch)
 	if err != nil {
 		return err
 	}
@@ -295,6 +295,7 @@ func (s *Store) evictIdle() {
 	now := time.Now()
 	s.mu.Lock()
 	var idle []string
+	quiet := false
 	for tr, at := range s.touch {
 		if _, isDirty := s.dirty[tr]; isDirty {
 			continue
@@ -303,6 +304,7 @@ func (s *Store) evictIdle() {
 			idle = append(idle, tr)
 		}
 	}
+	quiet = len(s.touch) == len(idle) && len(s.dirty) == 0
 	s.mu.Unlock()
 	sort.Strings(idle)
 	for _, tr := range idle {
@@ -320,9 +322,6 @@ func (s *Store) evictIdle() {
 	// The root topology head is opened by every flat fork (to read the
 	// parent's channel tails) and belongs to no trunk, so no lineage
 	// eviction can ever reach it. Retire it once nothing is live.
-	s.mu.Lock()
-	quiet := len(s.touch) == 0 && len(s.dirty) == 0
-	s.mu.Unlock()
 	if quiet {
 		s.Trunks.retireRootHot()
 	}

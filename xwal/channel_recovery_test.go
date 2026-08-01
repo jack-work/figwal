@@ -39,7 +39,7 @@ func TestOpenTrunksCompletesPendingChannelBeforeManifest(t *testing.T) {
 func TestOpenTrunksCompletesPartialReducibleBackfill(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	f, trunk := seedTrunk(t, dir)
-	branch := append([]string(nil), f.node(f.head(trunk)).Branch...)
+	branch := f.head(trunk)
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestOpenTrunksCompletesPartialReducibleBackfill(t *testing.T) {
 	if err := writeChannelPending(dir, plan); err != nil {
 		t.Fatal(err)
 	}
-	partial := filepath.Join(append([]string{dir, spec.Name}, branch...)...)
+	partial := filepath.Join(dir, spec.Name, branch)
 	if err := os.MkdirAll(partial, 0o755); err != nil {
 		t.Fatal(err)
 	}

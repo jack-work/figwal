@@ -100,13 +100,13 @@ func TestPoisonIsPerLineage(t *testing.T) {
 		defer s.mu.Unlock()
 		return len(s.dirty) == 0
 	})
-	var badBranch []string
+	var badBranch string
 	for _, ti := range s.ListLight() {
 		if ti.ID == bad {
-			badBranch = ti.Head
+			badBranch = ti.Head[0]
 		}
 	}
-	badDir := filepath.Join(append([]string{dir, "ir"}, badBranch...)...)
+	badDir := filepath.Join(dir, "ir", badBranch)
 	if err := os.Chmod(badDir, 0o500); err != nil {
 		t.Fatal(err)
 	}
@@ -290,13 +290,13 @@ func TestTopologyMutationRefusedWhileFlushFailing(t *testing.T) {
 		defer s.mu.Unlock()
 		return len(s.dirty) == 0
 	})
-	var branch []string
+	var branch string
 	for _, ti := range s.ListLight() {
 		if ti.ID == tr {
-			branch = ti.Head
+			branch = ti.Head[0]
 		}
 	}
-	mainDir := filepath.Join(append([]string{dir, "ir"}, branch...)...)
+	mainDir := filepath.Join(dir, "ir", branch)
 
 	// Fill past a segment so the next flush needs a rotation, then make
 	// the dir unwritable and append (pending only; FlushInterval is huge).

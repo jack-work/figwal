@@ -61,7 +61,7 @@ func TestOpenRejectsMultipleHeads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondBranch := f.node(f.head(second)).Branch
+	secondBranch := f.head(second)
 	if err := writeTrunkID(f.irDir(secondBranch), first); err != nil {
 		t.Fatal(err)
 	}

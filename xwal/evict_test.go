@@ -180,13 +180,13 @@ func TestFlushFailuresPoisonAppendsAndRecover(t *testing.T) {
 		return len(s.dirty) == 0
 	})
 
-	var headBranch []string
+	var headBranch string
 	for _, ti := range s.ListLight() {
 		if ti.ID == tr {
-			headBranch = ti.Head
+			headBranch = ti.Head[0]
 		}
 	}
-	mainDir := filepath.Join(append([]string{dir, "ir"}, headBranch...)...)
+	mainDir := filepath.Join(dir, "ir", headBranch)
 	if err := os.Chmod(mainDir, 0o500); err != nil {
 		t.Fatal(err)
 	}

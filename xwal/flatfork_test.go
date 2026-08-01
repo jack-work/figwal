@@ -17,7 +17,7 @@ func TestForkDoesNotMutateParent(t *testing.T) {
 		}
 	}
 	headKey, _ := f.idx.Head(trunk)
-	parentDir := f.irDir(f.node(headKey).Branch)
+	parentDir := f.irDir(headKey)
 	subdirs := func() []string {
 		ents, err := os.ReadDir(parentDir)
 		if err != nil {
@@ -52,8 +52,8 @@ func TestForkDoesNotMutateParent(t *testing.T) {
 		t.Fatal("no head for the alternative")
 	}
 	n, _ := f.idx.Node(altKey)
-	if len(n.Branch) != 1 {
-		t.Fatalf("alternative is nested: branch=%v", n.Branch)
+	if strings.Contains(altKey, "/") {
+		t.Fatalf("alternative is nested: key=%q", altKey)
 	}
 	if n.From != headKey {
 		t.Fatalf("alternative lineage = %q, want %q", n.From, headKey)

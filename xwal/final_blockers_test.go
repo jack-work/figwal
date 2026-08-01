@@ -190,9 +190,9 @@ func TestForkPreflightRepairsMissingRehomeMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	altBranch := f.node(f.head(alt)).Branch
+	altBranch := f.head(alt)
 	f.retireRootHot()
-	descendantDir := filepath.Join(append([]string{dir, spec.Name}, altBranch...)...)
+	descendantDir := filepath.Join(dir, spec.Name, altBranch)
 	if err := os.Remove(filepath.Join(descendantDir, ".fork")); err != nil {
 		t.Fatal(err)
 	}

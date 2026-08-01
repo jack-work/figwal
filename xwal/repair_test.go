@@ -55,10 +55,10 @@ func TestOpenRepairsIncoherentLineage(t *testing.T) {
 		}
 	}
 	lost, kept := lts[2], lts[1]
-	var headBranch []string
+	var headBranch string
 	for _, ti := range s.ListLight() {
 		if ti.ID == tr {
-			headBranch = ti.Head
+			headBranch = ti.Head[0]
 		}
 	}
 	if err := s.Close(); err != nil {
@@ -67,7 +67,7 @@ func TestOpenRepairsIncoherentLineage(t *testing.T) {
 
 	// Simulate a crash that lost the last main entry but kept the related
 	// records referencing it, with the store marked unclean.
-	mainDir := filepath.Join(append([]string{dir, "ir"}, headBranch...)...)
+	mainDir := filepath.Join(dir, "ir", headBranch)
 	bases, err := segmentBases(mainDir, segment.JSONLCodec{})
 	if err != nil || len(bases) == 0 {
 		t.Fatalf("main segments: %v %v", bases, err)

@@ -45,11 +45,12 @@ func repairCoherentCuts(t *Trunks) error {
 	if err != nil {
 		return err
 	}
-	for key, n := range t.idx.All() {
-		if len(t.idx.ChildrenOf(key)) > 0 {
+	kids := t.idx.ChildIndex()
+	for key := range t.idx.All() {
+		if len(kids[key]) > 0 {
 			continue
 		}
-		mainTail, err := nodeMainTail(filepath.Join(append([]string{t.root, man.Main}, n.Branch...)...), codec)
+		mainTail, err := nodeMainTail(t.irDir(key), codec)
 		if err != nil {
 			return fmt.Errorf("xwal: repair leaf %q: %w", key, err)
 		}
@@ -57,7 +58,7 @@ func repairCoherentCuts(t *Trunks) error {
 			if mc.Name == man.Main {
 				continue
 			}
-			dir := filepath.Join(append([]string{t.root, mc.Name}, n.Branch...)...)
+			dir := filepath.Join(t.root, mc.Name, key)
 			if !pathExists(dir) {
 				continue
 			}

@@ -275,12 +275,12 @@ func (t *Trunks) hasHead(trunk string) bool {
 	return ok
 }
 
-func (t *Trunks) headBranch(trunk string) ([]string, error) {
+func (t *Trunks) headKey(trunk string) (string, error) {
 	key, ok := t.idx.Head(trunk)
 	if !ok {
-		return nil, fmt.Errorf("%w %q", ErrUnknownTrunk, trunk)
+		return "", fmt.Errorf("%w %q", ErrUnknownTrunk, trunk)
 	}
-	return t.node(key).Branch, nil
+	return key, nil
 }
 
 func (t *Trunks) rootLineage(trunk string) *rootLineageState {
@@ -444,7 +444,7 @@ func (t *Trunks) evictLineage(trunk string) (bool, error) {
 	headKey, ok := t.idx.Head(trunk)
 	var branch []string
 	if ok {
-		branch = t.node(headKey).Branch
+		branch = []string{headKey}
 	}
 	t.mu.RUnlock()
 	if !ok {
@@ -504,7 +504,11 @@ func (t *Trunks) evictLineage(trunk string) (bool, error) {
 	return true, nil
 }
 
-func (t *Trunks) openHotTopology(branch []string) (*XWAL, error) {
+func (t *Trunks) openHotTopology(key string) (*XWAL, error) {
+	var branch []string
+	if key != "" {
+		branch = []string{key}
+	}
 	x, release, err := t.borrowHotUntracked(branch)
 	if err != nil {
 		return nil, err
@@ -1028,14 +1032,14 @@ func (t *Trunks) Head(trunk string) (*XWAL, error) {
 		return nil, err
 	}
 	t.mu.RLock()
-	branch, err := t.headBranch(trunk)
+	branch, err := t.headKey(trunk)
 	if err != nil {
 		t.mu.RUnlock()
 		endRootBorrow(t.registryRoot, t)
 		releaseLineage()
 		return nil, err
 	}
-	x, release, err := t.borrowHotUntracked(branch)
+	x, release, err := t.borrowHotUntracked([]string{branch})
 	t.mu.RUnlock()
 	if err != nil {
 		endRootBorrow(t.registryRoot, t)
@@ -1063,11 +1067,11 @@ func (t *Trunks) Append(trunk string, atMainLT uint64, payload, meta []byte) (st
 		return "", 0, err
 	}
 	defer endRead()
-	branch, err := t.headBranch(trunk)
+	branch, err := t.headKey(trunk)
 	if err != nil {
 		return "", 0, err
 	}
-	x, release, err := t.borrowHotUntracked(branch)
+	x, release, err := t.borrowHotUntracked([]string{branch})
 	if err != nil {
 		return "", 0, err
 	}
@@ -1088,7 +1092,7 @@ func (t *Trunks) ownerOf(node string, atMainLT uint64) (string, error) {
 		if hops--; hops < 0 {
 			return "", fmt.Errorf("xwal: lineage cycle below %q", node)
 		}
-		fb, err := t.readForkBase([]string{node})
+		fb, err := t.readForkBase(node)
 		if err != nil {
 			return "", err
 		}
@@ -1099,8 +1103,8 @@ func (t *Trunks) ownerOf(node string, atMainLT uint64) (string, error) {
 	return "", nil
 }
 
-func (t *Trunks) readForkBase(branch []string) (uint64, error) {
-	b, err := os.ReadFile(filepath.Join(t.irDir(branch), ".fork"))
+func (t *Trunks) readForkBase(key string) (uint64, error) {
+	b, err := os.ReadFile(filepath.Join(t.irDir(key), ".fork"))
 	if err != nil {
 		return 0, err
 	}
@@ -1109,7 +1113,7 @@ func (t *Trunks) readForkBase(branch []string) (uint64, error) {
 			return strconv.ParseUint(strings.TrimSpace(v), 10, 64)
 		}
 	}
-	return 0, fmt.Errorf("xwal: malformed fork marker for %q", strings.Join(branch, "/"))
+	return 0, fmt.Errorf("xwal: malformed fork marker for %q", key)
 }
 
 // ForkTail bisects a trunk's present.
@@ -1161,11 +1165,11 @@ func (t *Trunks) forkFlat(parentKey, kind string, mintTrunk bool) (string, error
 			return "", err
 		}
 	}
-	if err := writeFlatMarker(t.irDir([]string{child}), parentKey, kind); err != nil {
+	if err := writeFlatMarker(t.irDir(child), parentKey, kind); err != nil {
 		return "", err
 	}
 	if mintTrunk {
-		if err := writeTrunkID(t.irDir([]string{child}), trunk); err != nil {
+		if err := writeTrunkID(t.irDir(child), trunk); err != nil {
 			return "", err
 		}
 	}
@@ -1191,7 +1195,7 @@ func (t *Trunks) forkFlatNamed(parentKey, name, kind string) error {
 			return err
 		}
 	}
-	if err := writeFlatMarker(t.irDir([]string{name}), parentKey, kind); err != nil {
+	if err := writeFlatMarker(t.irDir(name), parentKey, kind); err != nil {
 		return err
 	}
 	t.idx.SpawnFlat(parentKey, name, "", kind)
@@ -1200,11 +1204,7 @@ func (t *Trunks) forkFlatNamed(parentKey, name, kind string) error {
 
 // channelTails is each channel's next index at node, i.e. its fork base.
 func (t *Trunks) channelTails(node string) (map[string]uint64, error) {
-	branch := []string(nil)
-	if node != "" {
-		branch = []string{node}
-	}
-	x, err := t.openHotTopology(branch)
+	x, err := t.openHotTopology(node)
 	if err != nil {
 		return nil, err
 	}
@@ -1233,7 +1233,7 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 		return "", err
 	}
 	defer endMutation()
-	branch, err := t.headBranch(trunk)
+	branch, err := t.headKey(trunk)
 	if err != nil {
 		return "", err
 	}
@@ -1251,7 +1251,7 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 	if atMainLT < ownFirst {
 		// Flat: fork the ancestor that owns atMainLT, in place.
 		t.retireRootHotPreservingValidation()
-		owner, oerr := t.ownerOf(strings.Join(branch, "/"), atMainLT)
+		owner, oerr := t.ownerOf(branch, atMainLT)
 		if oerr != nil {
 			return "", oerr
 		}
@@ -1260,7 +1260,7 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 
 	// Interior fork: a sibling sharing [1..atMainLT]. The parent keeps its
 	// suffix; nothing it owns is rewritten.
-	return t.forkFlatAt(strings.Join(branch, "/"), atMainLT)
+	return t.forkFlatAt(branch, atMainLT)
 }
 
 // forkFlatAt is forkFlat sharing a prefix that ends at an interior main LT.
@@ -1268,11 +1268,7 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 func (t *Trunks) forkFlatAt(parentKey string, atMainLT uint64) (string, error) {
 	child := t.mintNode()
 	trunk := t.mintTrunk()
-	branch := []string(nil)
-	if parentKey != "" {
-		branch = strings.Split(parentKey, "/")
-	}
-	x, err := t.openHotTopology(branch)
+	x, err := t.openHotTopology(parentKey)
 	if err != nil {
 		return "", err
 	}
@@ -1312,10 +1308,10 @@ func (t *Trunks) forkFlatAt(parentKey string, atMainLT uint64) (string, error) {
 			return "", err
 		}
 	}
-	if err := writeFlatMarker(t.irDir([]string{child}), parentKey, "conversation"); err != nil {
+	if err := writeFlatMarker(t.irDir(child), parentKey, "conversation"); err != nil {
 		return "", err
 	}
-	if err := writeTrunkID(t.irDir([]string{child}), trunk); err != nil {
+	if err := writeTrunkID(t.irDir(child), trunk); err != nil {
 		return "", err
 	}
 	t.idx.SpawnFlat(parentKey, child, trunk, "conversation")
@@ -1365,6 +1361,7 @@ func (t *Trunks) remove(trunk string, recursive bool) ([]TrunkID, error) {
 
 	// Collect the trunks living in the founding node's subtree.
 	sub := map[string]bool{}
+	kids := t.idx.ChildIndex()
 	var walk func(string)
 	walk = func(key string) {
 		n := t.node(key)
@@ -1374,7 +1371,7 @@ func (t *Trunks) remove(trunk string, recursive bool) ([]TrunkID, error) {
 		if n.Trunk != "" {
 			sub[n.Trunk] = true
 		}
-		for _, c := range t.idx.ChildrenOf(key) {
+		for _, c := range kids[key] {
 			walk(c)
 		}
 	}
@@ -1389,7 +1386,7 @@ func (t *Trunks) remove(trunk string, recursive bool) ([]TrunkID, error) {
 	}
 
 	// Delete the founding node's subtree dir in every channel.
-	branch := t.node(foundKey).Branch
+	branch := []string{foundKey}
 	names, err := channelNames(t.root)
 	if err != nil {
 		return nil, err
@@ -1518,11 +1515,11 @@ func (t *Trunks) OwnerTrunk(trunk string, atMainLT uint64) (string, error) {
 		return "", err
 	}
 	defer endRead()
-	branch, err := t.headBranch(trunk)
+	branch, err := t.headKey(trunk)
 	if err != nil {
 		return "", err
 	}
-	ob, err := t.ownerOf(strings.Join(branch, "/"), atMainLT)
+	ob, err := t.ownerOf(branch, atMainLT)
 	if err != nil {
 		return "", err
 	}
@@ -1550,11 +1547,11 @@ func (t *Trunks) Owner(trunk TrunkID, atMainLT uint64) (Owner, error) {
 		return Owner{}, err
 	}
 	defer endRead()
-	branch, err := t.headBranch(trunk)
+	branch, err := t.headKey(trunk)
 	if err != nil {
 		return Owner{}, err
 	}
-	ob, err := t.ownerOf(strings.Join(branch, "/"), atMainLT)
+	ob, err := t.ownerOf(branch, atMainLT)
 	if err != nil {
 		return Owner{}, err
 	}
@@ -1562,7 +1559,7 @@ func (t *Trunks) Owner(trunk TrunkID, atMainLT uint64) (Owner, error) {
 	if n == nil {
 		return Owner{}, fmt.Errorf("xwal: no owner node for main-LT %d on trunk %q", atMainLT, trunk)
 	}
-	return Owner{Trunk: n.Trunk, Stump: n.stumpName(), IsRoot: n.IsRoot}, nil
+	return Owner{Trunk: n.Trunk, Stump: stumpName(ob, n), IsRoot: n.IsRoot}, nil
 }
 
 // foundingNode returns the shallowest node carrying a trunk id (its parent is
@@ -1636,11 +1633,11 @@ func (t *Trunks) AppendChannel(trunk, channel string, mainLT uint64, payload, me
 		return 0, err
 	}
 	defer endRead()
-	branch, err := t.headBranch(trunk)
+	branch, err := t.headKey(trunk)
 	if err != nil {
 		return 0, err
 	}
-	x, release, err := t.borrowHotUntracked(branch)
+	x, release, err := t.borrowHotUntracked([]string{branch})
 	if err != nil {
 		return 0, err
 	}
@@ -1661,11 +1658,11 @@ func (t *Trunks) LatestChannelRecord(trunk, channel string, minMainLT uint64) (R
 		return Record{}, false, err
 	}
 	defer endRead()
-	branch, err := t.headBranch(trunk)
+	branch, err := t.headKey(trunk)
 	if err != nil {
 		return Record{}, false, err
 	}
-	x, release, err := t.borrowHotUntracked(branch)
+	x, release, err := t.borrowHotUntracked([]string{branch})
 	if err != nil {
 		return Record{}, false, err
 	}
@@ -1697,9 +1694,9 @@ func (t *Trunks) List() []TrunkInfo {
 	for _, id := range ids {
 		unlockLineage := t.lockLineage(id)
 		key := t.head(id)
-		ti := TrunkInfo{ID: id, Head: t.node(key).Branch}
+		ti := TrunkInfo{ID: id, Head: []string{key}}
 		ti.Parent, ti.Stump, ti.BranchedLT = t.lineage(id)
-		if x, err := t.openHotTopology(t.node(key).Branch); err == nil {
+		if x, err := t.openHotTopology(key); err == nil {
 			ti.Tip = mainTail(x)
 			x.Close()
 		}
@@ -1713,7 +1710,8 @@ func (t *Trunks) List() []TrunkInfo {
 // trunk), returning its parent trunk id, the stump it is rooted at (if its
 // parent is a stump), and the LT it branched at.
 func (t *Trunks) lineage(trunk string) (parent, stump string, bl uint64) {
-	n := t.node(t.head(trunk))
+	head := t.head(trunk)
+	n := t.node(head)
 	if n == nil || n.IsRoot {
 		return "", "", 0
 	}
@@ -1724,13 +1722,13 @@ func (t *Trunks) lineage(trunk string) (parent, stump string, bl uint64) {
 	if p == nil {
 		return "", "", 0
 	}
-	return p.Trunk, p.stumpName(), t.forkBaseOf(n.Branch)
+	return p.Trunk, stumpName(n.From, p), t.forkBaseOf(head)
 }
 
 // forkBaseOf reads a node's main-channel .fork base (the LT it forked at)
 // directly from the marker file — cheap, no log open / segment scan.
-func (t *Trunks) forkBaseOf(branch []string) uint64 {
-	b, err := os.ReadFile(filepath.Join(t.irDir(branch), ".fork"))
+func (t *Trunks) forkBaseOf(key string) uint64 {
+	b, err := os.ReadFile(filepath.Join(t.irDir(key), ".fork"))
 	if err != nil {
 		return 0
 	}
@@ -1758,7 +1756,7 @@ func (t *Trunks) ListLight() []TrunkInfo {
 	out := make([]TrunkInfo, 0, len(t.idx.LiveTrunks()))
 	for _, id := range t.idx.LiveTrunks() {
 		key := t.head(id)
-		ti := TrunkInfo{ID: id, Head: t.node(key).Branch}
+		ti := TrunkInfo{ID: id, Head: []string{key}}
 		ti.Parent, ti.Stump, ti.BranchedLT = t.lineage(id)
 		out = append(out, ti)
 	}
@@ -1767,15 +1765,15 @@ func (t *Trunks) ListLight() []TrunkInfo {
 
 // Nodes returns every node (debug), root first. NodeInfo lives in
 // index.go; Frozen is a method there, derived from Children.
-func (t *Trunks) Nodes() []NodeInfo {
+func (t *Trunks) Nodes() map[string]NodeInfo {
 	endRead, err := t.beginTrackedRead()
 	if err != nil {
 		return nil
 	}
 	defer endRead()
-	var out []NodeInfo
-	for _, n := range t.idx.All() {
-		out = append(out, *n)
+	out := map[string]NodeInfo{}
+	for key, n := range t.idx.All() {
+		out[key] = *n
 	}
 	return out
 }
@@ -1797,8 +1795,13 @@ func (t *Trunks) trunkExists(id string) bool {
 	return false
 }
 
-func (t *Trunks) irDir(branch []string) string {
-	return filepath.Join(append([]string{t.root, t.main}, branch...)...)
+// irDir is a node's main-channel directory. A flat key is one path element;
+// the root is the channel dir itself.
+func (t *Trunks) irDir(key string) string {
+	if key == "" {
+		return filepath.Join(t.root, t.main)
+	}
+	return filepath.Join(t.root, t.main, key)
 }
 
 func writeTrunkID(nodeDir, trunkID string) error {
@@ -1863,17 +1866,8 @@ func mainChannelName(dir string) (string, error) {
 
 // ownFirstIdx is the head's own first main index (forkBase, or 1 at root).
 func ownFirstIdx(x *XWAL) uint64 {
-	if fb := mainForkBase(x); fb > 0 {
+	if fb := x.chans[x.main].log.ForkBase(); fb > 0 {
 		return fb
 	}
 	return 1
-}
-
-func mainForkBase(x *XWAL) uint64 { return x.chans[x.main].log.ForkBase() }
-
-// isEmptyHead reports whether a forked head has no own entries yet (its
-// content is wholly inherited).
-func isEmptyHead(x *XWAL) bool {
-	fb := mainForkBase(x)
-	return fb > 0 && x.chans[x.main].log.LastIndex() < fb
 }

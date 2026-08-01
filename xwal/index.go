@@ -101,9 +101,7 @@ func (x *Index) Version() uint64 { return x.version.Load() }
 func (x *Index) SpawnFlat(parent, child, trunk, kind string) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	x.nodes[child] = &NodeInfo{
-		Branch: []string{child}, Trunk: trunk, From: parent, Kind: kind,
-	}
+	x.nodes[child] = &NodeInfo{Trunk: trunk, From: parent, Kind: kind}
 	if trunk != "" {
 		x.heads[trunk] = child
 	}
@@ -113,6 +111,8 @@ func (x *Index) SpawnFlat(parent, child, trunk, kind string) {
 
 // ChildrenOf is every node forked from key. Derived, not stored: a flat
 // fork writes only the child's own .from, so the parent has no list.
+//
+// Calling this in a loop over the forest is O(n^2); use ChildIndex once.
 func (x *Index) ChildrenOf(key string) []string {
 	x.mu.RLock()
 	defer x.mu.RUnlock()
@@ -123,6 +123,21 @@ func (x *Index) ChildrenOf(key string) []string {
 		}
 	}
 	sort.Strings(out)
+	return out
+}
+
+// ChildIndex is the whole from -> children adjacency in one pass under one
+// lock, for callers that would otherwise ask per node.
+func (x *Index) ChildIndex() map[string][]string {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	out := make(map[string][]string, len(x.nodes))
+	for k, n := range x.nodes {
+		out[n.From] = append(out[n.From], k)
+	}
+	for _, v := range out {
+		sort.Strings(v)
+	}
 	return out
 }
 
@@ -205,11 +220,7 @@ func (x *Index) addLocked(dir, key string, isRoot bool) error {
 		kind = "null"
 	}
 	trunkID, _ := readTrunkID(dir)
-	n := &NodeInfo{Trunk: trunkID, IsRoot: isRoot, From: from, Kind: kind}
-	if !isRoot {
-		n.Branch = []string{key}
-	}
-	x.nodes[key] = n
+	x.nodes[key] = &NodeInfo{Trunk: trunkID, IsRoot: isRoot, From: from, Kind: kind}
 	x.bumpSeqsLocked(key, trunkID)
 	if trunkID == "" {
 		return nil
