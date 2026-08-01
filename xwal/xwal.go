@@ -223,18 +223,6 @@ func open(dir string, cfg Config, store *log.Store, branch ...string) (*XWAL, er
 	if err != nil {
 		return nil, err
 	}
-	// Complete any interrupted joint fork before serving a branch, so the
-	// triune is never observed half-diverged.
-	if plan, pending, perr := readForkPlan(dir); perr != nil {
-		return nil, perr
-	} else if pending {
-		if err := recoverFork(dir, cfg, man, plan); err != nil {
-			return nil, fmt.Errorf("xwal: recover interrupted fork: %w", err)
-		}
-		if err := removeForkPlan(dir); err != nil {
-			return nil, err
-		}
-	}
 	codec, err := codecByName(man.Codec)
 	if err != nil {
 		return nil, err
@@ -621,6 +609,10 @@ func recoverChannelPending(root string, cfg Config, man manifest) (manifest, err
 	return man, nil
 }
 
+// ErrTopologyIncomplete reports a channel whose branch layout is not
+// complete enough to serve or fork.
+var ErrTopologyIncomplete = errors.New("xwal: channel topology incomplete")
+
 func channelFromManifest(cfg Config, mc manifestChannel) (*channel, error) {
 	ch := &channel{name: mc.Name, kind: ChannelLog, rname: mc.Reducer, opaque: mc.Opaque}
 	if mc.Kind != ChannelReducible.String() {
@@ -657,54 +649,6 @@ func materializeManifestChannels(root string, cfg Config, man manifest) (manifes
 	return man, nil
 }
 
-func forkTopologyStructurallyComplete(root string, cfg Config, branch []string) (bool, error) {
-	if pathExists(filepath.Join(root, channelPendingName)) {
-		return false, nil
-	}
-	man, err := loadOrCreateManifest(root, cfg)
-	if err != nil {
-		return false, err
-	}
-	codec, err := codecByName(man.Codec)
-	if err != nil {
-		return false, err
-	}
-	channels := make([]*channel, 0, len(man.Channels))
-	for _, mc := range man.Channels {
-		ch, err := channelFromManifest(cfg, mc)
-		if err != nil {
-			return false, err
-		}
-		channels = append(channels, ch)
-		dir := filepath.Join(append([]string{root, mc.Name}, branch...)...)
-		complete, err := channelNodeStructurallyComplete(dir, len(branch) == 0, ch, codec)
-		if err != nil || !complete {
-			return complete, err
-		}
-	}
-
-	mainDir := filepath.Join(append([]string{root, man.Main}, branch...)...)
-	entries, err := os.ReadDir(mainDir)
-	if err != nil {
-		return false, err
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
-			continue
-		}
-		for i, mc := range man.Channels {
-			dir := filepath.Join(append([]string{root, mc.Name}, branch...)...)
-			complete, err := channelNodeStructurallyComplete(
-				filepath.Join(dir, entry.Name()), false, channels[i], codec,
-			)
-			if err != nil || !complete {
-				return complete, err
-			}
-		}
-	}
-	return true, nil
-}
-
 func channelNodeStructurallyComplete(
 	dir string,
 	root bool,
@@ -739,174 +683,12 @@ func channelNodeStructurallyComplete(
 	return err == nil && info.Mode().IsRegular() && info.Size() > 0, nil
 }
 
-func repairBranchChannels(root string, cfg Config, branch []string) error {
-	man, err := loadOrCreateManifest(root, cfg)
-	if err != nil {
-		return err
-	}
-	man, err = recoverChannelPending(root, cfg, man)
-	if err != nil {
-		return err
-	}
-	codec, err := codecByName(man.Codec)
-	if err != nil {
-		return err
-	}
-	for _, mc := range man.Channels {
-		if mc.Name == man.Main {
-			continue
-		}
-		ch, err := channelFromManifest(cfg, mc)
-		if err != nil {
-			return err
-		}
-		needsRepair, err := branchChannelNeedsRepair(root, man.Main, cfg, codec, branch, ch)
-		if err != nil {
-			return err
-		}
-		if !needsRepair {
-			continue
-		}
-		if err := writeChannelPending(root, channelPendingPlan{Channel: mc}); err != nil {
-			return err
-		}
-		man, err = recoverChannelPending(root, cfg, man)
-		if err != nil {
-			return err
-		}
-		needsRepair, err = branchChannelNeedsRepair(root, man.Main, cfg, codec, branch, ch)
-		if err != nil {
-			return err
-		}
-		if needsRepair {
-			return fmt.Errorf("%w: channel %q branch %q remains incomplete after repair",
-				ErrTopologyIncomplete, mc.Name, strings.Join(branch, "/"))
-		}
-	}
-	return nil
-}
-
-func repairRehomeDescendants(root string, cfg Config, branch []string) error {
-	man, err := loadOrCreateManifest(root, cfg)
-	if err != nil {
-		return err
-	}
-	mainDir := filepath.Join(append([]string{root, man.Main}, branch...)...)
-	entries, err := os.ReadDir(mainDir)
-	if err != nil {
-		return err
-	}
-	var descendants []string
-	for _, entry := range entries {
-		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
-			descendants = append(descendants, entry.Name())
-		}
-	}
-	if len(descendants) == 0 {
-		return nil
-	}
-	codec, err := codecByName(man.Codec)
-	if err != nil {
-		return err
-	}
-	for _, mc := range man.Channels {
-		if mc.Name == man.Main {
-			continue
-		}
-		channelDir := filepath.Join(append([]string{root, mc.Name}, branch...)...)
-		for _, descendant := range descendants {
-			dir := filepath.Join(channelDir, descendant)
-			if validForkNode(dir, codec) {
-				continue
-			}
-			if err := writeChannelPending(root, channelPendingPlan{Channel: mc}); err != nil {
-				return err
-			}
-			man, err = recoverChannelPending(root, cfg, man)
-			if err != nil {
-				return err
-			}
-			if !validForkNode(dir, codec) {
-				return fmt.Errorf("%w: channel %q descendant %q has no valid fork marker",
-					ErrTopologyIncomplete, mc.Name, descendant)
-			}
-		}
-	}
-	return nil
-}
-
 func validForkNode(dir string, codec segment.SegmentCodec) bool {
 	if _, err := readForkBaseFile(filepath.Join(dir, ".fork")); err == nil {
 		return true
 	}
 	first, ok, err := firstSegmentBase(dir, codec)
 	return err == nil && ok && first == 1
-}
-
-func branchChannelNeedsRepair(
-	root, main string,
-	cfg Config,
-	codec segment.SegmentCodec,
-	branch []string,
-	ch *channel,
-) (bool, error) {
-	parentDir := filepath.Join(root, ch.name)
-	info, err := os.Stat(parentDir)
-	if errors.Is(err, os.ErrNotExist) || err == nil && !info.IsDir() {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if ch.kind == ChannelReducible {
-		valid, err := validateWatermark(parentDir, 1, codec, ch.initial)
-		if err != nil || !valid {
-			return true, nil
-		}
-	}
-	recovery := &XWAL{root: root, main: main, cfg: cfg, codec: codec}
-	for _, part := range branch {
-		dir := filepath.Join(parentDir, part)
-		info, err := os.Stat(dir)
-		if errors.Is(err, os.ErrNotExist) || err == nil && !info.IsDir() {
-			return true, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		base, err := readForkBaseFile(filepath.Join(dir, ".fork"))
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				first, ok, segmentErr := firstSegmentBase(dir, codec)
-				if segmentErr != nil {
-					return false, segmentErr
-				}
-				if ok && first == 1 {
-					if ch.kind == ChannelReducible {
-						valid, err := validateWatermark(dir, 1, codec, ch.initial)
-						if err != nil || !valid {
-							return true, nil
-						}
-					}
-					parentDir = dir
-					continue
-				}
-			}
-			return true, nil
-		}
-		if ch.kind == ChannelReducible {
-			state, err := recovery.backfillWatermarkState(parentDir, base, ch)
-			if err != nil {
-				return false, err
-			}
-			valid, err := validateWatermark(dir, base, codec, state)
-			if err != nil || !valid {
-				return true, nil
-			}
-		}
-		parentDir = dir
-	}
-	return false, nil
 }
 
 func (x *XWAL) channelOpts(ch *channel) disk.Options {

@@ -200,18 +200,6 @@ func openTrunks(dir string, cfg Config) (*Trunks, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Complete any interrupted joint fork FIRST: later repair passes open
-	// channel dirs and must never trip on mid-fork state.
-	if plan, pending, perr := readForkPlan(dir); perr != nil {
-		return nil, perr
-	} else if pending {
-		if err := recoverFork(dir, cfg, man, plan); err != nil {
-			return nil, fmt.Errorf("xwal: recover interrupted fork: %w", err)
-		}
-		if err := removeForkPlan(dir); err != nil {
-			return nil, err
-		}
-	}
 	if man, err = materializeManifestChannels(dir, cfg, man); err != nil {
 		return nil, err
 	}
@@ -742,7 +730,6 @@ func (t *Trunks) beginTopologyMutation() (func(), error) {
 		// Re-read the forest only when a PEER moved it. end() stamps the new
 		// epoch onto us, so after our own mutation we are already current and
 		// walking again teaches nothing. A repair that rewrites markers calls
-		// Refresh itself (see openForkSource).
 		if epoch := rootTopologyEpoch(t.registryRoot); t.rootEpoch.Load() != epoch {
 			if err := t.rebuild(); err != nil {
 				end()
@@ -894,70 +881,6 @@ func (t *Trunks) markTopologyValidated() {
 	t.validatedTopologyVersion = t.Version()
 	t.validatedForkBranches = nil
 	t.validationMu.Unlock()
-}
-
-func (t *Trunks) forkPreflightValidated(branch []string) bool {
-	key := strings.Join(branch, "/")
-	t.validationMu.Lock()
-	defer t.validationMu.Unlock()
-	if t.validatedTopologyVersion == t.Version() {
-		return true
-	}
-	return t.validatedForkBranches[key] == t.validationGeneration
-}
-
-func (t *Trunks) markForkPreflightValidated(branch []string) {
-	key := strings.Join(branch, "/")
-	t.validationMu.Lock()
-	if t.validationGeneration == 0 {
-		t.validationGeneration = 1
-	}
-	if t.validatedForkBranches == nil {
-		t.validatedForkBranches = make(map[string]uint64)
-	}
-	t.validatedForkBranches[key] = t.validationGeneration
-	t.validationMu.Unlock()
-}
-
-func (t *Trunks) markForkResultValidated(parent []string, children ...string) {
-	t.markForkPreflightValidated(parent)
-	for _, child := range children {
-		if child == "" {
-			continue
-		}
-		branch := append(append([]string(nil), parent...), child)
-		t.markForkPreflightValidated(branch)
-	}
-}
-
-func (t *Trunks) openForkSource(branch []string) (*XWAL, error) {
-	t.retireRootHotPreservingValidation()
-	validated := t.forkPreflightValidated(branch)
-	if validated {
-		complete, err := forkTopologyStructurallyComplete(t.root, t.cfg, branch)
-		if err != nil {
-			return nil, err
-		}
-		validated = complete
-	}
-	if !validated {
-		if t.testDeepRepair != nil {
-			t.testDeepRepair()
-		}
-		if err := repairBranchChannels(t.root, t.cfg, branch); err != nil {
-			return nil, err
-		}
-		if err := repairRehomeDescendants(t.root, t.cfg, branch); err != nil {
-			return nil, err
-		}
-		// A repair rewrote markers, so the index describes a forest that no
-		// longer exists. Pay the walk here, where the disk actually moved.
-		if err := t.rebuild(); err != nil {
-			return nil, err
-		}
-		t.markForkPreflightValidated(branch)
-	}
-	return Open(t.root, t.cfg, branch...)
 }
 
 func retireTrunkStores(root string) {
@@ -1574,30 +1497,6 @@ func (t *Trunks) SpawnUnderRoot() (TrunkID, error) {
 		return "", err
 	}
 	return t.forkFlat("", "conversation", true)
-}
-
-// forkChild forks the node at parentBranch at its tail (N-ary add-one, no
-// continuation), creating an empty child dir named childDir in every channel.
-// Returns the child's branch. Caller holds t.mu and updates the index after.
-func (t *Trunks) forkChild(parentBranch []string, childDir string, commit *forkCommit) ([]string, error) {
-	x, err := t.openHotTopology(parentBranch)
-	if err != nil {
-		return nil, err
-	}
-	tail := mainTail(x)
-	x.Close()
-	fx, err := t.openForkSource(parentBranch)
-	if err != nil {
-		return nil, err
-	}
-	c, ferr := fx.forkJoint(tail+1, childDir, "", commit) // N-ary add-one at the tail; no continuation
-	fx.Close()
-	if ferr != nil {
-		return nil, ferr
-	}
-	t.markForkResultValidated(parentBranch, childDir)
-	c.Close()
-	return append(append([]string(nil), parentBranch...), childDir), nil
 }
 
 // OwnerTrunk returns the trunk id of the node that OWNS atMainLT along the
