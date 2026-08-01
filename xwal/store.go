@@ -173,7 +173,7 @@ func (s *Store) poisoned(trunk string) error {
 }
 
 // purgeLineage drops all flusher bookkeeping for trunk ids that ceased
-// to exist (Remove) or were relabeled away (Promote).
+// to exist (Remove).
 func (s *Store) purgeLineage(ids ...string) {
 	s.mu.Lock()
 	for _, id := range ids {
@@ -216,15 +216,6 @@ func (s *Store) Remove(trunk string, recursive bool) error {
 		s.purgeLineage(removed...)
 	}
 	return err
-}
-
-// Promote relabels trunk markers; the absorbed parent id may cease to
-// exist, so its bookkeeping is drained first and purged after.
-func (s *Store) Promote(trunk TrunkID, levels int) (int, error) {
-	s.flushDirty()
-	n, err := s.Trunks.Promote(trunk, levels)
-	s.purgeVanished()
-	return n, err
 }
 
 // Clear wipes a channel's own data for a trunk's lineage and reseeds it

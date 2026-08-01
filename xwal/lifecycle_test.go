@@ -73,46 +73,6 @@ func TestRawTrunksRemoveIsPurgedByFlusher(t *testing.T) {
 	}
 }
 
-func TestPromoteDirtyTrunkDoesNotPoisonStore(t *testing.T) {
-	dir := t.TempDir()
-	opts := testStoreOptions()
-	opts.FlushInterval = 20 * time.Millisecond
-	s, err := OpenStore(dir, opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	if err := s.CreateStump("cfg"); err != nil {
-		t.Fatal(err)
-	}
-	parent, err := s.SpawnUnderStump("cfg")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 3; i++ {
-		if _, err := s.Append(parent, "ir", 0, []byte(`{"p":1}`), nil); err != nil {
-			t.Fatal(err)
-		}
-	}
-	child, err := s.Fork(parent, 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.Append(parent, "ir", 0, []byte(`{"p":2}`), nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.Append(child, "ir", 0, []byte(`{"c":1}`), nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.Promote(child, 5); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(300 * time.Millisecond)
-	if _, err := s.Append(child, "ir", 0, []byte(`{"c":2}`), nil); err != nil {
-		t.Fatalf("append to promoted trunk: %v", err)
-	}
-}
-
 func TestPoisonIsPerLineage(t *testing.T) {
 	dir := t.TempDir()
 	opts := testStoreOptions()

@@ -123,11 +123,6 @@ type (
 
 const trunkMarker = ".trunk"
 
-// ErrAtStump is returned by Promote when a trunk cannot climb further: the
-// node above it is a stump (the cauterization boundary). Callers map this
-// to a domain message (figaro: "cannot promote into a loadout").
-var ErrAtStump = errors.New("xwal: trunk is rooted at a stump; cannot promote further")
-
 // genesisMarker is the root node's first main entry, so the trunk is
 // immediately forkable and its prefix is never empty.
 const genesisMarker = `{"genesis":true}`
@@ -1660,67 +1655,6 @@ func (t *Trunks) Owner(trunk TrunkID, atMainLT uint64) (Owner, error) {
 		return Owner{}, fmt.Errorf("xwal: no owner node for main-LT %d on trunk %q", atMainLT, trunk)
 	}
 	return Owner{Trunk: n.Trunk, Stump: n.stumpName(), IsRoot: n.IsRoot}, nil
-}
-
-// Promote climbs a trunk up `levels` stump-bounded levels by relabeling the
-// main channel's .Trunk markers: the trunk absorbs its parent trunk's run
-// (the consecutive same-id ancestors above its divergence point), repeated
-// once per level. No data moves — only markers are rewritten, so the other
-// channels follow the unchanged node tree. The climb stops at a stump (the
-// cauterization boundary): if it cannot move at all, Promote returns
-// ErrAtStump; excess levels past the stump are a no-op. Returns the number
-// of levels actually climbed.
-func (t *Trunks) Promote(trunk TrunkID, levels int) (int, error) {
-	endMutation, err := t.beginTopologyMutation()
-	if err != nil {
-		return 0, err
-	}
-	defer endMutation()
-	if err := t.ensureNoOpenHeads(); err != nil {
-		return 0, err
-	}
-	t.retireRootHotPreservingValidation()
-	if levels <= 0 {
-		levels = 1
-	}
-	foundKey, ok := t.foundingNode(trunk)
-	if !ok {
-		return 0, fmt.Errorf("%w %q", ErrUnknownTrunk, trunk)
-	}
-	climbed := 0
-	for climbed < levels {
-		f := t.node(foundKey)
-		p := t.node(f.From)
-		if f.IsRoot || p == nil || p.IsRoot || p.Kind == "loadout" {
-			break // ceremonial boundary above — cannot climb further
-		}
-		parentID := p.Trunk
-		// Walk up from p (toward the root) through the consecutive same-id run,
-		// stopping when the node above has a different id (or is a stump/root).
-		runTop := f.From
-		for {
-			up := t.node(t.node(runTop).From)
-			if up == nil || up.IsRoot || up.Kind == "loadout" || up.Trunk != parentID {
-				break
-			}
-			runTop = t.node(runTop).From
-		}
-		// Relabel the run [runTop .. p] to the promoted id on disk.
-		for cur := f.From; ; cur = t.node(cur).From {
-			if err := writeTrunkID(t.irDir(t.node(cur).Branch), trunk); err != nil {
-				return climbed, err
-			}
-			if cur == runTop {
-				break
-			}
-		}
-		foundKey = runTop
-		climbed++
-	}
-	if climbed == 0 {
-		return 0, ErrAtStump
-	}
-	return climbed, t.rebuild()
 }
 
 // foundingNode returns the shallowest node carrying a trunk id (its parent is

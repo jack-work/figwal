@@ -283,26 +283,6 @@ func runXWAL(args []string) {
 		check(err)
 		fmt.Printf("spawned trunk %s under root\n", id)
 		return
-	case "promote":
-		// promote <dir> <trunk> [levels]
-		if len(pos) < 1 || len(pos) > 2 {
-			usageXWAL()
-		}
-		levels := 1
-		if len(pos) == 2 {
-			levels = int(mustU64(pos[1]))
-		}
-		f, err := xwal.OpenStore(dir, sopts)
-		check(err)
-		defer f.Close()
-		climbed, err := f.Promote(pos[0], levels)
-		if err == xwal.ErrAtStump {
-			fmt.Printf("trunk %s is rooted at a stump — cannot promote further\n", pos[0])
-			os.Exit(1)
-		}
-		check(err)
-		fmt.Printf("promoted trunk %s by %d level(s)\n", pos[0], climbed)
-		return
 	case "stumps":
 		f, err := xwal.OpenStore(dir, sopts)
 		check(err)
@@ -778,8 +758,6 @@ trunk verbs (mirror figaro — a trunk is the addressable handle; no attendance)
   spawn <stump-name>              mint a top-level trunk under a stump
   spawn-root                      mint a top-level trunk directly under the root
   stumps                          list stumps and their trunk children
-  promote <trunk> [levels]        climb a trunk up N stump-bounded levels by
-                                  relabeling .trunk markers (stops at a stump)
   send  <trunk>[:<LT>] <data>     append to a trunk's tail; with <LT>, fork a new
                                   trunk there first and append to it (channels
                                   auto-create on first append)

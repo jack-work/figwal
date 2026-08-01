@@ -545,10 +545,8 @@ func TestVersion_BumpsOnMutations(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	// Promote the alt — it has a real parent trunk to absorb, so it
-	// must climb and bump.
-	bump("Promote", func() {
-		if _, err := f.Promote(alt, 1); err != nil {
+	bump("Remove", func() {
+		if err := f.Remove(alt, false); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -564,53 +562,6 @@ func TestVersion_RefreshIsCheapAndBumps(t *testing.T) {
 	}
 	if v1 := f.Version(); v1 <= v0 {
 		t.Fatalf("Refresh should bump version (%d -> %d)", v0, v1)
-	}
-}
-
-// TestPromote_HeadRemainsUsableWithoutClose is the regression this whole
-// versioning scheme is meant to enable on the consumer side: after
-// Promote, calling Head(id) on the same live Trunks instance must
-// resolve to the correct leaf without any external Close/Reopen dance.
-// The in-memory index is refreshed inside Promote itself, and Head
-// serves the fresh view. If this test fails, the trunk lookup went
-// stale and consumers would strand.
-func TestPromote_HeadRemainsUsableWithoutClose(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "f")
-	f, c := seedTrunkBirth(t, dir, "cfg@d880")
-	// Extend + fork so there's something to promote across.
-	for _, m := range []string{`"m1"`, `"m2"`, `"m3"`} {
-		if _, _, err := f.Append(c, 0, []byte(m), nil); err != nil {
-			t.Fatal(err)
-		}
-	}
-	b, _ := forkAppend(t, f, c, 3, []byte(`"fromB"`))
-
-	// Capture the pre-promote head payloads so we can compare.
-	before := headPayloads(t, f, b)
-
-	// Promote B one level.
-	if n, err := f.Promote(b, 1); err != nil || n != 1 {
-		t.Fatalf("promote: n=%d err=%v", n, err)
-	}
-
-	// Head(b) on the SAME live instance must still resolve without any
-	// external help, and the payload sequence must be identical
-	// (promotion is cosmetic — no content changes).
-	after := headPayloads(t, f, b)
-	if len(before) != len(after) {
-		t.Fatalf("payload count changed across promote: %d -> %d", len(before), len(after))
-	}
-	for i := range before {
-		if before[i] != after[i] {
-			t.Fatalf("payload[%d] mismatch: pre=%q post=%q", i, before[i], after[i])
-		}
-	}
-
-	// And c is still resolvable too (siblings undisturbed).
-	if x, err := f.Head(c); err != nil {
-		t.Fatalf("head c after promote(b): %v", err)
-	} else {
-		x.Close()
 	}
 }
 

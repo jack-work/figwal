@@ -329,33 +329,6 @@ func TestConcurrentAppendsWithTopologyMutations(t *testing.T) {
 				}
 			},
 		},
-		{
-			name: "promote",
-			setup: func(t *testing.T, f *Trunks) func() error {
-				right, err := f.SpawnUnderStump("s")
-				if err != nil {
-					t.Fatal(err)
-				}
-				if _, _, err := f.Append(right, 0, []byte(`"right"`), nil); err != nil {
-					t.Fatal(err)
-				}
-				child, err := f.SpawnChild(right)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if _, _, err := f.Append(child, 0, []byte(`"child"`), nil); err != nil {
-					t.Fatal(err)
-				}
-				grandchild, err := f.SpawnChild(child)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return func() error {
-					_, err := f.Promote(grandchild, 1)
-					return err
-				}
-			},
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "f")
