@@ -650,15 +650,21 @@ func TestTopologyMutationRefusesOpenHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.ForkTail(trunk); err == nil {
+	// A creator no longer waits on open heads; a DESTRUCTIVE op still must,
+	// because it unlinks directories a live head is reading.
+	if _, err := f.ForkTail(trunk); err != nil {
+		t.Fatalf("ForkTail must not wait on an open head: %v", err)
+	}
+	shortTopologyWait(t)
+	if err := f.Remove(trunk, true); err == nil {
 		x.Close()
-		t.Fatal("ForkTail succeeded with an open head")
+		t.Fatal("Remove succeeded with an open head")
 	}
 	if err := x.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.ForkTail(trunk); err != nil {
-		t.Fatalf("ForkTail after close: %v", err)
+	if err := f.Remove(trunk, true); err != nil {
+		t.Fatalf("Remove after close: %v", err)
 	}
 }
 
@@ -685,9 +691,9 @@ func TestTopologyMutationSeesRetiredOpenHead(t *testing.T) {
 		t.Fatal(err)
 	}
 	shortTopologyWait(t)
-	if _, err := f.ForkTail(trunk); !isTopologyTimeout(err) {
+	if err := f.Remove(trunk, true); !isTopologyTimeout(err) {
 		stale.Close()
-		t.Fatalf("ForkTail error = %v, want bounded-wait timeout", err)
+		t.Fatalf("Remove error = %v, want bounded-wait timeout", err)
 	}
 	if err := stale.Close(); err != nil {
 		t.Fatal(err)

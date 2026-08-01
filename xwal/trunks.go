@@ -701,6 +701,30 @@ func (t *Trunks) beginTrackedRead() (func(), error) {
 	}, nil
 }
 
+// beginFlatCreate is the mutation gate for a creator. A flat fork writes
+// only its own new sibling directory and one index entry: it never freezes,
+// re-homes or rewrites anything a live head is reading, so it takes no root
+// topology mutation and does NOT wait for other arias to close their heads.
+// That is the whole point of the flat layout — an aria forks itself without
+// blocking anyone.
+func (t *Trunks) beginFlatCreate() (func(), error) {
+	t.mu.Lock()
+	if err := t.flushHot(); err != nil {
+		t.mu.Unlock()
+		return nil, fmt.Errorf("xwal: refusing create, hot flush failing: %w", err)
+	}
+	// A PEER moved the forest: re-read it. Cheap (one atomic load) and
+	// skipping it would let us fork from a node we do not know about.
+	if epoch := rootTopologyEpoch(t.registryRoot); t.rootEpoch.Load() != epoch {
+		if err := t.rebuild(); err != nil {
+			t.mu.Unlock()
+			return nil, err
+		}
+		t.rootEpoch.Store(epoch)
+	}
+	return func() { t.mu.Unlock() }, nil
+}
+
 func (t *Trunks) beginTopologyMutation() (func(), error) {
 	for {
 		t.mu.Lock()
@@ -1097,7 +1121,7 @@ func (t *Trunks) readForkBase(branch []string) (uint64, error) {
 func (t *Trunks) ForkTail(trunk string) (string, error) {
 	unlockLineage := t.lockLineage(trunk)
 	defer unlockLineage()
-	endMutation, err := t.beginTopologyMutation()
+	endMutation, err := t.beginFlatCreate()
 	if err != nil {
 		return "", err
 	}
@@ -1106,9 +1130,6 @@ func (t *Trunks) ForkTail(trunk string) (string, error) {
 }
 
 func (t *Trunks) forkTailLocked(trunk string) (string, error) {
-	if err := t.ensureNoOpenHeads(); err != nil {
-		return "", err
-	}
 	headKey, ok := t.idx.Head(trunk)
 	if !ok {
 		return "", fmt.Errorf("%w %q", ErrUnknownTrunk, trunk)
@@ -1207,14 +1228,11 @@ func (t *Trunks) channelTails(node string) (map[string]uint64, error) {
 func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 	unlockLineage := t.lockLineage(trunk)
 	defer unlockLineage()
-	endMutation, err := t.beginTopologyMutation()
+	endMutation, err := t.beginFlatCreate()
 	if err != nil {
 		return "", err
 	}
 	defer endMutation()
-	if err := t.ensureNoOpenHeads(); err != nil {
-		return "", err
-	}
 	branch, err := t.headBranch(trunk)
 	if err != nil {
 		return "", err
@@ -1393,14 +1411,11 @@ func (t *Trunks) remove(trunk string, recursive bool) ([]TrunkID, error) {
 // stumps, addressed with SpawnUnderRoot / SpawnUnderStump. SpawnChild
 // remains for spawning a fresh child under an existing trunk.
 func (t *Trunks) SpawnChild(parent TrunkID) (TrunkID, error) {
-	endMutation, err := t.beginTopologyMutation()
+	endMutation, err := t.beginFlatCreate()
 	if err != nil {
 		return "", err
 	}
 	defer endMutation()
-	if err := t.ensureNoOpenHeads(); err != nil {
-		return "", err
-	}
 	nodeKey, ok := t.anchorOf(parent)
 	if !ok {
 		return "", fmt.Errorf("%w %q", ErrUnknownTrunk, parent)
@@ -1415,14 +1430,11 @@ func (t *Trunks) SpawnChild(parent TrunkID) (TrunkID, error) {
 // (figaro names them <loadout>@<hash>). Idempotent callers should check
 // Stumps() first; a duplicate name is an error.
 func (t *Trunks) CreateStump(name string) error {
-	endMutation, err := t.beginTopologyMutation()
+	endMutation, err := t.beginFlatCreate()
 	if err != nil {
 		return err
 	}
 	defer endMutation()
-	if err := t.ensureNoOpenHeads(); err != nil {
-		return err
-	}
 	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) || strings.HasPrefix(name, ".") {
 		return fmt.Errorf("xwal: invalid stump name %q", name)
 	}
@@ -1474,14 +1486,11 @@ func (t *Trunks) StumpHead(name string) (*XWAL, error) {
 
 // SpawnUnderStump mints a new trunk (a top-level aria) as a child of a stump.
 func (t *Trunks) SpawnUnderStump(name string) (TrunkID, error) {
-	endMutation, err := t.beginTopologyMutation()
+	endMutation, err := t.beginFlatCreate()
 	if err != nil {
 		return "", err
 	}
 	defer endMutation()
-	if err := t.ensureNoOpenHeads(); err != nil {
-		return "", err
-	}
 	if n := t.node(name); n == nil || n.Kind != "loadout" {
 		return "", fmt.Errorf("xwal: no stump %q", name)
 	}
@@ -1491,14 +1500,11 @@ func (t *Trunks) SpawnUnderStump(name string) (TrunkID, error) {
 // SpawnUnderRoot mints a new trunk directly under the root (a top-level
 // trunk with no stump — e.g. a loadoutless conversation).
 func (t *Trunks) SpawnUnderRoot() (TrunkID, error) {
-	endMutation, err := t.beginTopologyMutation()
+	endMutation, err := t.beginFlatCreate()
 	if err != nil {
 		return "", err
 	}
 	defer endMutation()
-	if err := t.ensureNoOpenHeads(); err != nil {
-		return "", err
-	}
 	return t.forkFlat("", "conversation", true)
 }
 

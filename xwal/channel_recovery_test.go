@@ -171,9 +171,11 @@ func TestRootTopologyMutationRejectsPeerBorrowedHead(t *testing.T) {
 		head.Close()
 		t.Fatalf("EnsureChannel error = %v, want bounded-wait timeout", err)
 	}
-	if err := first.CreateStump("blocked"); !isTopologyTimeout(err) {
+	// A creator does not wait on a peer's borrowed head; only channel and
+	// destructive mutations, which rewrite what that head is reading, do.
+	if err := first.CreateStump("unblocked"); err != nil {
 		head.Close()
-		t.Fatalf("CreateStump error = %v, want bounded-wait timeout", err)
+		t.Fatalf("CreateStump must not wait on a peer head: %v", err)
 	}
 	if err := head.Close(); err != nil {
 		t.Fatal(err)

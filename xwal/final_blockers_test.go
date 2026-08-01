@@ -86,15 +86,20 @@ func TestDetachedHeadRetainsRootBorrowUntilClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	shortTopologyWait(t)
-	if _, err := f.ForkTail(trunk); !isTopologyTimeout(err) {
+	// A creator never waits on a detached head. A destructive op still does:
+	// the borrow is what keeps its directories alive.
+	if _, err := f.ForkTail(trunk); err != nil {
+		t.Fatalf("ForkTail must not wait on a detached head: %v", err)
+	}
+	if err := f.Remove(trunk, true); !isTopologyTimeout(err) {
 		head.Close()
-		t.Fatalf("ForkTail error = %v, want bounded-wait timeout", err)
+		t.Fatalf("Remove error = %v, want bounded-wait timeout", err)
 	}
 	if err := head.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.ForkTail(trunk); err != nil {
-		t.Fatalf("ForkTail after detached head close: %v", err)
+	if err := f.Remove(trunk, true); err != nil {
+		t.Fatalf("Remove after detached head close: %v", err)
 	}
 }
 

@@ -223,3 +223,39 @@ func TestLineageReadsTheFlatParent(t *testing.T) {
 		t.Error("forked trunk: branched-at LT = 0")
 	}
 }
+
+// The bottom line: an aria forks itself without blocking any other aria.
+// A flat fork writes only its own new sibling, so a head open elsewhere
+// must not delay it. Asserted by COUNT, never by duration: we hold real
+// heads open and require the fork to succeed, where the old global gate
+// spun until it timed out.
+func TestForkDoesNotWaitOnOtherOpenHeads(t *testing.T) {
+	f, trunk := seedTrunk(t, filepath.Join(t.TempDir(), "f"))
+	for range 3 {
+		if _, _, err := f.Append(trunk, 0, []byte(`"turn"`), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	others := make([]TrunkID, 0, 3)
+	for range 3 {
+		id, err := f.SpawnUnderRoot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		others = append(others, id)
+	}
+	// Hold every other aria's head open, as a live daemon does.
+	for _, id := range others {
+		x, err := f.Head(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer x.Close()
+	}
+	if _, err := f.ForkTail(trunk); err != nil {
+		t.Fatalf("fork blocked by %d open heads: %v", len(others), err)
+	}
+	if _, err := f.SpawnUnderRoot(); err != nil {
+		t.Fatalf("spawn blocked by open heads: %v", err)
+	}
+}
