@@ -317,6 +317,15 @@ func (s *Store) evictIdle() {
 			s.mu.Unlock()
 		}
 	}
+	// The root topology head is opened by every flat fork (to read the
+	// parent's channel tails) and belongs to no trunk, so no lineage
+	// eviction can ever reach it. Retire it once nothing is live.
+	s.mu.Lock()
+	quiet := len(s.touch) == 0 && len(s.dirty) == 0
+	s.mu.Unlock()
+	if quiet {
+		s.Trunks.retireRootHot()
+	}
 }
 
 // LoadedHeads reports how many lineage heads are currently resident in

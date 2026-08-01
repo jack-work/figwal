@@ -844,6 +844,9 @@ func (t *Trunks) register() error {
 	return nil
 }
 
+// retireRootHot drops the root topology head. Every flat fork opens it to
+// read the parent's channel tails, and it belongs to no trunk, so lineage
+// eviction can never reach it.
 func (t *Trunks) retireRootHot() {
 	invalidateRootTopologyValidation(t.registryRoot)
 	retireTrunkStores(t.root)

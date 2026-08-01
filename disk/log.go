@@ -615,6 +615,15 @@ func (l *Log) openActiveLocked(baseIndex uint64) error {
 				s.Close()
 				return err
 			}
+		} else if l.parent != nil && l.forkBase > 1 {
+			// A fork's FIRST segment inherits the parent's folded state at
+			// the fork point. Without this the child starts from the initial
+			// state and silently drops everything it inherited.
+			prevHeader, err = l.parent.StateAt(l.forkBase - 1)
+			if err != nil {
+				s.Close()
+				return err
+			}
 		}
 		header, herr := l.opts.OnSegmentOpen(prevHeader, sealed)
 		if herr != nil {
