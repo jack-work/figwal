@@ -3,6 +3,7 @@ package xwal
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -257,5 +258,62 @@ func TestForkDoesNotWaitOnOtherOpenHeads(t *testing.T) {
 	}
 	if _, err := f.SpawnUnderRoot(); err != nil {
 		t.Fatalf("spawn blocked by open heads: %v", err)
+	}
+}
+
+// A related channel is sparse: most main LTs have no record of their own.
+// An interior fork at such an LT must still inherit everything keyed below
+// it. Taking the boundary from an EXACT main-LT match instead made the
+// child claim base 1, severing the channel and dropping inherited state.
+func TestInteriorForkInheritsSparseChannel(t *testing.T) {
+	f, trunk := seedMapTrunk(t, filepath.Join(t.TempDir(), "f"))
+	_, lt, err := f.Append(trunk, 0, []byte(`"turn"`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch, err := MapSetPatch([]string{"model"}, []byte(`"m"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.AppendChannel(string(trunk), "chalkboard", lt, patch, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Three more turns with NO chalkboard record, so the fork point below
+	// is a main LT the related channel never keyed.
+	for range 3 {
+		if _, _, err := f.Append(trunk, 0, []byte(`"turn"`), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	x, err := f.Head(trunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := mainTail(x) - 1
+	x.Close()
+
+	alt, err := f.ForkAt(trunk, at)
+	if err != nil {
+		t.Fatalf("fork at %d: %v", at, err)
+	}
+	ax, err := f.Head(alt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ax.Close()
+	for _, c := range ax.Channels() {
+		if c.Name != "chalkboard" {
+			continue
+		}
+		if c.Last == 0 {
+			t.Fatalf("alt chalkboard is empty: it lost the inherited patch")
+		}
+		st, err := ax.StateAt("chalkboard", c.Last)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(st), `"model":"m"`) {
+			t.Fatalf("alt chalkboard state = %s, want the inherited model", st)
+		}
 	}
 }

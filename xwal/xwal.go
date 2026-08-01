@@ -135,6 +135,32 @@ type channel struct {
 	fkScan  bool
 }
 
+// lookupAtOrBelow is the greatest channel LT whose record is keyed at or
+// below mainLT — the boundary a fork sharing main [1..mainLT] inherits.
+//
+// NOT lookup: that is an EXACT match on mainLT, and a related channel is
+// sparse, so most main LTs have no record of their own. Using it as a
+// boundary made every fork at an unkeyed LT claim base 1, which severs the
+// channel from its ancestors and silently drops inherited state.
+func (ch *channel) lookupAtOrBelow(mainLT uint64) (uint64, bool, error) {
+	found, ok := uint64(0), false
+	err := ch.log.ScanFromEnd(ch.log.LastIndex(), func(idx uint64, payload []byte) error {
+		m, derr := decodeMainLT(payload)
+		if derr != nil {
+			return derr
+		}
+		if m <= mainLT {
+			found, ok = idx, true
+			return errStopRange
+		}
+		return nil
+	})
+	if err != nil && err != errStopRange {
+		return 0, false, err
+	}
+	return found, ok, nil
+}
+
 func (ch *channel) lookup(mainLT uint64) (uint64, bool, error) {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()

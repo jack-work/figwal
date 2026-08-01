@@ -1282,7 +1282,7 @@ func (t *Trunks) forkFlatAt(parentKey string, atMainLT uint64) (string, error) {
 			bases[c.Name] = atMainLT + 1
 			continue
 		}
-		lt, ok, lerr := x.chans[c.Name].lookup(atMainLT)
+		lt, ok, lerr := x.chans[c.Name].lookupAtOrBelow(atMainLT)
 		if lerr != nil {
 			x.Close()
 			return "", lerr
