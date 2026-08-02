@@ -114,7 +114,7 @@ func (s *Store) open(abs string, opts Options) (*Log, error) {
 
 // Evict syncs and drops the cached Log for dir, releasing its in-RAM
 // snapshot; the next Open rebuilds it from disk. The underlying disk
-// log stays cached in the disk store for cheap reload. On flush failure
+// log stays cached in the disk store for cheap reload. On sync failure
 // the log stays cached, so no buffered entry is orphaned.
 func (s *Store) Evict(dir string) error {
 	abs, err := filepath.Abs(dir)
@@ -139,7 +139,7 @@ func (s *Store) Evict(dir string) error {
 	return nil
 }
 
-// Close flushes buffered entries and closes every disk log after all
+// Close syncs queued entries and closes every disk log after all
 // in-flight cache constructions finish. The Store cannot be used again.
 func (s *Store) Close() error {
 	s.mu.Lock()

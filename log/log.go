@@ -269,7 +269,7 @@ func (l *Log) Sync() error { return l.SyncThrough(^uint64(0)) }
 
 // SyncThrough persists buffered entries with index <= target and fsyncs.
 // The buffer is trimmed only after the fsync succeeds, so a failed
-// flush retries safely: entries that did reach disk before the failure
+// sync retries safely: entries that did reach disk before the failure
 // are skipped on the next attempt.
 func (l *Log) SyncThrough(target uint64) error {
 	l.fmu.Lock()
@@ -459,7 +459,7 @@ func (l *Log) ChildForkBases() (map[string]uint64, error) {
 
 // StateAt reconstructs a header-mode state from the on-disk watermark.
 // The disk fold must see every appended patch, so buffered entries are
-// flushed first.
+// synced first.
 func (l *Log) StateAt(idx uint64) ([]byte, error) {
 	if err := l.Sync(); err != nil {
 		return nil, err
