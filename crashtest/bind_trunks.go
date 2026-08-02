@@ -100,6 +100,14 @@ func (b *trunksStore) ForkAt(trunk string, atMainLT uint64) (string, error) {
 	return b.s.Fork(trunk, atMainLT)
 }
 
+func (b *trunksStore) Detach(trunk string) error {
+	node, ok := b.s.HeadNode(trunk)
+	if !ok {
+		return nil // trunk vanished under us; nothing to detach
+	}
+	return b.s.Detach(node)
+}
+
 func (b *trunksStore) ReadAll(trunk, channel string) ([]Rec, error) {
 	rs, err := b.s.RecordsFrom(trunk, channel, 0, 0)
 	if isNoChannel(err) {

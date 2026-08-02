@@ -20,6 +20,10 @@ type Store interface {
 	AppendChannel(trunk, channel string, mainLT uint64, payload []byte) (uint64, error)
 	Kick()
 	ForkAt(trunk string, atMainLT uint64) (string, error)
+	// Detach makes a trunk self-sufficient: it absorbs the history prefix
+	// it reads through an ancestor and stops pointing at one. Crash-safe by
+	// ordering alone, which is a claim only this harness can test.
+	Detach(trunk string) error
 	ReadAll(trunk, channel string) ([]Rec, error)
 	TailRecord(trunk, channel string) (Rec, bool, error)
 	MainTail(trunk string) (uint64, error)

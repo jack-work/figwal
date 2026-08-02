@@ -193,6 +193,13 @@ func runChild() {
 			}
 			trunks = append(trunks, nt)
 			states[nt] = nts
+		case p < 94:
+			// Detach: absorb the inherited prefix, then stop pointing at an
+			// ancestor. LT-neutral by contract, so the model must see NO
+			// change -- which is exactly what makes it worth killing during.
+			if err := st.Detach(tr); err != nil {
+				childFail(fmt.Errorf("detach %s: %w", tr, err))
+			}
 		case p < 96:
 			if len(trunks) < 2 {
 				continue
