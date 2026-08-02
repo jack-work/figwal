@@ -1320,20 +1320,39 @@ func recoverAtomicReplacement(final string) error {
 	return disk.SyncDir(filepath.Dir(final))
 }
 
+// writeSyncedFile replaces path atomically: a reader sees the whole old
+// content or the whole new content, never a torn or empty file.
+//
+// It writes a temp file, fsyncs it, renames it over the target and fsyncs
+// the directory. Truncating in place would leave a ZERO-BYTE marker if the
+// process died between the truncate and the write -- and every .fork and
+// .from on disk is written through here, so that would turn one badly timed
+// crash into an unreadable node.
 func writeSyncedFile(path string, body []byte) error {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	tmp := path + ".tmp"
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
 	if _, err := file.Write(body); err != nil {
 		file.Close()
+		os.Remove(tmp)
 		return err
 	}
 	if err := file.Sync(); err != nil {
 		file.Close()
+		os.Remove(tmp)
 		return err
 	}
-	return file.Close()
+	if err := file.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return disk.SyncDir(filepath.Dir(path))
 }
 
 // AppendMain appends payload (with optional opaque meta) to the main

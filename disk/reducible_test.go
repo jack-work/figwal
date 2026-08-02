@@ -336,7 +336,9 @@ func TestReopenRepairsHeaderlessActiveSegment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload := func(i uint64) []byte { return []byte(fmt.Sprintf(`{"i":%d,"pad":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}`, i)) }
+	payload := func(i uint64) []byte {
+		return []byte(fmt.Sprintf(`{"i":%d,"pad":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}`, i))
+	}
 	last := uint64(0)
 	for i := uint64(1); len(l.SegmentBaseIndexes()) < 3; i++ {
 		if err := l.Write(i, payload(i)); err != nil {

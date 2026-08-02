@@ -146,7 +146,12 @@ func Open(dir string, opts Options) (*Log, error) {
 		} else {
 			firstBase = l.active.FirstIndex()
 		}
-		if firstBase != base {
+		// A fork may own MORE than its base claims: absorbing an inherited
+		// prefix (Detach) writes segments below it, and reads under the base
+		// still delegate to the parent, which serves identical bytes. Only
+		// the other direction is a defect -- a marker claiming data that
+		// starts later than it says, i.e. records nobody can serve.
+		if firstBase > base {
 			_ = l.Close()
 			return nil, fmt.Errorf("%w: marker=%d firstSegment=%d",
 				ErrForkMismatch, base, firstBase)

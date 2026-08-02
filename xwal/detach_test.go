@@ -146,3 +146,173 @@ func TestDetachIsIdempotent(t *testing.T) {
 		t.Fatalf("second detach changed the log: %v -> %v", first, got)
 	}
 }
+
+// The crash-safety argument, exercised rather than asserted: a Detach that
+// dies between two channels' marker flips must leave EVERY channel
+// readable. .from is written last precisely so this holds -- an unflipped
+// channel still delegates to the parent, a flipped one reads its own
+// absorbed copy, and the two are byte-identical.
+func TestDetachHalfFlipIsReadable(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "f")
+	f, parent := seedMapTrunk(t, dir)
+	for i := range 4 {
+		_, lt, err := f.Append(parent, 0, fmt.Appendf(nil, `"p%d"`, i), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		patch, _ := MapSetPatch([]string{"n"}, fmt.Appendf(nil, `%d`, i))
+		if _, err := f.AppendChannel(string(parent), "chalkboard", lt, patch, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	child, err := f.ForkTail(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := f.head(string(child))
+	want := mainLTs(t, f, child)
+	if err := f.Detach(key); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rewind to a half-flip: main published, chalkboard not, .from still
+	// naming the parent. This is exactly the state a kill between the two
+	// .fork writes leaves behind.
+	cbFork := filepath.Join(dir, "chalkboard", key, ".fork")
+	if err := os.WriteFile(cbFork, []byte("base=5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ir", key, ".from"), []byte("n0\nconversation\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g, err := openTrunks(dir, mapTrunksCfg())
+	if err != nil {
+		t.Fatalf("reopen half-flipped: %v", err)
+	}
+	cleanupTrunks(t, g)
+	if got := mainLTs(t, g, child); len(got) != len(want) {
+		t.Fatalf("half-flipped child reads %v, want %v", got, want)
+	}
+	x, err := g.Head(child)
+	if err != nil {
+		t.Fatalf("half-flipped head: %v", err)
+	}
+	defer x.Close()
+	for _, c := range x.Channels() {
+		if c.Name != "chalkboard" || c.Last == 0 {
+			continue
+		}
+		if _, err := x.StateAt("chalkboard", c.Last); err != nil {
+			t.Fatalf("half-flipped chalkboard unreadable: %v", err)
+		}
+	}
+}
+
+// A prefix longer than one segment's worth. The absorbed prefix must fold
+// to the same reducible state regardless of size: chunking it and giving
+// each chunk the INITIAL watermark would reproduce the wrong state from the
+// second chunk on, and only a prefix this long can show it.
+func TestDetachAbsorbsAPrefixLargerThanASegment(t *testing.T) {
+	cfg := mapTrunksCfg()
+	cfg.SegmentSize = 4096 // several rows per segment, so the prefix spans many
+	dir := filepath.Join(t.TempDir(), "f")
+	f, err := createTrunks(dir, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupTrunks(t, f)
+	if err := f.CreateStump("s"); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := f.SpawnUnderStump("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const turns = 120
+	for i := range turns {
+		_, lt, err := f.Append(parent, 0, fmt.Appendf(nil, `"turn-%03d-padding-padding-padding"`, i), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A DISTINCT key per turn, so state ACCUMULATES. Overwriting one
+		// key would make a lost watermark invisible: last-write-wins
+		// reproduces the right answer from the wrong history.
+		patch, _ := MapSetPatch([]string{fmt.Sprintf("k%d", i)}, fmt.Appendf(nil, `%d`, i))
+		if _, err := f.AppendChannel(string(parent), "chalkboard", lt, patch, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	child, err := f.ForkTail(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// EVERY index, not just the tail: a chunked absorb gives each chunk
+	// after the first a watermark claiming the INITIAL state, and only a
+	// read landing INSIDE such a chunk can see it. Reading the tail alone
+	// is served by the node's own segment and proves nothing.
+	states := func(g *Trunks) []string {
+		x, err := g.Head(child)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer x.Close()
+		var last uint64
+		for _, c := range x.Channels() {
+			if c.Name == "chalkboard" {
+				last = c.Last
+			}
+		}
+		out := make([]string, 0, last)
+		for i := uint64(1); i <= last; i++ {
+			st, err := x.StateAt("chalkboard", i)
+			if err != nil {
+				t.Fatalf("state at %d: %v", i, err)
+			}
+			out = append(out, string(st))
+		}
+		return out
+	}
+	before := states(f)
+	if len(before) < turns {
+		t.Fatalf("only %d chalkboard indices, want >= %d", len(before), turns)
+	}
+	if tail := before[len(before)-1]; !strings.Contains(tail, `"k0":0`) ||
+		!strings.Contains(tail, fmt.Sprintf(`"k%d":%d`, turns-1, turns-1)) {
+		t.Fatalf("pre-detach tail state does not accumulate: %s", tail)
+	}
+	lts := mainLTs(t, f, child)
+
+	if err := f.Detach(f.head(string(child))); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	// Compare against DISK, not the live handle: a cached head still holds
+	// the pre-detach fork base and would keep delegating to the parent,
+	// hiding whatever the absorb actually wrote. Remove the ancestor too,
+	// so nothing can be served from it by accident.
+	if err := os.RemoveAll(f.irDir(f.head(string(parent)))); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	g, err := openTrunks(dir, cfg)
+	if err != nil {
+		t.Fatalf("reopen without the ancestor: %v", err)
+	}
+	cleanupTrunks(t, g)
+	after := states(g)
+	for i := range before {
+		if i >= len(after) {
+			t.Fatalf("after detach only %d indices survive, want %d", len(after), len(before))
+		}
+		if after[i] != before[i] {
+			t.Fatalf("detach changed folded state at index %d: %s -> %s", i+1, before[i], after[i])
+		}
+	}
+	if got := mainLTs(t, g, child); len(got) != len(lts) {
+		t.Fatalf("with the ancestor gone: %d records, want %d", len(got), len(lts))
+	}
+}

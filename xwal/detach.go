@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/jack-work/figwal/disk"
+	"github.com/jack-work/figwal/log"
 	"github.com/jack-work/figwal/segment"
 )
 
@@ -41,54 +42,40 @@ func (t *Trunks) Detach(node string) error {
 	if err != nil {
 		return err
 	}
-	codec := x.codec
-	prefixes := map[string][][]byte{}
-	bases := map[string]uint64{}
+	var channels []string
 	for _, c := range x.Channels() {
 		ch := x.chans[c.Name]
+		channels = append(channels, c.Name)
 		base := ch.log.ForkBase()
-		bases[c.Name] = base
+		dir := filepath.Join(t.root, c.Name, node)
 		if base <= 1 {
 			continue // already its own root in this channel
 		}
-		var rows [][]byte
-		err := ch.log.Range(1, func(idx uint64, payload []byte) error {
-			if idx >= base {
-				return errStopRange
-			}
-			rows = append(rows, append([]byte(nil), payload...))
-			return nil
-		})
-		if err != nil && err != errStopRange {
+		if _, serr := os.Stat(dir); os.IsNotExist(serr) {
+			continue // a channel added after this node existed
+		} else if serr != nil {
 			x.Close()
-			return fmt.Errorf("xwal: detach %q read %q: %w", node, c.Name, err)
+			return serr
 		}
-		prefixes[c.Name] = rows
-	}
-	initial := map[string][]byte{}
-	for _, c := range x.Channels() {
-		if ch := x.chans[c.Name]; ch.kind == ChannelReducible {
-			initial[c.Name] = ch.initial
+		var initial []byte
+		if ch.kind == ChannelReducible {
+			initial = ch.initial
+		}
+		if err := absorbPrefix(dir, ch.log, base, initial, x.codec); err != nil {
+			x.Close()
+			return fmt.Errorf("xwal: detach %q channel %q: %w", node, c.Name, err)
 		}
 	}
 	x.Close()
 
-	// Phase 1: write the absorbed prefix. Invisible until the flip.
-	for name, rows := range prefixes {
+	// Publish: .fork per channel, then .from LAST. That order is
+	// load-bearing. A crash between two channels' .fork writes leaves each
+	// channel individually correct, because .from still names the parent: a
+	// flipped channel reads its own absorbed copy, an unflipped one still
+	// delegates, and the two are byte-identical. Clearing .from first would
+	// strand every channel not yet flipped, which is a hole.
+	for _, name := range channels {
 		dir := filepath.Join(t.root, name, node)
-		if _, err := os.Stat(dir); os.IsNotExist(err) {
-			continue
-		}
-		if err := writePrefixSegments(dir, rows, initial[name], codec, t.cfg.SegmentSize); err != nil {
-			return fmt.Errorf("xwal: detach %q write %q: %w", node, name, err)
-		}
-	}
-	// Phase 2: publish. Each marker write is an atomic replacement, so a
-	// reader sees the old lineage or the new one, never a torn one.
-	for name := range bases {
-		dir := filepath.Join(t.root, name, node)
-		// A channel added after this node was created has no directory
-		// here, so the node has no presence in it and nothing to detach.
 		if _, err := os.Stat(dir); os.IsNotExist(err) {
 			continue
 		} else if err != nil {
@@ -108,60 +95,56 @@ func (t *Trunks) Detach(node string) error {
 	return t.rebuild()
 }
 
-// writePrefixSegments lays rows down as segments starting at index 1, sized
-// by segmentSize. A reducible channel's first segment carries the initial
-// watermark, so folding from it reproduces the same state the ancestor gave.
-func writePrefixSegments(dir string, rows [][]byte, initial []byte, codec segment.SegmentCodec, segmentSize int64) error {
-	if len(rows) == 0 {
+// absorbPrefix copies [1, base) out of the parent chain into dir as ONE
+// segment based at 1, streaming straight from the read.
+//
+// One segment, not many: a reducible channel's segment header is the folded
+// state at its start, and only the segment based at 1 can honestly carry the
+// INITIAL state. Chunking would have to re-fold a watermark per chunk, and
+// getting that subtly wrong reproduces the wrong state on every later read.
+// Packing is segment normalization's job, and it is deferred.
+func absorbPrefix(dir string, src *log.Log, base uint64, initial []byte, codec segment.SegmentCodec) error {
+	if base <= 1 {
 		return nil
 	}
-	if segmentSize <= 0 {
-		segmentSize = 1 << 21
+	path := filepath.Join(dir, segFileName(1, codec))
+	// maxSize 0: unbounded, so the whole prefix lands in this one segment.
+	seg, err := segment.Create(path, codec, 1, 0)
+	if err != nil {
+		return err
 	}
-	idx := uint64(1)
-	for i := 0; i < len(rows); {
-		path := filepath.Join(dir, segFileName(idx, codec))
-		s, err := segment.Create(path, codec, idx, segmentSize)
-		if err != nil {
+	if initial != nil {
+		if err := seg.WriteHeader(initial); err != nil {
+			seg.Close()
 			return err
 		}
-		if initial != nil {
-			if err := s.WriteHeader(initial); err != nil {
-				s.Close()
-				return err
-			}
+	}
+	rerr := src.Range(1, func(idx uint64, payload []byte) error {
+		if idx >= base {
+			return errStopRange
 		}
-		wrote := 0
-		for ; i < len(rows); i++ {
-			if _, err := s.Append(rows[i]); err != nil {
-				if err == segment.ErrFull && wrote > 0 {
-					break
-				}
-				s.Close()
-				return err
-			}
-			wrote++
-		}
-		if err := s.Sync(); err != nil {
-			s.Close()
-			return err
-		}
-		if err := s.Close(); err != nil {
-			return err
-		}
-		idx += uint64(wrote)
+		_, aerr := seg.Append(payload)
+		return aerr
+	})
+	if rerr != nil && rerr != errStopRange {
+		seg.Close()
+		return rerr
+	}
+	if err := seg.Sync(); err != nil {
+		seg.Close()
+		return err
+	}
+	if err := seg.Close(); err != nil {
+		return err
 	}
 	return disk.SyncDir(dir)
 }
 
-// DetachAll detaches every node in the set, in lineage order so a survivor
-// never absorbs from an ancestor that has already been detached out from
-// under it.
+// DetachAll detaches every node in the set. Order does not matter: each
+// absorbs from the chain as it stands when its turn comes, and an ancestor
+// that has already detached still serves the same bytes.
 func (t *Trunks) DetachAll(nodes []string) error {
 	for _, n := range nodes {
-		if _, err := os.Stat(t.irDir(n)); err != nil {
-			continue
-		}
 		if err := t.Detach(n); err != nil {
 			return err
 		}
