@@ -209,6 +209,20 @@ func (s *Store) purgeVanished() {
 // their flusher bookkeeping so a dirty-at-removal lineage cannot poison
 // the store. Unflushed appends on the removed trunks are flushed first
 // (best effort; they are deleted either way).
+// Detach makes a node self-sufficient, absorbing the history prefix it
+// reads through an ancestor. Call it for every boundary survivor before
+// removing the set they inherit from.
+func (s *Store) Detach(node string) error {
+	s.flushDirty()
+	return s.Trunks.Detach(node)
+}
+
+// HeadNode is the node key carrying a trunk's live head, for callers that
+// must address the directory rather than the trunk.
+func (s *Store) HeadNode(trunk string) (string, bool) {
+	return s.Trunks.idx.Head(trunk)
+}
+
 func (s *Store) Remove(trunk string, recursive bool) error {
 	s.flushDirty()
 	removed, err := s.Trunks.remove(trunk, recursive)
