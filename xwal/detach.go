@@ -79,11 +79,14 @@ func (t *Trunks) Detach(node string) error {
 			return err
 		}
 	}
-	kind := "conversation"
-	if n := t.node(node); n != nil && n.Kind != "" {
-		kind = n.Kind
+	kind, trunk := "conversation", ""
+	if n := t.node(node); n != nil {
+		if n.Kind != "" {
+			kind = n.Kind
+		}
+		trunk = n.Trunk
 	}
-	if err := writeFlatMarker(t.irDir(node), "", kind); err != nil {
+	if err := writeNodeMarker(t.irDir(node), nodeMarker{kind: kind, trunk: trunk}); err != nil {
 		return err
 	}
 	return t.rebuild()

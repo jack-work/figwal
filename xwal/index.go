@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/jack-work/figwal/disk"
 )
 
 // Index is the node/trunk index: the forest shape, and where each trunk's
@@ -212,15 +214,24 @@ func (x *Index) RebuildFrom(mainDir string) error {
 // directory says nothing. A fork does not freeze its parent, so a node
 // with a trunk id is that trunk's live head, forks or no forks.
 func (x *Index) addLocked(dir, key string, isRoot bool) error {
-	from, kind, flat := readFlatMarker(dir)
-	if !flat && !isRoot {
-		return nil // an unfinished fork: .from is the commit point
+	n, ok, legacy := readNodeMarker(dir)
+	if !ok && !isRoot {
+		return nil // an unfinished fork: the marker is the commit point
 	}
 	if isRoot {
-		kind = "null"
+		n.kind = "null"
 	}
-	trunkID, _ := readTrunkID(dir)
-	x.nodes[key] = &NodeInfo{Trunk: trunkID, IsRoot: isRoot, From: from, Kind: kind}
+	// Upgrade a store written before the markers merged, on the read path
+	// and once per node. Both forms are ground truth and .node is exactly
+	// their union, so a failure here costs nothing but the next rebuild.
+	// (internal/store/meta_heal.go does the same for figaro's sidecar.)
+	if legacy && !isRoot {
+		if err := writeNodeMarker(dir, n); err != nil {
+			return err
+		}
+	}
+	trunkID := n.trunk
+	x.nodes[key] = &NodeInfo{Trunk: trunkID, IsRoot: isRoot, From: n.from, Kind: n.kind}
 	x.bumpSeqsLocked(key, trunkID)
 	if trunkID == "" {
 		return nil
@@ -250,24 +261,78 @@ func (x *Index) bumpSeqsLocked(key, trunkID string) {
 	}
 }
 
-// .from is "<parent>\n<kind>\n". Its absence marks the null root.
-// At is not stored: it is the channel's own .fork base minus one.
-const flatMarkerName = ".from"
+// A node's identity lives in ONE file, .node:
+//
+//	from=n0
+//	kind=conversation
+//	trunk=t1
+//
+// Its absence marks the null root, or a fork that did not finish. One file
+// rather than the .from/.trunk pair it replaces, for two reasons.
+//
+// ATOMICITY. The pair was written in sequence, so a crash between them left
+// a node with lineage and no trunk id: real debris, invisible as a head. A
+// single atomic replacement either exists whole or not at all.
+//
+// SYSCALLS. Rebuilding the index reads every node's markers, and the cost is
+// per-FILE, not per-byte: ~15us here, ~900us on the NTFS+Defender box this
+// was reported from. Halving the file count halves the cold-start walk on
+// the platform that actually hurts.
+const nodeMarkerName = ".node"
 
-func writeFlatMarker(dir, parent, kind string) error {
-	return writeSyncedFile(filepath.Join(dir, flatMarkerName), fmt.Appendf(nil, "%s\n%s\n", parent, kind))
+// Legacy names, still READ so an existing store opens, never written.
+const (
+	legacyFromName  = ".from"
+	legacyTrunkName = ".trunk"
+)
+
+type nodeMarker struct {
+	from  string
+	kind  string
+	trunk string
 }
 
-func readFlatMarker(dir string) (string, string, bool) {
-	b, err := os.ReadFile(filepath.Join(dir, flatMarkerName))
+func writeNodeMarker(dir string, n nodeMarker) error {
+	body := fmt.Appendf(nil, "from=%s\nkind=%s\ntrunk=%s\n", n.from, n.kind, n.trunk)
+	if err := writeSyncedFile(filepath.Join(dir, nodeMarkerName), body); err != nil {
+		return err
+	}
+	return disk.SyncDir(dir)
+}
+
+// readNodeMarker returns the node's identity, whether it was found, and
+// whether it came from the legacy pair (so the caller can upgrade it).
+func readNodeMarker(dir string) (n nodeMarker, ok bool, legacy bool) {
+	if b, err := os.ReadFile(filepath.Join(dir, nodeMarkerName)); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			k, v, found := strings.Cut(strings.TrimSpace(line), "=")
+			if !found {
+				continue
+			}
+			switch k {
+			case "from":
+				n.from = v
+			case "kind":
+				n.kind = v
+			case "trunk":
+				n.trunk = v
+			}
+		}
+		return n, true, false
+	}
+	b, err := os.ReadFile(filepath.Join(dir, legacyFromName))
 	if err != nil {
-		return "", "", false
+		return nodeMarker{}, false, false
 	}
 	// Split before trimming: an empty parent leaves a leading newline that
 	// TrimSpace would eat, collapsing two fields into one.
 	parts := strings.SplitN(string(b), "\n", 2)
 	if len(parts) != 2 {
-		return "", "", false
+		return nodeMarker{}, false, false
 	}
-	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), true
+	n.from, n.kind = strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	if tb, terr := os.ReadFile(filepath.Join(dir, legacyTrunkName)); terr == nil {
+		n.trunk = strings.TrimSpace(string(tb))
+	}
+	return n, true, true
 }

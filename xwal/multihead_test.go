@@ -61,8 +61,16 @@ func TestOpenRejectsMultipleHeads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Forge a second node claiming the first node's trunk id. This is the
+	// shape a lost mint counter produced (bumpSeqs recovering only one of
+	// the two), and open must refuse it rather than serve two live heads.
 	secondBranch := f.head(second)
-	if err := writeTrunkID(f.irDir(secondBranch), first); err != nil {
+	n, ok, _ := readNodeMarker(f.irDir(secondBranch))
+	if !ok {
+		t.Fatalf("no node marker for %s", secondBranch)
+	}
+	n.trunk = string(first)
+	if err := writeNodeMarker(f.irDir(secondBranch), n); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Close(); err != nil {

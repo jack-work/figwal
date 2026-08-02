@@ -13,7 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jack-work/figwal/disk"
 	"github.com/jack-work/figwal/log"
 )
 
@@ -120,8 +119,6 @@ type (
 	NodeID  = string
 	TrunkID = string
 )
-
-const trunkMarker = ".trunk"
 
 // genesisMarker is the root node's first main entry, so the trunk is
 // immediately forkable and its prefix is never empty.
@@ -1165,13 +1162,11 @@ func (t *Trunks) forkFlat(parentKey, kind string, mintTrunk bool) (string, error
 			return "", err
 		}
 	}
-	if err := writeFlatMarker(t.irDir(child), parentKey, kind); err != nil {
+	// One marker, written last: it IS the commit point, and writing lineage
+	// and trunk id as a pair left a node with one and not the other when a
+	// crash landed between them.
+	if err := writeNodeMarker(t.irDir(child), nodeMarker{from: parentKey, kind: kind, trunk: trunk}); err != nil {
 		return "", err
-	}
-	if mintTrunk {
-		if err := writeTrunkID(t.irDir(child), trunk); err != nil {
-			return "", err
-		}
 	}
 	t.idx.SpawnFlat(parentKey, child, trunk, kind)
 	if !mintTrunk {
@@ -1195,7 +1190,7 @@ func (t *Trunks) forkFlatNamed(parentKey, name, kind string) error {
 			return err
 		}
 	}
-	if err := writeFlatMarker(t.irDir(name), parentKey, kind); err != nil {
+	if err := writeNodeMarker(t.irDir(name), nodeMarker{from: parentKey, kind: kind}); err != nil {
 		return err
 	}
 	t.idx.SpawnFlat(parentKey, name, "", kind)
@@ -1307,10 +1302,7 @@ func (t *Trunks) forkFlatAt(parentKey string, atMainLT uint64) (string, error) {
 			return "", err
 		}
 	}
-	if err := writeFlatMarker(t.irDir(child), parentKey, "conversation"); err != nil {
-		return "", err
-	}
-	if err := writeTrunkID(t.irDir(child), trunk); err != nil {
+	if err := writeNodeMarker(t.irDir(child), nodeMarker{from: parentKey, kind: "conversation", trunk: trunk}); err != nil {
 		return "", err
 	}
 	t.idx.SpawnFlat(parentKey, child, trunk, "conversation")
@@ -1801,21 +1793,6 @@ func (t *Trunks) irDir(key string) string {
 		return filepath.Join(t.root, t.main)
 	}
 	return filepath.Join(t.root, t.main, key)
-}
-
-func writeTrunkID(nodeDir, trunkID string) error {
-	if err := writeSyncedFile(filepath.Join(nodeDir, trunkMarker), []byte(trunkID+"\n")); err != nil {
-		return err
-	}
-	return disk.SyncDir(nodeDir)
-}
-
-func readTrunkID(nodeDir string) (string, bool) {
-	b, err := os.ReadFile(filepath.Join(nodeDir, trunkMarker))
-	if err != nil {
-		return "", false
-	}
-	return strings.TrimSpace(string(b)), true
 }
 
 // numSuffix parses the numeric suffix of e.g. "n12" / "t3" given the

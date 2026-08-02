@@ -409,3 +409,92 @@ func TestTailForkDropsRelatedRecordsAheadOfMain(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A store written before the markers merged must open unchanged, and be
+// upgraded in place. Both forms are ground truth and .node is exactly their
+// union, so this can happen on the read path.
+func TestLegacyMarkersUpgradeOnOpen(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "f")
+	f, trunk := seedTrunk(t, dir)
+	for range 3 {
+		if _, _, err := f.Append(trunk, 0, []byte(`"turn"`), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alt, err := f.ForkTail(trunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := map[string]NodeInfo{}
+	for k, n := range f.Nodes() {
+		before[k] = n
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rewind every node to the old pair.
+	ents, err := os.ReadDir(filepath.Join(dir, "ir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewound := 0
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		nd := filepath.Join(dir, "ir", e.Name())
+		n, ok, _ := readNodeMarker(nd)
+		if !ok {
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(nd, ".from"),
+			[]byte(n.from+"\n"+n.kind+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if n.trunk != "" {
+			if err := os.WriteFile(filepath.Join(nd, ".trunk"), []byte(n.trunk+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Remove(filepath.Join(nd, ".node")); err != nil {
+			t.Fatal(err)
+		}
+		rewound++
+	}
+	if rewound == 0 {
+		t.Fatal("rewound no nodes; the test proves nothing")
+	}
+
+	g, err := openTrunks(dir, trunksCfg())
+	if err != nil {
+		t.Fatalf("legacy store failed to open: %v", err)
+	}
+	cleanupTrunks(t, g)
+	after := g.Nodes()
+	if len(after) != len(before) {
+		t.Fatalf("legacy open sees %d nodes, want %d", len(after), len(before))
+	}
+	for k, want := range before {
+		got, ok := after[k]
+		if !ok {
+			t.Fatalf("node %q lost", k)
+		}
+		if got.From != want.From || got.Kind != want.Kind || got.Trunk != want.Trunk {
+			t.Fatalf("node %q: got %+v, want %+v", k, got, want)
+		}
+	}
+	if _, ok := g.idx.Head(alt); !ok {
+		t.Errorf("forked trunk %s lost its head across the upgrade", alt)
+	}
+	// And it is upgraded, so the next open pays one read per node, not two.
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		nd := filepath.Join(dir, "ir", e.Name())
+		if _, err := os.Stat(filepath.Join(nd, ".node")); err != nil {
+			t.Errorf("node %q not upgraded: %v", e.Name(), err)
+		}
+	}
+}
