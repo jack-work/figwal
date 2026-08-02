@@ -42,20 +42,20 @@ func (t *Trunks) Detach(node string) error {
 	if err != nil {
 		return err
 	}
-	var channels []string
+	var dirs []string
 	for _, c := range x.Channels() {
 		ch := x.chans[c.Name]
-		channels = append(channels, c.Name)
-		base := ch.log.ForkBase()
 		dir := filepath.Join(t.root, c.Name, node)
-		if base <= 1 {
-			continue // already its own root in this channel
-		}
 		if _, serr := os.Stat(dir); os.IsNotExist(serr) {
 			continue // a channel added after this node existed
 		} else if serr != nil {
 			x.Close()
 			return serr
+		}
+		dirs = append(dirs, dir)
+		base := ch.log.ForkBase()
+		if base <= 1 {
+			continue // already its own root in this channel
 		}
 		var initial []byte
 		if ch.kind == ChannelReducible {
@@ -74,13 +74,7 @@ func (t *Trunks) Detach(node string) error {
 	// flipped channel reads its own absorbed copy, an unflipped one still
 	// delegates, and the two are byte-identical. Clearing .from first would
 	// strand every channel not yet flipped, which is a hole.
-	for _, name := range channels {
-		dir := filepath.Join(t.root, name, node)
-		if _, err := os.Stat(dir); os.IsNotExist(err) {
-			continue
-		} else if err != nil {
-			return err
-		}
+	for _, dir := range dirs {
 		if err := writeSyncedFile(filepath.Join(dir, ".fork"), []byte("base=1\n")); err != nil {
 			return err
 		}
@@ -107,9 +101,20 @@ func absorbPrefix(dir string, src *log.Log, base uint64, initial []byte, codec s
 	if base <= 1 {
 		return nil
 	}
-	path := filepath.Join(dir, segFileName(1, codec))
+	// Build under a unique temp name and rename into place. segment.Create
+	// is O_EXCL, so a crash that left a partial file at the final name would
+	// make EVERY retry fail with EEXIST -- and crash recovery here IS
+	// re-running Detach, so that would leave the store unrecoverable.
+	tmp, err := os.CreateTemp(dir, ".absorb-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	tmp.Close()
+	os.Remove(tmpName)
+	defer os.Remove(tmpName)
 	// maxSize 0: unbounded, so the whole prefix lands in this one segment.
-	seg, err := segment.Create(path, codec, 1, 0)
+	seg, err := segment.Create(tmpName, codec, 1, 0)
 	if err != nil {
 		return err
 	}
@@ -135,6 +140,9 @@ func absorbPrefix(dir string, src *log.Log, base uint64, initial []byte, codec s
 		return err
 	}
 	if err := seg.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, filepath.Join(dir, segFileName(1, codec))); err != nil {
 		return err
 	}
 	return disk.SyncDir(dir)

@@ -25,7 +25,7 @@ var (
 	ErrCodecMismatch   = errors.New("log directory contains segments with a different codec")
 	ErrPayloadTooLarge = errors.New("payload too large for segment size")
 	ErrReadOnly        = errors.New("log is read-only (branch point with child forks)")
-	ErrForkMismatch    = errors.New(".fork base does not match first segment baseIndex")
+	ErrForkMismatch    = errors.New(".fork base starts before the first segment")
 	errRangeBoundary   = errors.New("range reached fork boundary")
 )
 

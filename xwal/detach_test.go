@@ -2,6 +2,7 @@ package xwal
 
 import (
 	"fmt"
+	"github.com/jack-work/figwal/segment"
 	"os"
 	"path/filepath"
 	"strings"
@@ -314,5 +315,37 @@ func TestDetachAbsorbsAPrefixLargerThanASegment(t *testing.T) {
 	}
 	if got := mainLTs(t, g, child); len(got) != len(lts) {
 		t.Fatalf("with the ancestor gone: %d records, want %d", len(got), len(lts))
+	}
+}
+
+// A crash mid-absorb leaves a partial prefix segment at its final name.
+// Detach must still complete on the retry: crash recovery here IS re-running
+// it, so anything that makes a second run fail makes the store unrecoverable.
+func TestDetachRecoversFromAPartialAbsorb(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "f")
+	f, parent := seedMapTrunk(t, dir)
+	for range 4 {
+		if _, _, err := f.Append(parent, 0, []byte(`"p"`), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	child, err := f.ForkTail(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := f.head(string(child))
+	want := mainLTs(t, f, child)
+
+	// Simulate the crash: a half-written segment already sits at the name
+	// the absorb will use.
+	partial := filepath.Join(dir, "ir", key, segFileName(1, segment.JSONLCodec{}))
+	if err := os.WriteFile(partial, []byte("{\"truncated\":\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Detach(key); err != nil {
+		t.Fatalf("detach after a partial absorb: %v", err)
+	}
+	if got := mainLTs(t, f, child); len(got) != len(want) {
+		t.Fatalf("after recovery child reads %v, want %v", got, want)
 	}
 }

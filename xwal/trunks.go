@@ -1152,7 +1152,7 @@ func (t *Trunks) forkFlat(parentKey, kind string, mintTrunk bool) (string, error
 	if mintTrunk {
 		trunk = t.mintTrunk()
 	}
-	bases, err := t.channelTails(parentKey)
+	bases, err := t.channelBases(parentKey, 0)
 	if err != nil {
 		return "", err
 	}
@@ -1182,7 +1182,7 @@ func (t *Trunks) forkFlat(parentKey, kind string, mintTrunk bool) (string, error
 
 // forkFlatNamed is forkFlat with a caller-chosen node name (stumps).
 func (t *Trunks) forkFlatNamed(parentKey, name, kind string) error {
-	bases, err := t.channelTails(parentKey)
+	bases, err := t.channelBases(parentKey, 0)
 	if err != nil {
 		return err
 	}
@@ -1202,27 +1202,32 @@ func (t *Trunks) forkFlatNamed(parentKey, name, kind string) error {
 	return nil
 }
 
-// channelTails is each channel's next index at node, i.e. its fork base.
-func (t *Trunks) channelTails(node string) (map[string]uint64, error) {
+// channelBases is the fork base for every channel of node, sharing main
+// [1..at]. ONE rule for tail and interior forks alike: main starts at at+1,
+// and a related channel inherits only what is keyed at or below at, never
+// past what the parent itself exposes, never below where its segments start.
+//
+// at == 0 means "the parent's tail", i.e. a tail fork.
+func (t *Trunks) channelBases(node string, at uint64) (map[string]uint64, error) {
 	x, err := t.openHotTopology(node)
 	if err != nil {
 		return nil, err
 	}
-	// The fork point is the parent's main tail; a related channel inherits
-	// only what is keyed at or below it. Taking c.Last+1 for every channel
-	// looked right and was not: a related record may be keyed AHEAD of main
-	// (a note written for a turn whose main record is not durable yet), and
-	// inheriting it hands the child a record referencing a turn it does not
-	// have. Same rule as an interior fork, with at = the tail.
-	at := mainTail(x)
+	if at == 0 {
+		at = mainTail(x)
+	}
 	out := map[string]uint64{}
 	for _, c := range x.Channels() {
 		var base uint64
 		if c.Name == t.main {
-			base = c.Last + 1
+			base = at + 1
 		} else {
 			lt, ok, lerr := x.chans[c.Name].lookupAtOrBelow(at)
-			if !ok || lerr != nil {
+			if lerr != nil {
+				x.Close()
+				return nil, lerr // a failed lookup is not "found nothing"
+			}
+			if !ok {
 				lt = 0
 			}
 			base = lt + 1
@@ -1287,37 +1292,10 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 func (t *Trunks) forkFlatAt(parentKey string, atMainLT uint64) (string, error) {
 	child := t.mintNode()
 	trunk := t.mintTrunk()
-	x, err := t.openHotTopology(parentKey)
+	bases, err := t.channelBases(parentKey, atMainLT)
 	if err != nil {
 		return "", err
 	}
-	bases := map[string]uint64{}
-	for _, c := range x.Channels() {
-		if c.Name == t.main {
-			bases[c.Name] = atMainLT + 1
-			continue
-		}
-		lt, ok, lerr := x.chans[c.Name].lookupAtOrBelow(atMainLT)
-		if lerr != nil {
-			x.Close()
-			return "", lerr
-		}
-		if !ok {
-			lt = 0
-		}
-		base := lt + 1
-		// A child can never reach past what its parent itself exposes. lookup
-		// walks the lineage; the parent's own fork base may sever it, and a
-		// base above the parent's tail leaves the child numbering over a hole.
-		if base > c.Last+1 {
-			base = c.Last + 1
-		}
-		if base < c.First {
-			base = c.First
-		}
-		bases[c.Name] = base
-	}
-	x.Close()
 	for name, base := range bases {
 		dir := filepath.Join(t.root, name, child)
 		if err := os.MkdirAll(dir, 0o755); err != nil {

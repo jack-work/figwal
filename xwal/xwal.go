@@ -1329,11 +1329,15 @@ func recoverAtomicReplacement(final string) error {
 // .from on disk is written through here, so that would turn one badly timed
 // crash into an unreadable node.
 func writeSyncedFile(path string, body []byte) error {
-	tmp := path + ".tmp"
-	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	// A UNIQUE temp: a fixed path+".tmp" lets two writers of the same marker
+	// clobber each other's scratch, and leaves a stale one beside the marker
+	// forever after a crash.
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
+	file := f
 	if _, err := file.Write(body); err != nil {
 		file.Close()
 		os.Remove(tmp)
