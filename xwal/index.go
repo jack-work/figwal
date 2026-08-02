@@ -223,23 +223,29 @@ func (x *Index) addLocked(dir, key string, isRoot bool) error {
 	}
 	// Upgrade a store written before the markers merged, on the read path
 	// and once per node. Both forms are ground truth and .node is exactly
-	// their union, so a failure here costs nothing but the next rebuild.
+	// their union, so this is an optimisation and IGNORES its error: a
+	// read-only volume or a full disk must still open the store, and
+	// returning here would abort RebuildFrom and with it the open.
 	// (internal/store/meta_heal.go does the same for figaro's sidecar.)
 	if legacy && !isRoot {
-		if err := writeNodeMarker(dir, n); err != nil {
-			return err
+		if err := writeNodeMarker(dir, n); err == nil {
+			// Only once it is durable: retire the pair, so a node carries
+			// ONE identity file and no later reader has two to disagree
+			// about. Best effort, same reasoning.
+			_ = os.Remove(filepath.Join(dir, legacyFromName))
+			_ = os.Remove(filepath.Join(dir, legacyTrunkName))
+			_ = disk.SyncDir(dir)
 		}
 	}
-	trunkID := n.trunk
-	x.nodes[key] = &NodeInfo{Trunk: trunkID, IsRoot: isRoot, From: n.from, Kind: n.kind}
-	x.bumpSeqsLocked(key, trunkID)
-	if trunkID == "" {
+	x.nodes[key] = &NodeInfo{Trunk: n.trunk, IsRoot: isRoot, From: n.from, Kind: n.kind}
+	x.bumpSeqsLocked(key, n.trunk)
+	if n.trunk == "" {
 		return nil
 	}
-	if previous, exists := x.heads[trunkID]; exists {
-		return fmt.Errorf("xwal: trunk %q has multiple live heads %q and %q", trunkID, previous, key)
+	if previous, exists := x.heads[n.trunk]; exists {
+		return fmt.Errorf("xwal: trunk %q has multiple live heads %q and %q", n.trunk, previous, key)
 	}
-	x.heads[trunkID] = key
+	x.heads[n.trunk] = key
 	return nil
 }
 
@@ -293,11 +299,10 @@ type nodeMarker struct {
 }
 
 func writeNodeMarker(dir string, n nodeMarker) error {
+	// writeSyncedFile already fsyncs the directory after its rename; a
+	// second SyncDir here made every fork commit pay two.
 	body := fmt.Appendf(nil, "from=%s\nkind=%s\ntrunk=%s\n", n.from, n.kind, n.trunk)
-	if err := writeSyncedFile(filepath.Join(dir, nodeMarkerName), body); err != nil {
-		return err
-	}
-	return disk.SyncDir(dir)
+	return writeSyncedFile(filepath.Join(dir, nodeMarkerName), body)
 }
 
 // readNodeMarker returns the node's identity, whether it was found, and

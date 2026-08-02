@@ -233,6 +233,19 @@ type manifestChannel struct {
 	Unkeyed bool   `json:"unkeyed,omitempty"`
 }
 
+// manifest is the on-disk form of a spec. ONE place, so the next field
+// lands once instead of in the three call sites that built this by hand
+// (which is how Unkeyed came to be written out three times).
+func (c ChannelSpec) manifest() manifestChannel {
+	return manifestChannel{
+		Name:    c.Name,
+		Kind:    c.Kind.String(),
+		Reducer: c.Reducer,
+		Opaque:  c.Opaque,
+		Unkeyed: c.Unkeyed,
+	}
+}
+
 type channelPendingPlan struct {
 	Channel manifestChannel `json:"channel"`
 }
@@ -432,9 +445,7 @@ func loadOrCreateManifest(dir string, cfg Config) (manifest, error) {
 		if c.Kind == ChannelReducible && c.Reducer == "" {
 			return manifest{}, fmt.Errorf("xwal: reducible channel %q needs a reducer name", c.Name)
 		}
-		m.Channels = append(m.Channels, manifestChannel{
-			Name: c.Name, Kind: c.Kind.String(), Reducer: c.Reducer, Opaque: c.Opaque, Unkeyed: c.Unkeyed,
-		})
+		m.Channels = append(m.Channels, c.manifest())
 	}
 	if !seenMain {
 		return manifest{}, fmt.Errorf("xwal: main channel %q not in Channels", cfg.Main)
@@ -822,9 +833,7 @@ func (x *XWAL) addChannel(spec ChannelSpec) error {
 		ch.reduce = r.Reduce
 		ch.initial = r.Initial
 	}
-	pending := channelPendingPlan{Channel: manifestChannel{
-		Name: spec.Name, Kind: spec.Kind.String(), Reducer: spec.Reducer, Opaque: spec.Opaque, Unkeyed: spec.Unkeyed,
-	}}
+	pending := channelPendingPlan{Channel: spec.manifest()}
 	if err := writeChannelPending(x.root, pending); err != nil {
 		return err
 	}

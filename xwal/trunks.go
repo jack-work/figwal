@@ -1002,9 +1002,7 @@ func (t *Trunks) ensureChannel(spec ChannelSpec) error {
 
 	cfg := withChannelSpec(t.cfg, spec)
 	t.retireRootHotPreservingValidation()
-	pending := channelPendingPlan{Channel: manifestChannel{
-		Name: spec.Name, Kind: spec.Kind.String(), Reducer: spec.Reducer, Opaque: spec.Opaque, Unkeyed: spec.Unkeyed,
-	}}
+	pending := channelPendingPlan{Channel: spec.manifest()}
 	if err := writeChannelPending(t.root, pending); err != nil {
 		return err
 	}
