@@ -61,6 +61,11 @@ type ChannelSpec struct {
 	Kind    Kind
 	Reducer string // registry key; required iff Kind == ChannelReducible
 	Opaque  bool   // persist payload bytes without JSON canonicalization
+	// Unkeyed: records carry no main LT, so they can be appended with no
+	// reference to the timeline and no lock against it. A fork learns what
+	// such a channel inherits from the cursor stamped on the main record at
+	// the fork point.
+	Unkeyed bool
 }
 
 // Config opens or creates an xwal. On first open the manifest is written
@@ -128,6 +133,9 @@ type channel struct {
 	reduce  ReduceFunc
 	initial []byte
 	opaque  bool
+	// unkeyed: records carry no main LT. Appended with no reference to the
+	// timeline; a fork learns what to inherit from main's cursor stamp.
+	unkeyed bool
 	fk      map[uint64]uint64 // main-LT -> channel-LT (last wins)
 	fkBuilt bool              // all entries indexed?
 	fkNext  uint64            // highest channel-LT not yet indexed
@@ -222,6 +230,7 @@ type manifestChannel struct {
 	Kind    string `json:"kind"`
 	Reducer string `json:"reducer,omitempty"`
 	Opaque  bool   `json:"opaque,omitempty"`
+	Unkeyed bool   `json:"unkeyed,omitempty"`
 }
 
 type channelPendingPlan struct {
@@ -263,7 +272,7 @@ func open(dir string, cfg Config, store *log.Store, branch ...string) (*XWAL, er
 		shared: store != nil,
 	}
 	for _, mc := range man.Channels {
-		ch := &channel{name: mc.Name, rname: mc.Reducer, opaque: mc.Opaque}
+		ch := &channel{name: mc.Name, rname: mc.Reducer, opaque: mc.Opaque, unkeyed: mc.Unkeyed}
 		switch mc.Kind {
 		case "reducible":
 			ch.kind = ChannelReducible
@@ -424,7 +433,7 @@ func loadOrCreateManifest(dir string, cfg Config) (manifest, error) {
 			return manifest{}, fmt.Errorf("xwal: reducible channel %q needs a reducer name", c.Name)
 		}
 		m.Channels = append(m.Channels, manifestChannel{
-			Name: c.Name, Kind: c.Kind.String(), Reducer: c.Reducer, Opaque: c.Opaque,
+			Name: c.Name, Kind: c.Kind.String(), Reducer: c.Reducer, Opaque: c.Opaque, Unkeyed: c.Unkeyed,
 		})
 	}
 	if !seenMain {
@@ -814,7 +823,7 @@ func (x *XWAL) addChannel(spec ChannelSpec) error {
 		ch.initial = r.Initial
 	}
 	pending := channelPendingPlan{Channel: manifestChannel{
-		Name: spec.Name, Kind: spec.Kind.String(), Reducer: spec.Reducer, Opaque: spec.Opaque,
+		Name: spec.Name, Kind: spec.Kind.String(), Reducer: spec.Reducer, Opaque: spec.Opaque, Unkeyed: spec.Unkeyed,
 	}}
 	if err := writeChannelPending(x.root, pending); err != nil {
 		return err
@@ -1359,6 +1368,24 @@ func writeSyncedFile(path string, body []byte) error {
 	return disk.SyncDir(filepath.Dir(path))
 }
 
+// unkeyedCursors is where every unkeyed channel stands right now, for
+// stamping onto a main record. Nil when there are none, so a store without
+// unkeyed channels writes byte-identical frames to before.
+func (x *XWAL) unkeyedCursors() map[string]uint64 {
+	var out map[string]uint64
+	for _, name := range x.order {
+		ch := x.chans[name]
+		if ch == nil || !ch.unkeyed {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]uint64, 2)
+		}
+		out[name] = ch.log.LastIndex()
+	}
+	return out
+}
+
 // AppendMain appends payload (with optional opaque meta) to the main
 // channel. The returned mainLT is the channel index it landed at;
 // related-channel entries reference it.
@@ -1367,7 +1394,7 @@ func (x *XWAL) AppendMain(payload, meta []byte) (uint64, error) {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 	next := ch.log.LastIndex() + 1
-	if err := ch.log.Write(next, encodeChannelFrame(next, payload, meta, ch.opaque)); err != nil {
+	if err := ch.log.Write(next, encodeStampedFrame(next, payload, meta, ch.opaque, x.unkeyedCursors())); err != nil {
 		return 0, err
 	}
 	if ch.fkScan || ch.fkBuilt {
@@ -1390,6 +1417,18 @@ func (x *XWAL) Append(channelName string, mainLT uint64, payload, meta []byte) (
 	}
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
+	// An UNKEYED channel never reads main. No tail to compare against, no
+	// key to stamp, nothing to serialize with the timeline -- which is the
+	// entire point: a caller can append here while a turn is in flight, and
+	// the record is durable on its own terms. Its fork boundary comes from
+	// the cursor main stamps, not from a key stored here.
+	if ch.unkeyed {
+		next := ch.log.LastIndex() + 1
+		if err := ch.log.Write(next, encodeChannelFrame(0, payload, meta, ch.opaque)); err != nil {
+			return 0, err
+		}
+		return next, nil
+	}
 	if lastMain, ok, err := x.tailMain(ch); err != nil {
 		return 0, err
 	} else if ok && mainLT < lastMain {
@@ -1795,6 +1834,20 @@ type frameObj struct {
 	P   json.RawMessage `json:"p,omitempty"`
 	P64 *string         `json:"p64,omitempty"`
 	X   json.RawMessage `json:"x,omitempty"`
+	// C is the cursor stamp, present only on MAIN records: the tail of every
+	// UNKEYED channel at the moment this record was written.
+	//
+	// An unkeyed channel carries no main LT, so it can be appended with no
+	// reference to the timeline and no lock against it -- which is the whole
+	// point. But a fork still has to decide what such a channel inherits,
+	// and "records keyed at or below the fork point" is not available. The
+	// cursor answers it from the other side: the main record AT the fork
+	// point already says where that channel stood.
+	//
+	// Written by main's writer, which is single-writer-per-lineage already,
+	// so stamping costs a read of an in-memory tail and no coordination on
+	// the unkeyed channel's own append path.
+	C map[string]uint64 `json:"c,omitempty"`
 }
 
 // Record is a decoded channel entry.
@@ -1821,7 +1874,11 @@ func encodeFrame(mainLT uint64, payload, meta []byte) []byte {
 }
 
 func encodeChannelFrame(mainLT uint64, payload, meta []byte, opaque bool) []byte {
-	o := frameObj{M: mainLT}
+	return encodeStampedFrame(mainLT, payload, meta, opaque, nil)
+}
+
+func encodeStampedFrame(mainLT uint64, payload, meta []byte, opaque bool, cursors map[string]uint64) []byte {
+	o := frameObj{M: mainLT, C: cursors}
 	if opaque {
 		encoded := base64.StdEncoding.EncodeToString(payload)
 		o.P64 = &encoded
@@ -2053,4 +2110,37 @@ func (x *XWAL) openFlatParent(chName, node string, opts disk.Options, store *log
 		x.flatParents = append(x.flatParents, l)
 	}
 	return l, nil
+}
+
+// cursorAt is where an unkeyed channel stood when main record at was
+// written, from that record's cursor stamp.
+//
+// LAZY MIGRATION: a record written before stamping existed carries no
+// cursor. The channel's OLD main-LT key is still on disk, so the answer is
+// derivable — the highest index in that channel keyed at or below at. No
+// rewrite, no migration gate; the derivation simply retires as old records
+// scroll out of the prefix.
+func (x *XWAL) cursorAt(at uint64, channel string) (uint64, error) {
+	if at == 0 {
+		return 0, nil
+	}
+	frame, err := x.chans[x.main].log.Read(at)
+	if err != nil {
+		return 0, fmt.Errorf("xwal: cursor for %q at main %d: %w", channel, at, err)
+	}
+	var o frameObj
+	if err := json.Unmarshal(frame, &o); err != nil {
+		return 0, fmt.Errorf("xwal: decode main %d: %w", at, err)
+	}
+	if v, ok := o.C[channel]; ok {
+		return v, nil
+	}
+	lt, ok, lerr := x.chans[channel].lookupAtOrBelow(at)
+	if lerr != nil {
+		return 0, lerr
+	}
+	if !ok {
+		return 0, nil
+	}
+	return lt, nil
 }

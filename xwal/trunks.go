@@ -1003,7 +1003,7 @@ func (t *Trunks) ensureChannel(spec ChannelSpec) error {
 	cfg := withChannelSpec(t.cfg, spec)
 	t.retireRootHotPreservingValidation()
 	pending := channelPendingPlan{Channel: manifestChannel{
-		Name: spec.Name, Kind: spec.Kind.String(), Reducer: spec.Reducer, Opaque: spec.Opaque,
+		Name: spec.Name, Kind: spec.Kind.String(), Reducer: spec.Reducer, Opaque: spec.Opaque, Unkeyed: spec.Unkeyed,
 	}}
 	if err := writeChannelPending(t.root, pending); err != nil {
 		return err
@@ -1216,9 +1216,21 @@ func (t *Trunks) channelBases(node string, at uint64) (map[string]uint64, error)
 	out := map[string]uint64{}
 	for _, c := range x.Channels() {
 		var base uint64
-		if c.Name == t.main {
+		switch {
+		case c.Name == t.main:
 			base = at + 1
-		} else {
+		case x.chans[c.Name].unkeyed:
+			// An unkeyed channel carries no main LT, so "records keyed at or
+			// below the fork point" is not a question that can be asked. The
+			// main record AT the fork point already recorded where this
+			// channel stood; that stamp IS the boundary.
+			cur, cerr := x.cursorAt(at, c.Name)
+			if cerr != nil {
+				x.Close()
+				return nil, cerr
+			}
+			base = cur + 1
+		default:
 			lt, ok, lerr := x.chans[c.Name].lookupAtOrBelow(at)
 			if lerr != nil {
 				x.Close()
