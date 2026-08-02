@@ -101,17 +101,19 @@ func absorbPrefix(dir string, src *log.Log, base uint64, initial []byte, codec s
 	if base <= 1 {
 		return nil
 	}
-	// Build under a unique temp name and rename into place. segment.Create
-	// is O_EXCL, so a crash that left a partial file at the final name would
-	// make EVERY retry fail with EEXIST -- and crash recovery here IS
-	// re-running Detach, so that would leave the store unrecoverable.
-	tmp, err := os.CreateTemp(dir, ".absorb-*")
-	if err != nil {
+	// Build under a scratch name and rename into place. segment.Create is
+	// O_EXCL, so a crash that left a partial file at the FINAL name would
+	// make every retry fail with EEXIST -- and crash recovery here IS
+	// re-running Detach, so that would leave the store unrecoverable by the
+	// one mechanism meant to recover it.
+	//
+	// The name is pid-scoped, so no live writer can collide, and it is
+	// removed first: a crash leaves OUR scratch behind, and O_EXCL would
+	// then reject the retry for exactly the reason we are avoiding.
+	tmpName := filepath.Join(dir, fmt.Sprintf(".absorb-%d", os.Getpid()))
+	if err := os.Remove(tmpName); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	tmpName := tmp.Name()
-	tmp.Close()
-	os.Remove(tmpName)
 	defer os.Remove(tmpName)
 	// maxSize 0: unbounded, so the whole prefix lands in this one segment.
 	seg, err := segment.Create(tmpName, codec, 1, 0)

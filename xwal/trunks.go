@@ -1207,7 +1207,9 @@ func (t *Trunks) forkFlatNamed(parentKey, name, kind string) error {
 // and a related channel inherits only what is keyed at or below at, never
 // past what the parent itself exposes, never below where its segments start.
 //
-// at == 0 means "the parent's tail", i.e. a tail fork.
+// at == 0 means "the parent's tail", i.e. a tail fork. That sentinel is
+// safe only because LTs are 1-based, so 0 is not a position anyone can
+// fork at; if that ever changes, this needs a second parameter.
 func (t *Trunks) channelBases(node string, at uint64) (map[string]uint64, error) {
 	x, err := t.openHotTopology(node)
 	if err != nil {

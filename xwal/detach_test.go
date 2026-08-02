@@ -2,11 +2,12 @@ package xwal
 
 import (
 	"fmt"
-	"github.com/jack-work/figwal/segment"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jack-work/figwal/segment"
 )
 
 // mainLTs reads every main index visible from a trunk's head.
@@ -336,10 +337,16 @@ func TestDetachRecoversFromAPartialAbsorb(t *testing.T) {
 	key := f.head(string(child))
 	want := mainLTs(t, f, child)
 
-	// Simulate the crash: a half-written segment already sits at the name
-	// the absorb will use.
-	partial := filepath.Join(dir, "ir", key, segFileName(1, segment.JSONLCodec{}))
+	// Simulate the crash twice over: a half-written segment at the FINAL
+	// name, and our own scratch file left behind. segment.Create is O_EXCL,
+	// so either one alone would fail every retry.
+	chDir := filepath.Join(dir, "ir", key)
+	partial := filepath.Join(chDir, segFileName(1, segment.JSONLCodec{}))
 	if err := os.WriteFile(partial, []byte("{\"truncated\":\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	scratch := filepath.Join(chDir, fmt.Sprintf(".absorb-%d", os.Getpid()))
+	if err := os.WriteFile(scratch, []byte("stale\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Detach(key); err != nil {
