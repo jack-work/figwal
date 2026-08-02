@@ -317,3 +317,95 @@ func TestInteriorForkInheritsSparseChannel(t *testing.T) {
 		}
 	}
 }
+
+// A fork sharing main [1..at] must not inherit a RELATED record keyed
+// above at. Such a record references a turn the child does not have, which
+// the crash harness reports as [orphan-related] -- and it needs no crash
+// to produce, only a related channel with records on both sides of the
+// fork point.
+func TestInteriorForkDropsRelatedRecordsPastTheForkPoint(t *testing.T) {
+	f, trunk := seedTrunk(t, filepath.Join(t.TempDir(), "f"))
+	var lts []uint64
+	for range 6 {
+		_, lt, err := f.Append(trunk, 0, []byte(`"turn"`), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lts = append(lts, lt)
+		if _, err := f.AppendChannel(string(trunk), "translations", lt, []byte(`"note"`), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	at := lts[2] // fork in the middle: notes exist above and below
+	alt, err := f.ForkAt(trunk, at)
+	if err != nil {
+		t.Fatalf("fork at %d: %v", at, err)
+	}
+	x, err := f.Head(alt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer x.Close()
+	ch := x.chans["translations"]
+	last := ch.log.LastIndex()
+	if last == 0 {
+		return // nothing inherited at all is fine
+	}
+	if err := ch.log.Range(1, func(idx uint64, payload []byte) error {
+		m, derr := decodeMainLT(payload)
+		if derr != nil {
+			return derr
+		}
+		if m > at {
+			t.Errorf("related record at %d references main %d, past the fork point %d", idx, m, at)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A related record may be keyed AHEAD of main: a note written for a turn
+// whose main record is not durable yet. A tail fork must not hand that
+// record to the child, which would then hold a note referencing a turn it
+// does not have -- the crash harness's [orphan-related], and it needs no
+// crash to produce.
+func TestTailForkDropsRelatedRecordsAheadOfMain(t *testing.T) {
+	f, trunk := seedTrunk(t, filepath.Join(t.TempDir(), "f"))
+	var lts []uint64
+	for range 3 {
+		_, lt, err := f.Append(trunk, 0, []byte(`"turn"`), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lts = append(lts, lt)
+	}
+	// A note for a turn that does not exist yet.
+	ahead := lts[len(lts)-1] + 5
+	if _, err := f.AppendChannel(string(trunk), "translations", ahead, []byte(`"ahead"`), nil); err != nil {
+		t.Fatal(err)
+	}
+	alt, err := f.ForkTail(trunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := f.Head(alt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer x.Close()
+	mainTailLT := mainTail(x)
+	ch := x.chans["translations"]
+	if err := ch.log.Range(1, func(idx uint64, payload []byte) error {
+		m, derr := decodeMainLT(payload)
+		if derr != nil {
+			return derr
+		}
+		if m > mainTailLT {
+			t.Errorf("inherited note at %d references main %d, past the child's main tail %d", idx, m, mainTailLT)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

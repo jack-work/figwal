@@ -1208,9 +1208,28 @@ func (t *Trunks) channelTails(node string) (map[string]uint64, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The fork point is the parent's main tail; a related channel inherits
+	// only what is keyed at or below it. Taking c.Last+1 for every channel
+	// looked right and was not: a related record may be keyed AHEAD of main
+	// (a note written for a turn whose main record is not durable yet), and
+	// inheriting it hands the child a record referencing a turn it does not
+	// have. Same rule as an interior fork, with at = the tail.
+	at := mainTail(x)
 	out := map[string]uint64{}
 	for _, c := range x.Channels() {
-		base := c.Last + 1
+		var base uint64
+		if c.Name == t.main {
+			base = c.Last + 1
+		} else {
+			lt, ok, lerr := x.chans[c.Name].lookupAtOrBelow(at)
+			if !ok || lerr != nil {
+				lt = 0
+			}
+			base = lt + 1
+			if base > c.Last+1 {
+				base = c.Last + 1
+			}
+		}
 		if base < c.First {
 			base = c.First // channel empty here; inherit from the ancestor
 		}
