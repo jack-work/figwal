@@ -76,6 +76,9 @@ func (t *Trunks) Detach(node string) error {
 	// Phase 1: write the absorbed prefix. Invisible until the flip.
 	for name, rows := range prefixes {
 		dir := filepath.Join(t.root, name, node)
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			continue
+		}
 		if err := writePrefixSegments(dir, rows, initial[name], codec, t.cfg.SegmentSize); err != nil {
 			return fmt.Errorf("xwal: detach %q write %q: %w", node, name, err)
 		}
@@ -84,6 +87,13 @@ func (t *Trunks) Detach(node string) error {
 	// reader sees the old lineage or the new one, never a torn one.
 	for name := range bases {
 		dir := filepath.Join(t.root, name, node)
+		// A channel added after this node was created has no directory
+		// here, so the node has no presence in it and nothing to detach.
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return err
+		}
 		if err := writeSyncedFile(filepath.Join(dir, ".fork"), []byte("base=1\n")); err != nil {
 			return err
 		}
