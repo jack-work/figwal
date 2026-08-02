@@ -299,7 +299,7 @@ func (t *Trunks) adoptLineage(lineage *rootLineageState) {
 	} else if lineage.owner != t {
 		// The previous owner's buffered appends must reach disk before this
 		// peer opens the lineage from disk.
-		_ = lineage.owner.flushHot()
+		_ = lineage.owner.syncHot()
 		t.retireHot()
 		lineage.owner = t
 	}
@@ -467,7 +467,7 @@ func (t *Trunks) evictLineage(trunk string) (bool, error) {
 	t.hotMu.Unlock()
 
 	for _, name := range head.x.order {
-		if err := head.x.chans[name].log.Flush(); err != nil {
+		if err := head.x.chans[name].log.Sync(); err != nil {
 			return false, err
 		}
 	}
@@ -710,7 +710,7 @@ func (t *Trunks) beginTrackedRead() (func(), error) {
 // blocking anyone.
 func (t *Trunks) beginFlatCreate() (func(), error) {
 	t.mu.Lock()
-	if err := t.flushHot(); err != nil {
+	if err := t.syncHot(); err != nil {
 		t.mu.Unlock()
 		return nil, fmt.Errorf("xwal: refusing create, hot flush failing: %w", err)
 	}
@@ -747,7 +747,7 @@ func (t *Trunks) beginTopologyMutation() (func(), error) {
 		}
 		// A failing flush must fail the topology op loudly: retiring the
 		// hot store would silently drop the unflushed (acked) tail.
-		if err := t.flushHot(); err != nil {
+		if err := t.syncHot(); err != nil {
 			end()
 			t.mu.Unlock()
 			return nil, fmt.Errorf("xwal: refusing topology mutation, hot flush failing: %w", err)
@@ -784,10 +784,10 @@ func (t *Trunks) releaseHot(h *trunkStore) error {
 	return nil
 }
 
-// flushHot flushes every loaded head lineage-coherently (main first,
+// syncHot flushes every loaded head lineage-coherently (main first,
 // related channels capped at durable main referents), so the stray
 // sweep can never push a related record ahead of its main entry.
-func (t *Trunks) flushHot() error {
+func (t *Trunks) syncHot() error {
 	t.hotMu.Lock()
 	h := t.hot
 	if h != nil {
@@ -814,7 +814,7 @@ func (t *Trunks) flushHot() error {
 		if head.x == nil || head.err != nil {
 			continue
 		}
-		if ferr := head.x.flushCoherent(); ferr != nil && err == nil {
+		if ferr := head.x.syncCoherent(); ferr != nil && err == nil {
 			err = ferr
 		}
 	}

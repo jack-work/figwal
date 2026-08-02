@@ -1406,9 +1406,9 @@ func (x *XWAL) Append(channelName string, mainLT uint64, payload, meta []byte) (
 	return next, nil
 }
 
-func (x *XWAL) flushAll() error {
+func (x *XWAL) syncAll() error {
 	if ch := x.chans[x.main]; ch != nil {
-		if err := ch.log.Flush(); err != nil {
+		if err := ch.log.Sync(); err != nil {
 			return err
 		}
 	}
@@ -1416,28 +1416,28 @@ func (x *XWAL) flushAll() error {
 		if name == x.main {
 			continue
 		}
-		if err := x.chans[name].log.Flush(); err != nil {
+		if err := x.chans[name].log.Sync(); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// FlushCoherent synchronously persists this handle's channels as one
+// SyncCoherent synchronously persists this handle's channels as one
 // lineage-coherent cut. It is the ONLY sanctioned durability call for
 // raw XWAL handles (StumpHead birth writes and other ceremonial appends
 // are invisible to the store flusher until Close without it).
-func (x *XWAL) FlushCoherent() error { return x.flushCoherent() }
+func (x *XWAL) SyncCoherent() error { return x.syncCoherent() }
 
-// flushCoherent persists this lineage's channels as one cut: the main
+// syncCoherent persists this lineage's channels as one cut: the main
 // channel first, then each related channel only up to the last record
 // whose main-LT referent is already durable.
-func (x *XWAL) flushCoherent() error {
+func (x *XWAL) syncCoherent() error {
 	main := x.chans[x.main]
 	if main == nil {
-		return x.flushAll()
+		return x.syncAll()
 	}
-	if err := main.log.Flush(); err != nil {
+	if err := main.log.Sync(); err != nil {
 		return err
 	}
 	// The cut is bounded by the DURABLE main tail: an append racing this
@@ -1453,7 +1453,7 @@ func (x *XWAL) flushCoherent() error {
 		if err != nil {
 			return err
 		}
-		if err := ch.log.FlushTo(target); err != nil {
+		if err := ch.log.SyncThrough(target); err != nil {
 			return err
 		}
 	}

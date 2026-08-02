@@ -140,7 +140,7 @@ func TestCleanCloseSkipsRepairMarker(t *testing.T) {
 func TestOneAheadPatchDurableAndCrashSafe(t *testing.T) {
 	dir := t.TempDir()
 	opts := testStoreOptions()
-	opts.FlushInterval = 20 * time.Millisecond
+	opts.SyncInterval = 20 * time.Millisecond
 	s, err := OpenStore(dir, opts)
 	if err != nil {
 		t.Fatal(err)

@@ -112,7 +112,7 @@ func (s *Store) open(abs string, opts Options) (*Log, error) {
 	return l, nil
 }
 
-// Evict flushes and drops the cached Log for dir, releasing its in-RAM
+// Evict syncs and drops the cached Log for dir, releasing its in-RAM
 // snapshot; the next Open rebuilds it from disk. The underlying disk
 // log stays cached in the disk store for cheap reload. On flush failure
 // the log stays cached, so no buffered entry is orphaned.
@@ -128,7 +128,7 @@ func (s *Store) Evict(dir string) error {
 	if l == nil {
 		return nil
 	}
-	if err := l.Flush(); err != nil {
+	if err := l.Sync(); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -167,7 +167,7 @@ func (s *Store) Close() error {
 	s.mu.Unlock()
 	var errs []error
 	for _, l := range logs {
-		if err := l.Flush(); err != nil {
+		if err := l.Sync(); err != nil {
 			errs = append(errs, err)
 		}
 	}

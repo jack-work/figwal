@@ -27,7 +27,7 @@ func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool)
 func TestIdleLineageEvictsAndReloads(t *testing.T) {
 	dir := t.TempDir()
 	opts := testStoreOptions()
-	opts.FlushInterval = 10 * time.Millisecond
+	opts.SyncInterval = 10 * time.Millisecond
 	opts.IdleUnload = 30 * time.Millisecond
 	s, err := OpenStore(dir, opts)
 	if err != nil {
@@ -84,7 +84,7 @@ func TestIdleLineageEvictsAndReloads(t *testing.T) {
 func TestEvictionNeverLosesPendingAppends(t *testing.T) {
 	dir := t.TempDir()
 	opts := testStoreOptions()
-	opts.FlushInterval = 2 * time.Millisecond
+	opts.SyncInterval = 2 * time.Millisecond
 	opts.IdleUnload = 2 * time.Millisecond
 	s, err := OpenStore(dir, opts)
 	if err != nil {
@@ -127,7 +127,7 @@ func TestEvictionNeverLosesPendingAppends(t *testing.T) {
 func TestBorrowedHeadIsNotEvicted(t *testing.T) {
 	dir := t.TempDir()
 	opts := testStoreOptions()
-	opts.FlushInterval = 5 * time.Millisecond
+	opts.SyncInterval = 5 * time.Millisecond
 	opts.IdleUnload = 10 * time.Millisecond
 	s, err := OpenStore(dir, opts)
 	if err != nil {
@@ -159,7 +159,7 @@ func TestBorrowedHeadIsNotEvicted(t *testing.T) {
 func TestFlushFailuresPoisonAppendsAndRecover(t *testing.T) {
 	dir := t.TempDir()
 	opts := testStoreOptions()
-	opts.FlushInterval = 5 * time.Millisecond
+	opts.SyncInterval = 5 * time.Millisecond
 	opts.IdleUnload = -1
 	opts.SegmentSize = 256
 	s, err := OpenStore(dir, opts)

@@ -20,10 +20,10 @@ const (
 
 func storeOptions() xwal.StoreOptions {
 	return xwal.StoreOptions{
-		Main:          chanMain,
-		FlushInterval: flushInterval,
-		Reducers:      map[string]xwal.Reducer{chanState: {Reduce: lastWins, Initial: []byte("{}")}},
-		SegmentSize:   4096,
+		Main:         chanMain,
+		SyncInterval: flushInterval,
+		Reducers:     map[string]xwal.Reducer{chanState: {Reduce: lastWins, Initial: []byte("{}")}},
+		SegmentSize:  4096,
 	}
 }
 

@@ -13,7 +13,7 @@ import (
 
 type StoreOptions struct {
 	Main              string
-	FlushInterval     time.Duration
+	SyncInterval      time.Duration
 	MaxUnflushedBytes int64
 	// IdleUnload evicts a lineage's in-RAM head after this much time
 	// without an append or read; 0 = default 5m, negative = never.
@@ -88,8 +88,8 @@ func OpenStore(root string, opts StoreOptions) (*Store, error) {
 		unlockRoot(lockFile)
 		return nil, err
 	}
-	if opts.FlushInterval <= 0 {
-		opts.FlushInterval = defaultFlushInterval
+	if opts.SyncInterval <= 0 {
+		opts.SyncInterval = defaultFlushInterval
 	}
 	if opts.IdleUnload == 0 {
 		opts.IdleUnload = defaultIdleUnload
@@ -112,7 +112,7 @@ func OpenStore(root string, opts StoreOptions) (*Store, error) {
 
 func (s *Store) run() {
 	defer close(s.done)
-	ticker := time.NewTicker(s.opts.FlushInterval)
+	ticker := time.NewTicker(s.opts.SyncInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -121,7 +121,7 @@ func (s *Store) run() {
 		case <-ticker.C:
 		case <-s.kick:
 		}
-		s.flushDirty()
+		s.syncDirty()
 		s.evictIdle()
 	}
 }
@@ -149,14 +149,14 @@ func (s *Store) markTouched(trunk string) {
 	s.mu.Unlock()
 }
 
-func (s *Store) noteFlushFailure(trunk string, err error) {
+func (s *Store) noteSyncFailure(trunk string, err error) {
 	s.mu.Lock()
 	s.lineageFails[trunk]++
 	s.lineageErr[trunk] = err
 	s.mu.Unlock()
 }
 
-func (s *Store) noteFlushSuccess(trunk string) {
+func (s *Store) noteSyncSuccess(trunk string) {
 	s.mu.Lock()
 	delete(s.lineageFails, trunk)
 	delete(s.lineageErr, trunk)
@@ -213,7 +213,7 @@ func (s *Store) purgeVanished() {
 // reads through an ancestor. Call it for every boundary survivor before
 // removing the set they inherit from.
 func (s *Store) Detach(node string) error {
-	s.flushDirty()
+	s.syncDirty()
 	return s.Trunks.Detach(node)
 }
 
@@ -224,7 +224,7 @@ func (s *Store) HeadNode(trunk string) (string, bool) {
 }
 
 func (s *Store) Remove(trunk string, recursive bool) error {
-	s.flushDirty()
+	s.syncDirty()
 	removed, err := s.Trunks.remove(trunk, recursive)
 	if len(removed) > 0 {
 		s.purgeLineage(removed...)
@@ -262,19 +262,19 @@ func (s *Store) Clear(trunk, channel string) error {
 	return clearErr
 }
 
-// FlushStump synchronously persists a stump's birth records, lineage-
+// SyncStump synchronously persists a stump's birth records, lineage-
 // coherently. Raw StumpHead writes are invisible to the flusher; call
 // this before spawning children under a freshly written stump.
-func (s *Store) FlushStump(name string) error {
+func (s *Store) SyncStump(name string) error {
 	sx, err := s.Trunks.StumpHead(name)
 	if err != nil {
 		return err
 	}
 	defer sx.Close()
-	return sx.flushCoherent()
+	return sx.syncCoherent()
 }
 
-func (s *Store) flushDirty() {
+func (s *Store) syncDirty() {
 	s.mu.Lock()
 	trunks := make([]string, 0, len(s.dirty))
 	for tr := range s.dirty {
@@ -284,20 +284,20 @@ func (s *Store) flushDirty() {
 	s.mu.Unlock()
 	sort.Strings(trunks)
 	for _, tr := range trunks {
-		err := s.flushLineage(tr)
+		err := s.syncLineage(tr)
 		switch {
 		case err == nil:
-			s.noteFlushSuccess(tr)
+			s.noteSyncSuccess(tr)
 		case errors.Is(err, ErrUnknownTrunk):
 			slog.Info("xwal: dropping flush bookkeeping for vanished trunk", "trunk", tr)
 			s.purgeLineage(tr)
 		default:
 			slog.Warn("xwal: lineage flush failed", "trunk", tr, "err", err)
 			s.markDirty(tr)
-			s.noteFlushFailure(tr, err)
+			s.noteSyncFailure(tr, err)
 		}
 	}
-	if err := s.Trunks.flushHot(); err != nil {
+	if err := s.Trunks.syncHot(); err != nil {
 		slog.Warn("xwal: stray flush failed", "err", err)
 	}
 }
@@ -357,13 +357,13 @@ func (s *Store) LoadedHeads() int {
 	return n
 }
 
-func (s *Store) flushLineage(trunk string) error {
+func (s *Store) syncLineage(trunk string) error {
 	x, err := s.Trunks.Head(trunk)
 	if err != nil {
 		return err
 	}
 	defer x.Close()
-	return x.flushCoherent()
+	return x.syncCoherent()
 }
 
 func (o StoreOptions) config() Config {
@@ -514,7 +514,7 @@ func (s *Store) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.stop)
 		<-s.done
-		s.flushDirty()
+		s.syncDirty()
 		s.closeErr = s.Trunks.Close()
 		if s.closeErr == nil {
 			s.closeErr = clearUnclean(s.Trunks.root)

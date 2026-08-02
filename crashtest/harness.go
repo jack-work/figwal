@@ -73,7 +73,7 @@ func runChildOnce(dir string, childSeed int64, salt string, delay time.Duration,
 }
 
 // durableCutoff is the append-stamp bound the contract guarantees durable:
-// FlushInterval behind the last moment the flusher was known alive (kill
+// SyncInterval behind the last moment the flusher was known alive (kill
 // time, or Close start if the child began shutting down), minus scheduling
 // slack. A completed Close makes everything reported durable.
 func durableCutoff(m *model, killedAt time.Time) int64 {

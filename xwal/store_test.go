@@ -8,9 +8,9 @@ import (
 
 func testStoreOptions() StoreOptions {
 	return StoreOptions{
-		Main:          "ir",
-		FlushInterval: 20 * time.Millisecond,
-		Reducers:      map[string]Reducer{"chalkboard": MapReducer()},
+		Main:         "ir",
+		SyncInterval: 20 * time.Millisecond,
+		Reducers:     map[string]Reducer{"chalkboard": MapReducer()},
 	}
 }
 

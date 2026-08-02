@@ -285,12 +285,12 @@ func (s *Segment) nextOffsetAfter(off int64) int64 {
 	return -1
 }
 
-func (s *Segment) Count() uint64     { return s.count }
-func (s *Segment) Sync() error       { return s.f.Sync() }
-func (s *Segment) Size() int64       { return s.size }
-func (s *Segment) Close() error      { return s.f.Close() }
-func (s *Segment) Path() string      { return s.path }
-func (s *Segment) ReadOnly() bool    { return s.readOnly }
+func (s *Segment) Count() uint64      { return s.count }
+func (s *Segment) Sync() error        { return s.f.Sync() }
+func (s *Segment) Size() int64        { return s.size }
+func (s *Segment) Close() error       { return s.f.Close() }
+func (s *Segment) Path() string       { return s.path }
+func (s *Segment) ReadOnly() bool     { return s.readOnly }
 func (s *Segment) FirstIndex() uint64 { return s.baseIndex }
 func (s *Segment) BaseIndex() uint64  { return s.baseIndex }
 

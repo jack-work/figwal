@@ -10,7 +10,7 @@ import (
 func TestRemoveDirtyTrunkDoesNotPoisonStore(t *testing.T) {
 	dir := t.TempDir()
 	opts := testStoreOptions()
-	opts.FlushInterval = 20 * time.Millisecond
+	opts.SyncInterval = 20 * time.Millisecond
 	s, err := OpenStore(dir, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -46,7 +46,7 @@ func TestRemoveDirtyTrunkDoesNotPoisonStore(t *testing.T) {
 func TestRawTrunksRemoveIsPurgedByFlusher(t *testing.T) {
 	dir := t.TempDir()
 	opts := testStoreOptions()
-	opts.FlushInterval = 20 * time.Millisecond
+	opts.SyncInterval = 20 * time.Millisecond
 	s, err := OpenStore(dir, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -76,7 +76,7 @@ func TestRawTrunksRemoveIsPurgedByFlusher(t *testing.T) {
 func TestPoisonIsPerLineage(t *testing.T) {
 	dir := t.TempDir()
 	opts := testStoreOptions()
-	opts.FlushInterval = 5 * time.Millisecond
+	opts.SyncInterval = 5 * time.Millisecond
 	opts.IdleUnload = -1
 	opts.SegmentSize = 256
 	s, err := OpenStore(dir, opts)
@@ -166,7 +166,7 @@ func TestFlushStumpMakesBirthDurable(t *testing.T) {
 	if err := sx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FlushStump("cfg"); err != nil {
+	if err := s.SyncStump("cfg"); err != nil {
 		t.Fatal(err)
 	}
 	found := false
@@ -181,7 +181,7 @@ func TestFlushStumpMakesBirthDurable(t *testing.T) {
 		return nil
 	})
 	if !found {
-		t.Fatal("stump birth record not durable after FlushStump")
+		t.Fatal("stump birth record not durable after SyncStump")
 	}
 }
 
@@ -204,7 +204,7 @@ func containsBytes(haystack, needle []byte) bool {
 func TestStoreClearDoesNotResurrectPending(t *testing.T) {
 	dir := t.TempDir()
 	opts := testStoreOptions()
-	opts.FlushInterval = 10 * time.Millisecond
+	opts.SyncInterval = 10 * time.Millisecond
 	opts.Opaque = []string{"translations"}
 	s, err := OpenStore(dir, opts)
 	if err != nil {
@@ -270,7 +270,7 @@ func TestStoreClearDoesNotResurrectPending(t *testing.T) {
 func TestTopologyMutationRefusedWhileFlushFailing(t *testing.T) {
 	dir := t.TempDir()
 	opts := testStoreOptions()
-	opts.FlushInterval = time.Hour
+	opts.SyncInterval = time.Hour
 	opts.SegmentSize = 256
 	s, err := OpenStore(dir, opts)
 	if err != nil {
@@ -299,7 +299,7 @@ func TestTopologyMutationRefusedWhileFlushFailing(t *testing.T) {
 	mainDir := filepath.Join(dir, "ir", branch)
 
 	// Fill past a segment so the next flush needs a rotation, then make
-	// the dir unwritable and append (pending only; FlushInterval is huge).
+	// the dir unwritable and append (pending only; SyncInterval is huge).
 	pad := make([]byte, 150)
 	for i := range pad {
 		pad[i] = 'x'

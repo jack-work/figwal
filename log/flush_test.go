@@ -46,7 +46,7 @@ func TestFlushRetrySkipsPersistedEntries(t *testing.T) {
 	if err := l.Disk().Write(2, []byte{2}); err != nil {
 		t.Fatal(err)
 	}
-	if err := l.Flush(); err != nil {
+	if err := l.Sync(); err != nil {
 		t.Fatalf("flush over partially persisted state: %v", err)
 	}
 	if _, _, ok := l.PendingBounds(); ok {
@@ -81,14 +81,14 @@ func TestFlushFailureKeepsPendingAndRetriesCleanly(t *testing.T) {
 	if err := l.Write(2, bytes.Repeat([]byte{2}, 200)); err != nil {
 		t.Fatal(err)
 	}
-	if err := l.Flush(); !errors.Is(err, disk.ErrPayloadTooLarge) {
+	if err := l.Sync(); !errors.Is(err, disk.ErrPayloadTooLarge) {
 		t.Fatalf("first flush: %v", err)
 	}
 	first, last, ok := l.PendingBounds()
 	if !ok || first != 1 || last != 2 {
 		t.Fatalf("pending after failure: %d..%d ok=%v", first, last, ok)
 	}
-	retryErr := l.Flush()
+	retryErr := l.Sync()
 	if errors.Is(retryErr, disk.ErrOutOfOrder) {
 		t.Fatal("retry re-wrote persisted entries")
 	}
