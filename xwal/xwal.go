@@ -100,6 +100,11 @@ var errStopRange = errors.New("xwal: stop range")
 // does not exist (yet). Store.Append reacts by auto-creating it.
 var ErrNoChannel = errors.New("xwal: no channel")
 
+// ErrLegacyLayout is returned by an open when the store predates the flat
+// layout. It is not a warning and there is no degraded mode behind it: the
+// caller migrates with Flatten, or does not get a store.
+var ErrLegacyLayout = errors.New("xwal: store predates the flat layout; run Flatten to migrate it")
+
 // XWAL is an opened branch of a multi-channel log.
 type XWAL struct {
 	root   string // dir holding the manifest and the per-channel trees

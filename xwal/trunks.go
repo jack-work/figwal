@@ -193,6 +193,15 @@ func openTrunks(dir string, cfg Config) (*Trunks, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Before anything walks. A store in the nested v3 layout opens
+	// "successfully" from here and reports its stumps and none of its
+	// conversations, because RebuildFrom reads ONE directory and a v3 node
+	// has no .node. There is no third path: either the store is the layout
+	// this build writes, or it is refused, and Flatten is the way through.
+	if man.Layout != layoutVersion {
+		return nil, fmt.Errorf("%w: store %s is layout %d, this build writes %d",
+			ErrLegacyLayout, dir, man.Layout, layoutVersion)
+	}
 	man, err = recoverChannelPending(dir, cfg, man)
 	if err != nil {
 		return nil, err

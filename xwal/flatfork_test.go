@@ -1,6 +1,7 @@
 package xwal
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -410,10 +411,11 @@ func TestTailForkDropsRelatedRecordsAheadOfMain(t *testing.T) {
 	}
 }
 
-// A store written before the markers merged must open unchanged, and be
-// upgraded in place. Both forms are ground truth and .node is exactly their
-// union, so this can happen on the read path.
-func TestLegacyMarkersUpgradeOnOpen(t *testing.T) {
+// A store written before the markers merged is REFUSED, and Flatten is what
+// carries it across: every node keeps its from, kind and trunk, and the
+// pair is retired. The upgrade used to happen lazily on the read path; old
+// formats now live only in the migration.
+func TestLegacyMarkersMigrateWithFlatten(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "f")
 	f, trunk := seedTrunk(t, dir)
 	for range 3 {
@@ -444,7 +446,7 @@ func TestLegacyMarkersUpgradeOnOpen(t *testing.T) {
 			continue
 		}
 		nd := filepath.Join(dir, "ir", e.Name())
-		n, ok, _ := readNodeMarker(nd)
+		n, ok := readNodeMarker(nd)
 		if !ok {
 			continue
 		}
@@ -466,14 +468,22 @@ func TestLegacyMarkersUpgradeOnOpen(t *testing.T) {
 		t.Fatal("rewound no nodes; the test proves nothing")
 	}
 
+	unstampManifest(t, dir)
+	if _, err := openTrunks(dir, trunksCfg()); !errors.Is(err, ErrLegacyLayout) {
+		t.Fatalf("open of a legacy store: got %v, want ErrLegacyLayout", err)
+	}
+	if _, err := Flatten(dir); err != nil {
+		t.Fatal(err)
+	}
+
 	g, err := openTrunks(dir, trunksCfg())
 	if err != nil {
-		t.Fatalf("legacy store failed to open: %v", err)
+		t.Fatalf("migrated store failed to open: %v", err)
 	}
 	cleanupTrunks(t, g)
 	after := g.Nodes()
 	if len(after) != len(before) {
-		t.Fatalf("legacy open sees %d nodes, want %d", len(after), len(before))
+		t.Fatalf("migrated open sees %d nodes, want %d", len(after), len(before))
 	}
 	for k, want := range before {
 		got, ok := after[k]
@@ -485,16 +495,22 @@ func TestLegacyMarkersUpgradeOnOpen(t *testing.T) {
 		}
 	}
 	if _, ok := g.idx.Head(alt); !ok {
-		t.Errorf("forked trunk %s lost its head across the upgrade", alt)
+		t.Errorf("forked trunk %s lost its head across the migration", alt)
 	}
-	// And it is upgraded, so the next open pays one read per node, not two.
+	// One identity file per node afterwards, so no later reader has two to
+	// disagree about.
 	for _, e := range ents {
 		if !e.IsDir() {
 			continue
 		}
 		nd := filepath.Join(dir, "ir", e.Name())
 		if _, err := os.Stat(filepath.Join(nd, ".node")); err != nil {
-			t.Errorf("node %q not upgraded: %v", e.Name(), err)
+			t.Errorf("node %q not migrated: %v", e.Name(), err)
+		}
+		for _, legacy := range []string{".from", ".trunk"} {
+			if _, err := os.Stat(filepath.Join(nd, legacy)); !os.IsNotExist(err) {
+				t.Errorf("node %q kept %s (err=%v)", e.Name(), legacy, err)
+			}
 		}
 	}
 }

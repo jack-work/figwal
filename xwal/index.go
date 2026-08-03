@@ -16,7 +16,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/jack-work/figwal/disk"
 )
 
 // Index is the node/trunk index: the forest shape, and where each trunk's
@@ -210,32 +209,16 @@ func (x *Index) RebuildFrom(mainDir string) error {
 	return nil
 }
 
-// addLocked records one node from its markers. Lineage is .from; the
-// directory says nothing. A fork does not freeze its parent, so a node
-// with a trunk id is that trunk's live head, forks or no forks.
+// addLocked records one node from its marker. Lineage is .node's from; the
+// directory says nothing. A fork does not freeze its parent, so a node with
+// a trunk id is that trunk's live head, forks or no forks.
 func (x *Index) addLocked(dir, key string, isRoot bool) error {
-	n, ok, legacy := readNodeMarker(dir)
+	n, ok := readNodeMarker(dir)
 	if !ok && !isRoot {
 		return nil // an unfinished fork: the marker is the commit point
 	}
 	if isRoot {
 		n.kind = "null"
-	}
-	// Upgrade a store written before the markers merged, on the read path
-	// and once per node. Both forms are ground truth and .node is exactly
-	// their union, so this is an optimisation and IGNORES its error: a
-	// read-only volume or a full disk must still open the store, and
-	// returning here would abort RebuildFrom and with it the open.
-	// (internal/store/meta_heal.go does the same for figaro's sidecar.)
-	if legacy && !isRoot {
-		if err := writeNodeMarker(dir, n); err == nil {
-			// Only once it is durable: retire the pair, so a node carries
-			// ONE identity file and no later reader has two to disagree
-			// about. Best effort, same reasoning.
-			_ = os.Remove(filepath.Join(dir, legacyFromName))
-			_ = os.Remove(filepath.Join(dir, legacyTrunkName))
-			_ = disk.SyncDir(dir)
-		}
 	}
 	x.nodes[key] = &NodeInfo{Trunk: n.trunk, IsRoot: isRoot, From: n.from, Kind: n.kind}
 	x.bumpSeqsLocked(key, n.trunk)
@@ -286,7 +269,10 @@ func (x *Index) bumpSeqsLocked(key, trunkID string) {
 // the platform that actually hurts.
 const nodeMarkerName = ".node"
 
-// Legacy names, still READ so an existing store opens, never written.
+// Legacy names. The reader below no longer knows them: old-format
+// knowledge lives in the MIGRATION (flatten.go), so that a build either
+// understands a store or refuses it, with no third path that half-reads an
+// older one.
 const (
 	legacyFromName  = ".from"
 	legacyTrunkName = ".trunk"
@@ -305,39 +291,27 @@ func writeNodeMarker(dir string, n nodeMarker) error {
 	return writeSyncedFile(filepath.Join(dir, nodeMarkerName), body)
 }
 
-// readNodeMarker returns the node's identity, whether it was found, and
-// whether it came from the legacy pair (so the caller can upgrade it).
-func readNodeMarker(dir string) (n nodeMarker, ok bool, legacy bool) {
-	if b, err := os.ReadFile(filepath.Join(dir, nodeMarkerName)); err == nil {
-		for _, line := range strings.Split(string(b), "\n") {
-			k, v, found := strings.Cut(strings.TrimSpace(line), "=")
-			if !found {
-				continue
-			}
-			switch k {
-			case "from":
-				n.from = v
-			case "kind":
-				n.kind = v
-			case "trunk":
-				n.trunk = v
-			}
-		}
-		return n, true, false
-	}
-	b, err := os.ReadFile(filepath.Join(dir, legacyFromName))
+// readNodeMarker returns the node's identity and whether it was found. It
+// reads .node and nothing else; a store whose nodes predate it is migrated
+// by Flatten before any of this runs, or refused.
+func readNodeMarker(dir string) (n nodeMarker, ok bool) {
+	b, err := os.ReadFile(filepath.Join(dir, nodeMarkerName))
 	if err != nil {
-		return nodeMarker{}, false, false
+		return nodeMarker{}, false
 	}
-	// Split before trimming: an empty parent leaves a leading newline that
-	// TrimSpace would eat, collapsing two fields into one.
-	parts := strings.SplitN(string(b), "\n", 2)
-	if len(parts) != 2 {
-		return nodeMarker{}, false, false
+	for _, line := range strings.Split(string(b), "\n") {
+		k, v, found := strings.Cut(strings.TrimSpace(line), "=")
+		if !found {
+			continue
+		}
+		switch k {
+		case "from":
+			n.from = v
+		case "kind":
+			n.kind = v
+		case "trunk":
+			n.trunk = v
+		}
 	}
-	n.from, n.kind = strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
-	if tb, terr := os.ReadFile(filepath.Join(dir, legacyTrunkName)); terr == nil {
-		n.trunk = strings.TrimSpace(string(tb))
-	}
-	return n, true, true
+	return n, true
 }

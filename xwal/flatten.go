@@ -18,6 +18,7 @@
 package xwal
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -174,10 +175,46 @@ func mainParentLeaf(mainDir, rel string) string {
 	if p := parentLeaf(rel); p != "" {
 		return p
 	}
-	if m, ok, _ := readNodeMarker(filepath.Join(mainDir, rel)); ok {
+	if m, ok := readNodeMarker(filepath.Join(mainDir, rel)); ok {
 		return m.from
 	}
 	return ""
+}
+
+// readLegacyPair reads the pre-.node identity: .from holding "parent\nkind"
+// and .trunk holding the trunk id. It lives here, in the migration, and
+// nowhere else -- the read path no longer knows these files exist, so a
+// build either understands a store or refuses it.
+func readLegacyPair(dir string) (n nodeMarker, ok bool) {
+	b, err := os.ReadFile(filepath.Join(dir, legacyFromName))
+	if err != nil {
+		return nodeMarker{}, false
+	}
+	// Split before trimming: an empty parent leaves a leading newline that
+	// TrimSpace would eat, collapsing two fields into one.
+	parts := strings.SplitN(string(b), "\n", 2)
+	if len(parts) != 2 {
+		return nodeMarker{}, false
+	}
+	n.from, n.kind = strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	if tb, terr := os.ReadFile(filepath.Join(dir, legacyTrunkName)); terr == nil {
+		n.trunk = strings.TrimSpace(string(tb))
+	}
+	return n, true
+}
+
+// NeedsFlatten reports whether a store must be migrated before it can be
+// opened. It reads one file, so it is cheap enough for every open. A
+// directory with no manifest is not a store yet and needs nothing.
+func NeedsFlatten(root string) (bool, error) {
+	m, err := readManifestFile(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return m.Layout != layoutVersion, nil
 }
 
 // errNoForkBase reports a node directory with neither a .fork marker nor a
@@ -217,8 +254,14 @@ func checkForkMarker(chanDir, rel string, codec segment.SegmentCodec) error {
 // .node, so a resumed migration counts no work it is redoing.
 func plannedMarker(chanDir, rel string) (m nodeMarker, need bool, err error) {
 	dir := filepath.Join(chanDir, rel)
-	if _, ok, legacy := readNodeMarker(dir); ok && !legacy {
+	if _, ok := readNodeMarker(dir); ok {
 		return nodeMarker{}, false, nil
+	}
+	// A store written after the flattening but before the markers merged is
+	// already at depth 1 and carries the .from/.kind pair. Its identity is
+	// on disk in full, so it is taken as written rather than re-derived.
+	if legacy, ok := readLegacyPair(dir); ok {
+		return legacy, true, nil
 	}
 	m.from = parentLeaf(rel)
 	if b, rerr := os.ReadFile(filepath.Join(dir, legacyTrunkName)); rerr == nil {

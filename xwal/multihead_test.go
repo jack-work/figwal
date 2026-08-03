@@ -65,7 +65,7 @@ func TestOpenRejectsMultipleHeads(t *testing.T) {
 	// shape a lost mint counter produced (bumpSeqs recovering only one of
 	// the two), and open must refuse it rather than serve two live heads.
 	secondBranch := f.head(second)
-	n, ok, _ := readNodeMarker(f.irDir(secondBranch))
+	n, ok := readNodeMarker(f.irDir(secondBranch))
 	if !ok {
 		t.Fatalf("no node marker for %s", secondBranch)
 	}

@@ -188,7 +188,7 @@ func nest(t *testing.T, dir string) {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
-		m, ok, _ := readNodeMarker(filepath.Join(mainDir, e.Name()))
+		m, ok := readNodeMarker(filepath.Join(mainDir, e.Name()))
 		if !ok {
 			t.Fatalf("fixture node %q has no .node", e.Name())
 		}
