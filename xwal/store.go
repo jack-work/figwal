@@ -17,9 +17,13 @@ type StoreOptions struct {
 	MaxUnflushedBytes int64
 	// IdleUnload evicts a lineage's in-RAM head after this much time
 	// without an append or read; 0 = default 5m, negative = never.
-	IdleUnload  time.Duration
-	Reducers    map[string]Reducer
-	Opaque      []string
+	IdleUnload time.Duration
+	Reducers   map[string]Reducer
+	Opaque     []string
+	// Unkeyed names channels whose records carry no main LT. They append
+	// without reading the timeline, and a fork learns what they inherit
+	// from the cursor main stamps. See ChannelSpec.Unkeyed.
+	Unkeyed     []string
 	Codec       string
 	SegmentSize int64
 	Genesis     []byte
@@ -380,6 +384,10 @@ func (o StoreOptions) config() Config {
 	for _, name := range o.Opaque {
 		opaque[name] = true
 	}
+	unkeyed := make(map[string]bool, len(o.Unkeyed))
+	for _, name := range o.Unkeyed {
+		unkeyed[name] = true
+	}
 	seen := map[string]bool{o.Main: true}
 	cfg.Channels = append(cfg.Channels, ChannelSpec{Name: o.Main, Opaque: opaque[o.Main]})
 	reducible := make([]string, 0, len(o.Reducers))
@@ -393,7 +401,7 @@ func (o StoreOptions) config() Config {
 		}
 		seen[name] = true
 		cfg.Channels = append(cfg.Channels, ChannelSpec{
-			Name: name, Kind: ChannelReducible, Reducer: name, Opaque: opaque[name],
+			Name: name, Kind: ChannelReducible, Reducer: name, Opaque: opaque[name], Unkeyed: unkeyed[name],
 		})
 	}
 	for _, name := range o.Opaque {
@@ -401,7 +409,7 @@ func (o StoreOptions) config() Config {
 			continue
 		}
 		seen[name] = true
-		cfg.Channels = append(cfg.Channels, ChannelSpec{Name: name, Opaque: true})
+		cfg.Channels = append(cfg.Channels, ChannelSpec{Name: name, Opaque: true, Unkeyed: unkeyed[name]})
 	}
 	return cfg
 }
