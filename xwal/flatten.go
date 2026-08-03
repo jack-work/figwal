@@ -646,3 +646,53 @@ func without(all []string, drop string) []string {
 	}
 	return out
 }
+
+// reconcileUnkeyed brings an existing manifest's channel properties up to
+// what the caller now declares. Only ONE property, and only in ONE
+// direction: keyed -> unkeyed.
+//
+// The manifest is authoritative for channel properties once a store exists,
+// and materializeManifestChannels only ever added MISSING directories --
+// so a store written before a channel became unkeyed kept it keyed
+// forever. The consequence was not subtle and was invisible: the whole
+// unkeyed design (append without reading the timeline, no lock, a `set`
+// that lands mid-turn) applied to stores created by this build and to no
+// store anyone already had. A fuzz worker found it from the outside as a
+// `set` the parent kept and a tail fork's child never saw, which is the
+// contract in channelBases spelled out: a tail fork inherits an unkeyed
+// channel's records written SINCE the last turn, and the keyed branch
+// cannot, because those records are keyed above the fork point.
+//
+// The mixed store this produces -- old records keyed, new ones not -- is
+// exactly the state the cursor fallback exists for, gated by
+// UnstampedRecords.
+//
+// The other direction is REFUSED. Records already written carry no key, and
+// reading them as keyed would read every one of them as key 0.
+func reconcileUnkeyed(dir string, cfg Config, man manifest) (manifest, error) {
+	want := make(map[string]bool, len(cfg.Channels))
+	declared := make(map[string]bool, len(cfg.Channels))
+	for _, c := range cfg.Channels {
+		want[c.Name], declared[c.Name] = c.Unkeyed, true
+	}
+	changed := false
+	for i, mc := range man.Channels {
+		switch {
+		case want[mc.Name] && !mc.Unkeyed:
+			man.Channels[i].Unkeyed = true
+			changed = true
+		case mc.Unkeyed && declared[mc.Name] && !want[mc.Name]:
+			return man, fmt.Errorf(
+				"xwal: channel %q is unkeyed on disk but the caller declares it keyed; "+
+					"its records carry no main LT and there is no converter that could invent one",
+				mc.Name)
+		}
+	}
+	if !changed {
+		return man, nil
+	}
+	if err := writeManifest(dir, man); err != nil {
+		return man, err
+	}
+	return man, nil
+}
