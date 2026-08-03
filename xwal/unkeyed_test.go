@@ -107,3 +107,47 @@ func TestUnkeyedCursorFallsBackForOldRecords(t *testing.T) {
 		t.Fatal("cursor is 0; the stamp is not being written")
 	}
 }
+
+// A reader walking main already holds the cursor stamp, so attributing an
+// unkeyed channel's records to turns costs no extra read at all.
+func TestMainRecordCarriesTheCursor(t *testing.T) {
+	f, trunk := seedUnkeyed(t, filepath.Join(t.TempDir(), "f"))
+	for i := range 3 {
+		patch, _ := MapSetPatch([]string{fmt.Sprintf("k%d", i)}, fmt.Appendf(nil, `%d`, i))
+		if _, err := f.AppendChannel(string(trunk), "chalkboard", 0, patch, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := f.Append(trunk, 0, []byte(`"t"`), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	x, err := f.Head(trunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer x.Close()
+	tail := mainTail(x)
+	seen := 0
+	var prev uint64
+	for lt := uint64(1); lt <= tail; lt++ {
+		rec, err := x.ReadAt("ir", lt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cur, ok := rec.Cursors["chalkboard"]
+		if !ok {
+			continue // pre-stamp genesis records
+		}
+		if cur < prev {
+			t.Fatalf("cursor went backwards at LT %d: %d after %d", lt, cur, prev)
+		}
+		prev = cur
+		seen++
+	}
+	if seen == 0 {
+		t.Fatal("no main record carried a cursor; the stamp is not reaching Record")
+	}
+	if prev == 0 {
+		t.Fatal("cursor never advanced despite three board patches")
+	}
+}

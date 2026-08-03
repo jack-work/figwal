@@ -1865,6 +1865,11 @@ type Record struct {
 	MainLT    uint64
 	Payload   []byte
 	Meta      []byte
+	// Cursors, on MAIN records only: where each unkeyed channel stood when
+	// this record was written. A reader walking the timeline already holds
+	// this, so it can attribute an unkeyed channel's records to turns
+	// without a single extra read.
+	Cursors map[string]uint64
 }
 
 func embedJSON(b []byte) json.RawMessage {
@@ -1920,7 +1925,9 @@ func decodeFrame(f []byte) (uint64, []byte, error) {
 }
 
 func decodeRecord(channelLT uint64, f []byte) (Record, error) {
-	if m, p, x, ok := fastDecodeFrame(f); ok {
+	// The fast path skips the cursor stamp, so a frame that has one takes
+	// the full decode. Only main records carry it.
+	if m, p, x, ok := fastDecodeFrame(f); ok && !bytes.Contains(f, []byte(`"c":`)) {
 		return Record{ChannelLT: channelLT, MainLT: m, Payload: p, Meta: x}, nil
 	}
 	var o frameObj
@@ -1931,7 +1938,7 @@ func decodeRecord(channelLT uint64, f []byte) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
-	return Record{ChannelLT: channelLT, MainLT: o.M, Payload: payload, Meta: o.X}, nil
+	return Record{ChannelLT: channelLT, MainLT: o.M, Payload: payload, Meta: o.X, Cursors: o.C}, nil
 }
 
 func (o frameObj) payload() ([]byte, error) {
