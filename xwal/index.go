@@ -15,7 +15,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-
 )
 
 // Index is the node/trunk index: the forest shape, and where each trunk's

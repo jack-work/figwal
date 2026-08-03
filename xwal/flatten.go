@@ -72,6 +72,12 @@ func PlanFlatten(root string) (*FlattenPlan, error) {
 	}
 	plan := &FlattenPlan{Root: root, Main: main}
 
+	mainDir := filepath.Join(root, main)
+	mainMarkers, err := planMainMarkers(mainDir)
+	if err != nil {
+		return nil, err
+	}
+
 	// Main first: its tree is the lineage authority, and every other
 	// channel is checked against it.
 	ordered := append([]string{main}, without(chanList, main)...)
@@ -117,11 +123,7 @@ func PlanFlatten(root string) (*FlattenPlan, error) {
 			}
 			node := flattenNode{Rel: rel, Flat: leaf}
 			if ch == main {
-				m, need, err := plannedMarker(dir, rel)
-				if err != nil {
-					return nil, err
-				}
-				if need {
+				if m, ok := mainMarkers[rel]; ok {
 					node.Marker = &m
 					plan.Markers++
 				}
@@ -158,6 +160,91 @@ func PlanFlatten(root string) (*FlattenPlan, error) {
 			root, strings.Join(append(collisions, divergent...), "\n  "))
 	}
 	return plan, nil
+}
+
+// planMainMarkers is every .node the main channel still needs, keyed by the
+// node's current path. It runs before any move because of the ONE HEAD rule:
+// what a node's marker should say depends on the other nodes carrying the
+// same trunk id, which is a property of the whole channel, not of one
+// directory.
+//
+// In the nested layout a trunk was a CHAIN of nodes -- a continuation forked
+// a child that inherited the trunk id, and the head was the deepest of them.
+// Flat, a trunk has exactly one head and two live heads is an open error
+// ("trunk %q has multiple live heads"), which is how this was found: on a
+// real store, 44 of 340 trunks span 2 to 22 nodes each.
+//
+// So the deepest node of a chain keeps the trunk id and the ancestors are
+// demoted to plain lineage. Deepest is the live one, and that is measured
+// rather than assumed: across every chain in that store the fork base rises
+// strictly with depth (90 links, no exception), so the deepest node holds
+// the newest records.
+func planMainMarkers(mainDir string) (map[string]nodeMarker, error) {
+	paths, err := nodePaths(mainDir)
+	if err != nil {
+		return nil, err
+	}
+	markers := map[string]nodeMarker{}
+	carriers := map[string][]string{} // trunk id -> paths claiming it
+	for _, rel := range paths {
+		m, need, err := plannedMarker(mainDir, rel)
+		if err != nil {
+			return nil, err
+		}
+		if need {
+			markers[rel] = m
+			if m.trunk != "" {
+				carriers[m.trunk] = append(carriers[m.trunk], rel)
+			}
+			continue
+		}
+		// Already migrated: its marker is authoritative, and a node already
+		// demoted carries no trunk, so it does not compete for the head.
+		if existing, ok := readNodeMarker(filepath.Join(mainDir, rel)); ok && existing.trunk != "" {
+			carriers[existing.trunk] = append(carriers[existing.trunk], rel)
+		}
+	}
+	var tangled []string
+	for trunk, rels := range carriers {
+		if len(rels) < 2 {
+			continue
+		}
+		sort.Slice(rels, func(i, j int) bool { return pathDepth(rels[i]) < pathDepth(rels[j]) })
+		if !isLineageChain(mainDir, rels) {
+			// Two nodes claim one trunk without one descending from the
+			// other, so there is no "the newest" to pick. Refused rather
+			// than guessed: choosing wrong publishes an aria's older half
+			// as its present.
+			tangled = append(tangled, fmt.Sprintf("trunk %q is claimed by %v, which is not one chain", trunk, rels))
+			continue
+		}
+		for _, rel := range rels[:len(rels)-1] {
+			m, ok := markers[rel]
+			if !ok {
+				// An already-migrated head that a deeper node outranks.
+				// Rewriting it is the only way to leave one head, so the
+				// marker is planned even though the node was "done".
+				m, _ = readNodeMarker(filepath.Join(mainDir, rel))
+			}
+			m.trunk = ""
+			markers[rel] = m
+		}
+	}
+	if len(tangled) > 0 {
+		return nil, fmt.Errorf("xwal: cannot flatten %s:\n  %s", mainDir, strings.Join(tangled, "\n  "))
+	}
+	return markers, nil
+}
+
+// isLineageChain reports whether rels, ordered shallowest first, is a single
+// descent: each one's parent is the one before it.
+func isLineageChain(mainDir string, rels []string) bool {
+	for i := 1; i < len(rels); i++ {
+		if mainParentLeaf(mainDir, rels[i]) != filepath.Base(rels[i-1]) {
+			return false
+		}
+	}
+	return true
 }
 
 // parentLeaf is the leaf name of a nested path's parent, empty at depth 1.

@@ -618,3 +618,66 @@ func equalBases(a, b map[string]map[string]uint64) bool {
 	}
 	return true
 }
+
+// A v3 trunk was a CHAIN of nodes: a continuation forked a child that
+// inherited the trunk id, and the head was the deepest of them. Flat, one
+// trunk has one head, and two of them is an open error. So the migration
+// must keep the id on the deepest node and demote its ancestors -- deepest
+// because that is where a chain's newest records are, which is measured on
+// the real store (fork bases rise strictly with depth across every chain).
+func TestFlattenLeavesOneHeadPerTrunkChain(t *testing.T) {
+	dir, _ := buildNestedFixture(t)
+	// Turn a parent/child pair into a v3 continuation chain: the child
+	// inherits the parent's trunk id, and its own ceases to exist.
+	paths, err := nodePaths(filepath.Join(dir, "ir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parent, child string
+	for _, p := range paths {
+		for _, q := range paths {
+			if filepath.Dir(q) == p && pathDepth(p) >= 2 {
+				parent, child = p, q
+			}
+		}
+	}
+	if child == "" {
+		t.Fatal("fixture has no nested parent/child pair")
+	}
+	shared, err := os.ReadFile(filepath.Join(dir, "ir", parent, legacyTrunkName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ir", child, legacyTrunkName), shared, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	trunk := strings.TrimSpace(string(shared))
+
+	if _, err := Flatten(dir); err != nil {
+		t.Fatalf("flatten a chain: %v", err)
+	}
+	s, err := OpenStore(dir, testStoreOptions())
+	if err != nil {
+		t.Fatalf("open after migrating a chain: %v", err)
+	}
+	defer s.Close()
+
+	head, ok := s.HeadNode(trunk)
+	if !ok {
+		t.Fatalf("trunk %s has no head", trunk)
+	}
+	if want := filepath.Base(child); head != want {
+		t.Errorf("head of the chain is %q, want the DEEPEST node %q", head, want)
+	}
+	if m, ok := readNodeMarker(filepath.Join(dir, "ir", filepath.Base(parent))); !ok || m.trunk != "" {
+		t.Errorf("ancestor %q still claims a trunk: %+v", parent, m)
+	}
+	// The demoted ancestor is still lineage, so the head reads through it.
+	recs, err := s.RecordsFrom(trunk, "ir", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) == 0 {
+		t.Error("the surviving head reads nothing")
+	}
+}
