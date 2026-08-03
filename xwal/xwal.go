@@ -105,6 +105,11 @@ var ErrNoChannel = errors.New("xwal: no channel")
 // caller migrates with Flatten, or does not get a store.
 var ErrLegacyLayout = errors.New("xwal: store predates the flat layout; run Flatten to migrate it")
 
+// ErrFutureLayout is the other direction: a store written by a NEWER build.
+// No migration can help; only a newer binary can. Kept distinct so a caller
+// does not "migrate" a store forward into the past.
+var ErrFutureLayout = errors.New("xwal: store was written by a newer build")
+
 // XWAL is an opened branch of a multi-channel log.
 type XWAL struct {
 	root   string // dir holding the manifest and the per-channel trees
@@ -114,7 +119,10 @@ type XWAL struct {
 	chans  map[string]*channel
 	cfg    Config
 	codec  segment.SegmentCodec
-	shared bool
+	// unstampedRecords: this store came through Flatten, so its main
+	// records predate the cursor stamp. Gates the fallback in CursorAt.
+	unstampedRecords bool
+	shared           bool
 	// flatParents are ancestor logs this XWAL opened and must close.
 	flatParents []*log.Log
 
@@ -230,11 +238,14 @@ type manifest struct {
 	Channels []manifestChannel `json:"channels"`
 	// Layout is the on-disk TOPOLOGY version: 4 is flat, absent (0) is the
 	// nested v3 layout this build cannot read. It is stamped on creation and
-	// by Flatten, and openTrunks refuses anything else. LayoutFrom records
-	// what a migrated store came from, and is what sanctions the migration-era
-	// compatibility in CursorAt.
-	Layout     int `json:"layout,omitempty"`
-	LayoutFrom int `json:"layout_from,omitempty"`
+	// by Flatten, and openTrunks refuses anything else.
+	//
+	// UnstampedRecords marks a store that came through Flatten, and so holds
+	// main records written before the cursor stamp existed (the stamp and
+	// this layout shipped together). It is what sanctions the migration-era
+	// fallback in CursorAt, and the ONLY thing that does.
+	Layout           int  `json:"layout,omitempty"`
+	UnstampedRecords bool `json:"unstamped_records,omitempty"`
 }
 
 // layoutVersion is the flat layout: every node at depth 1, lineage in .node.
@@ -298,6 +309,9 @@ func open(dir string, cfg Config, store *log.Store, branch ...string) (*XWAL, er
 		cfg:    cfg,
 		codec:  codec,
 		shared: store != nil,
+		// Set from the manifest, never from a flag: only a store that came
+		// through Flatten may reach the pre-stamp cursor path.
+		unstampedRecords: man.UnstampedRecords,
 	}
 	for _, mc := range man.Channels {
 		ch := &channel{name: mc.Name, rname: mc.Reducer, opaque: mc.Opaque, unkeyed: mc.Unkeyed}
@@ -1758,17 +1772,21 @@ func (x *XWAL) Branch() []string { return append([]string(nil), x.branch...) }
 
 func (x *XWAL) sharedView(release func() error, releaseRoot func(), retire func()) *XWAL {
 	return &XWAL{
-		root:        x.root,
-		branch:      append([]string(nil), x.branch...),
-		main:        x.main,
-		order:       x.order,
-		chans:       x.chans,
-		cfg:         x.cfg,
-		codec:       x.codec,
-		shared:      true,
-		release:     release,
-		releaseRoot: releaseRoot,
-		retire:      retire,
+		root:   x.root,
+		branch: append([]string(nil), x.branch...),
+		main:   x.main,
+		order:  x.order,
+		chans:  x.chans,
+		cfg:    x.cfg,
+		codec:  x.codec,
+		shared: true,
+		// A hand-rolled copy: every field added to XWAL has to be added
+		// here too. Forgetting this one silenced the migration-era cursor
+		// path on the ONLY route that opens a head.
+		unstampedRecords: x.unstampedRecords,
+		release:          release,
+		releaseRoot:      releaseRoot,
+		retire:           retire,
 	}
 }
 
@@ -2177,6 +2195,19 @@ func (x *XWAL) CursorAt(at uint64, channel string) (uint64, error) {
 	}
 	if v, ok := o.C[channel]; ok {
 		return v, nil
+	}
+	// MIGRATION-ERA ONLY. A store written before the cursor stamp has main
+	// records with no stamp at all, and its related records still carry the
+	// main LT they were keyed by, so the boundary is recoverable by lookup.
+	// A store this build created cannot want that: its unkeyed records carry
+	// main LT 0, so the lookup would answer "every record so far" for any
+	// `at` -- a fork would inherit records written after it branched.
+	//
+	// It retires when no store carrying pre-stamp records remains, i.e. when
+	// a converter rewrites canonical IR. Until then this is the sanctioned
+	// path and the flag is its gate.
+	if !x.unstampedRecords {
+		return 0, nil
 	}
 	lt, ok, lerr := x.chans[channel].lookupAtOrBelow(at)
 	if lerr != nil {

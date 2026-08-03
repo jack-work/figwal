@@ -448,6 +448,17 @@ func (s *Store) autoCreateChannel(channel string) error {
 			spec.Opaque = true
 		}
 	}
+	// Unkeyed, like Opaque, is a property of the CHANNEL, and this is the
+	// one place a channel is born without passing through opts.config().
+	// Dropping it here created a keyed channel under an unkeyed name: the
+	// append path then reads main to stamp a key -- the exact coupling
+	// unkeyed exists to remove -- and a fork takes its boundary from that
+	// key instead of from the cursor stamps.
+	for _, name := range s.opts.Unkeyed {
+		if name == channel {
+			spec.Unkeyed = true
+		}
+	}
 	if _, ok := s.opts.Reducers[channel]; ok {
 		spec.Kind = ChannelReducible
 		spec.Reducer = channel

@@ -95,7 +95,7 @@ func unstampManifest(t *testing.T, dir string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.Layout, m.LayoutFrom = 0, 0
+	m.Layout, m.UnstampedRecords = 0, false
 	if err := writeManifest(dir, m); err != nil {
 		t.Fatal(err)
 	}
