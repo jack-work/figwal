@@ -2144,16 +2144,28 @@ func (x *XWAL) openFlatParent(chName, node string, opts disk.Options, store *log
 		return nil, nil
 	}
 	opts.Parent = nil
+	var above *log.Log
 	if up := x.cfg.ParentOf(node); up != "" {
 		p, err := x.openFlatParent(chName, up, opts, store)
 		if err != nil {
 			return nil, err
 		}
 		if p != nil {
+			above = p
 			opts.Parent = p.Disk()
 		}
 	}
 	dir := filepath.Join(x.root, chName, node)
+	// An ancestor with no directory in this channel is PASSED THROUGH, not
+	// created. log.Open would MkdirAll an empty log, and an empty log owns
+	// its numbering from 1 -- so this node would stop delegating and sever
+	// the reader from everything above it. Detach stats and skips for the
+	// same reason; now the two agree.
+	if _, serr := os.Stat(dir); errors.Is(serr, os.ErrNotExist) {
+		return above, nil
+	} else if serr != nil {
+		return nil, serr
+	}
 	var l *log.Log
 	var err error
 	if store == nil {

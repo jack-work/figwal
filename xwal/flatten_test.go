@@ -859,3 +859,48 @@ func TestCursorFallbackServesAMigratedStore(t *testing.T) {
 		t.Error("no trunk resolved a chalkboard cursor: the migration-era fallback is not running")
 	}
 }
+
+// A collision must be REPORTED as a collision. The lineage walk indexes
+// nodes by leaf name, so a duplicate leaf corrupts the depths and the run
+// can refuse with "not one chain" -- a true refusal for a false reason, and
+// the reason is what the user acts on.
+func TestACollisionIsReportedAsACollisionNotAsATangledChain(t *testing.T) {
+	dir, _ := buildNestedFixture(t)
+	paths, err := nodePaths(filepath.Join(dir, "ir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Duplicate a DEEP node's leaf name higher up, and give both the same
+	// trunk id, so the tangled-chain path is reachable too.
+	var deep string
+	for _, p := range paths {
+		if pathDepth(p) > pathDepth(deep) {
+			deep = p
+		}
+	}
+	clash := filepath.Join(filepath.Dir(filepath.Dir(deep)), filepath.Base(deep))
+	if err := os.MkdirAll(filepath.Join(dir, "ir", clash), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ir", clash, ".fork"), []byte("base=1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	trunk, err := os.ReadFile(filepath.Join(dir, "ir", deep, legacyTrunkName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ir", clash, legacyTrunkName), trunk, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = Flatten(dir)
+	if err == nil {
+		t.Fatal("expected a refusal")
+	}
+	if !strings.Contains(err.Error(), "both flatten to") {
+		t.Errorf("refusal does not name the collision: %v", err)
+	}
+	if strings.Contains(err.Error(), "not one chain") {
+		t.Errorf("refusal blames the chain for a collision: %v", err)
+	}
+}

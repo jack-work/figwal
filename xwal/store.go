@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -442,22 +443,18 @@ func (s *Store) Append(trunk, channel string, mainLT uint64, payload, meta []byt
 }
 
 func (s *Store) autoCreateChannel(channel string) error {
-	spec := ChannelSpec{Name: channel, Kind: ChannelLog}
-	for _, name := range s.opts.Opaque {
-		if name == channel {
-			spec.Opaque = true
-		}
-	}
-	// Unkeyed, like Opaque, is a property of the CHANNEL, and this is the
-	// one place a channel is born without passing through opts.config().
-	// Dropping it here created a keyed channel under an unkeyed name: the
-	// append path then reads main to stamp a key -- the exact coupling
+	// Opaque and Unkeyed are properties of the CHANNEL, and this is the one
+	// place a channel is born without passing through opts.config().
+	// Dropping Unkeyed here created a keyed channel under an unkeyed name:
+	// the append path then reads main to stamp a key -- the exact coupling
 	// unkeyed exists to remove -- and a fork takes its boundary from that
-	// key instead of from the cursor stamps.
-	for _, name := range s.opts.Unkeyed {
-		if name == channel {
-			spec.Unkeyed = true
-		}
+	// key instead of from the cursor stamps. Written as one shape so the
+	// third such property lands once rather than being forgotten once.
+	spec := ChannelSpec{
+		Name:    channel,
+		Kind:    ChannelLog,
+		Opaque:  slices.Contains(s.opts.Opaque, channel),
+		Unkeyed: slices.Contains(s.opts.Unkeyed, channel),
 	}
 	if _, ok := s.opts.Reducers[channel]; ok {
 		spec.Kind = ChannelReducible

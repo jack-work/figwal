@@ -73,6 +73,14 @@ func PlanFlatten(root string) (*FlattenPlan, error) {
 	plan := &FlattenPlan{Root: root, Main: main}
 
 	mainDir := filepath.Join(root, main)
+	// Leaf uniqueness in MAIN is checked first, because planMainMarkers
+	// indexes nodes by leaf to walk lineage. With a duplicate leaf that
+	// index keeps whichever it saw last, the depths come out wrong, and the
+	// run can refuse with "not one chain" when the truth is a collision --
+	// nothing is applied either way, but the message is what a user acts on.
+	if err := checkLeafCollisions(mainDir, main); err != nil {
+		return nil, fmt.Errorf("xwal: cannot flatten %s:\n  %s", root, err)
+	}
 	mainMarkers, err := planMainMarkers(mainDir)
 	if err != nil {
 		return nil, err
@@ -160,6 +168,30 @@ func PlanFlatten(root string) (*FlattenPlan, error) {
 			root, strings.Join(append(collisions, divergent...), "\n  "))
 	}
 	return plan, nil
+}
+
+// checkLeafCollisions reports every pair of nodes in one channel that would
+// flatten onto the same name. Name mangling is deliberately not
+// implemented, so this is a refusal, and it names all of them at once.
+func checkLeafCollisions(chanDir, ch string) error {
+	paths, err := nodePaths(chanDir)
+	if err != nil {
+		return err
+	}
+	claimed := map[string]string{}
+	var clashes []string
+	for _, rel := range paths {
+		leaf := filepath.Base(rel)
+		if owner, taken := claimed[leaf]; taken {
+			clashes = append(clashes, fmt.Sprintf("%s: %q and %q both flatten to %q", ch, owner, rel, leaf))
+			continue
+		}
+		claimed[leaf] = rel
+	}
+	if len(clashes) > 0 {
+		return fmt.Errorf("%s", strings.Join(clashes, "\n  "))
+	}
+	return nil
 }
 
 // planMainMarkers is every .node the main channel still needs, keyed by the
