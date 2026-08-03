@@ -1561,7 +1561,7 @@ func (x *XWAL) ReadAt(channelName string, channelLT uint64) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
-	return decodeRecord(channelLT, f)
+	return decodeRecordFrom(channelLT, f, channelName == x.main)
 }
 
 // Lookup finds the entry referencing a given main LT in a channel (the
@@ -1634,7 +1634,7 @@ func (x *XWAL) RecordsFrom(channelName string, fromMainLT uint64, limit int) ([]
 
 	records := make([]Record, 0)
 	err = snapshot.Range(first, func(idx uint64, frame []byte) error {
-		record, err := decodeRecord(idx, frame)
+		record, err := decodeRecordFrom(idx, frame, channelName == x.main)
 		if err != nil {
 			return err
 		}
@@ -1663,7 +1663,7 @@ func (x *XWAL) LatestChannelRecord(channelName string, minMainLT uint64) (Record
 	var latest Record
 	found := false
 	err := ch.log.Snapshot().ScanFromEnd(0, func(idx uint64, frame []byte) error {
-		record, err := decodeRecord(idx, frame)
+		record, err := decodeRecordFrom(idx, frame, channelName == x.main)
 		if err != nil {
 			return err
 		}
@@ -1924,10 +1924,19 @@ func decodeFrame(f []byte) (uint64, []byte, error) {
 	return o.M, payload, nil
 }
 
+// decodeRecord decodes a related-channel frame. isMain selects the slow
+// path, because only a MAIN record carries a cursor stamp and the fast
+// decode does not look for one.
+//
+// Keyed off the channel, NOT off the bytes: probing a payload for `"c":`
+// would let any user content that happens to contain that literal -- a
+// chalkboard key named c -- silently take the slow path forever.
 func decodeRecord(channelLT uint64, f []byte) (Record, error) {
-	// The fast path skips the cursor stamp, so a frame that has one takes
-	// the full decode. Only main records carry it.
-	if m, p, x, ok := fastDecodeFrame(f); ok && !bytes.Contains(f, []byte(`"c":`)) {
+	return decodeRecordFrom(channelLT, f, false)
+}
+
+func decodeRecordFrom(channelLT uint64, f []byte, isMain bool) (Record, error) {
+	if m, p, x, ok := fastDecodeFrame(f); ok && !isMain {
 		return Record{ChannelLT: channelLT, MainLT: m, Payload: p, Meta: x}, nil
 	}
 	var o frameObj
@@ -2129,21 +2138,17 @@ func (x *XWAL) openFlatParent(chName, node string, opts disk.Options, store *log
 }
 
 // CursorAt is where an unkeyed channel stood when main record `at` was
-// written. Unkeyed decouples the WRITE path from the timeline; a reader
-// that wants to group records by turn still can, from this.
-func (x *XWAL) CursorAt(at uint64, channel string) (uint64, error) {
-	return x.cursorAt(at, channel)
-}
-
-// cursorAt is where an unkeyed channel stood when main record at was
 // written, from that record's cursor stamp.
+//
+// Unkeyed decouples the WRITE path from the timeline; a reader that wants
+// to attribute records to turns still can, from this.
 //
 // LAZY MIGRATION: a record written before stamping existed carries no
 // cursor. The channel's OLD main-LT key is still on disk, so the answer is
 // derivable — the highest index in that channel keyed at or below at. No
 // rewrite, no migration gate; the derivation simply retires as old records
 // scroll out of the prefix.
-func (x *XWAL) cursorAt(at uint64, channel string) (uint64, error) {
+func (x *XWAL) CursorAt(at uint64, channel string) (uint64, error) {
 	if at == 0 {
 		return 0, nil
 	}

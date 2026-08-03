@@ -370,6 +370,14 @@ func (s *Store) syncLineage(trunk string) error {
 	return x.syncCoherent()
 }
 
+func nameSet(names []string) map[string]bool {
+	out := make(map[string]bool, len(names))
+	for _, n := range names {
+		out[n] = true
+	}
+	return out
+}
+
 func (o StoreOptions) config() Config {
 	cfg := Config{
 		Main:              o.Main,
@@ -380,14 +388,7 @@ func (o StoreOptions) config() Config {
 		Genesis:           o.Genesis,
 		MintTrunkID:       o.MintTrunkID,
 	}
-	opaque := make(map[string]bool, len(o.Opaque))
-	for _, name := range o.Opaque {
-		opaque[name] = true
-	}
-	unkeyed := make(map[string]bool, len(o.Unkeyed))
-	for _, name := range o.Unkeyed {
-		unkeyed[name] = true
-	}
+	opaque, unkeyed := nameSet(o.Opaque), nameSet(o.Unkeyed)
 	seen := map[string]bool{o.Main: true}
 	cfg.Channels = append(cfg.Channels, ChannelSpec{Name: o.Main, Opaque: opaque[o.Main]})
 	reducible := make([]string, 0, len(o.Reducers))

@@ -1230,12 +1230,21 @@ func (t *Trunks) channelBases(node string, at uint64) (map[string]uint64, error)
 			// below the fork point" is not a question that can be asked. The
 			// main record AT the fork point already recorded where this
 			// channel stood; that stamp IS the boundary.
-			cur, cerr := x.cursorAt(at, c.Name)
+			cur, cerr := x.CursorAt(at, c.Name)
 			if cerr != nil {
 				x.Close()
 				return nil, cerr
 			}
 			base = cur + 1
+			// Same ceiling as the keyed branch, for the same reason. A
+			// cursor is DATA ON DISK: stale, repaired, or written by an
+			// older build, it can name a position the parent does not have.
+			// A base above the parent's own tail leaves the child numbering
+			// over a hole in its own prefix, and the first read through the
+			// gap kills the process.
+			if base > c.Last+1 {
+				base = c.Last + 1
+			}
 		default:
 			lt, ok, lerr := x.chans[c.Name].lookupAtOrBelow(at)
 			if lerr != nil {
