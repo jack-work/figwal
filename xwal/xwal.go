@@ -2121,6 +2121,13 @@ func (x *XWAL) openFlatParent(chName, node string, opts disk.Options, store *log
 	return l, nil
 }
 
+// CursorAt is where an unkeyed channel stood when main record `at` was
+// written. Unkeyed decouples the WRITE path from the timeline; a reader
+// that wants to group records by turn still can, from this.
+func (x *XWAL) CursorAt(at uint64, channel string) (uint64, error) {
+	return x.cursorAt(at, channel)
+}
+
 // cursorAt is where an unkeyed channel stood when main record at was
 // written, from that record's cursor stamp.
 //

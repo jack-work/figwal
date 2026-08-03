@@ -1208,7 +1208,13 @@ func (t *Trunks) channelBases(node string, at uint64) (map[string]uint64, error)
 	if err != nil {
 		return nil, err
 	}
-	if at == 0 {
+	// A TAIL fork means "everything as it stands now", and for an unkeyed
+	// channel that includes records written since the last turn -- a board
+	// patch is a declaration, and one made after the last turn is still part
+	// of what the child should start from. An INTERIOR fork means "as of
+	// turn N", which is exactly what N's cursor stamp says.
+	tailFork := at == 0
+	if tailFork {
 		at = mainTail(x)
 	}
 	out := map[string]uint64{}
@@ -1217,6 +1223,8 @@ func (t *Trunks) channelBases(node string, at uint64) (map[string]uint64, error)
 		switch {
 		case c.Name == t.main:
 			base = at + 1
+		case x.chans[c.Name].unkeyed && tailFork:
+			base = c.Last + 1
 		case x.chans[c.Name].unkeyed:
 			// An unkeyed channel carries no main LT, so "records keyed at or
 			// below the fork point" is not a question that can be asked. The
