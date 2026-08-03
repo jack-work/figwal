@@ -904,3 +904,72 @@ func TestACollisionIsReportedAsACollisionNotAsATangledChain(t *testing.T) {
 		t.Errorf("refusal blames the chain for a collision: %v", err)
 	}
 }
+
+// A kill lands between two demotion writes, and the nodes still claiming
+// the trunk are then a grandparent and a grandchild: one line of descent,
+// with the demoted node between them, NOT adjacent. Testing immediate
+// parentage called that tangled and refused the store forever -- with every
+// byte of every aria intact on disk. A fuzz worker measured the window at
+// roughly 80% of the main phase, which makes it the ordinary case rather
+// than a race.
+func TestFlattenResumesAChainWhoseMiddleWasAlreadyDemoted(t *testing.T) {
+	dir, _ := buildNestedFixture(t)
+	paths, err := nodePaths(filepath.Join(dir, "ir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A three-node chain: grandparent -> parent -> child, all one trunk.
+	var gp, mid, child string
+	for _, p := range paths {
+		for _, q := range paths {
+			for _, r := range paths {
+				if filepath.Dir(q) == p && filepath.Dir(r) == q {
+					gp, mid, child = p, q, r
+				}
+			}
+		}
+	}
+	if child == "" {
+		t.Fatal("fixture has no three-node chain")
+	}
+	trunk, err := os.ReadFile(filepath.Join(dir, "ir", gp, legacyTrunkName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{mid, child} {
+		if err := os.WriteFile(filepath.Join(dir, "ir", n, legacyTrunkName), trunk, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	id := strings.TrimSpace(string(trunk))
+
+	// The interrupted state: the MIDDLE node has been demoted and its
+	// legacy marker retired; the other two still claim the trunk.
+	if err := writeNodeMarker(filepath.Join(dir, "ir", mid), nodeMarker{
+		from: filepath.Base(gp), kind: "conversation", trunk: "",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "ir", mid, legacyTrunkName)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Flatten(dir); err != nil {
+		t.Fatalf("resume with a demoted middle: %v", err)
+	}
+	s, err := OpenStore(dir, testStoreOptions())
+	if err != nil {
+		t.Fatalf("open after the resumed migration: %v", err)
+	}
+	defer s.Close()
+	head, ok := s.HeadNode(id)
+	if !ok {
+		t.Fatalf("trunk %s has no head after the resume", id)
+	}
+	if want := filepath.Base(child); head != want {
+		t.Errorf("head is %q, want the deepest node %q", head, want)
+	}
+	if recs, err := s.RecordsFrom(id, "ir", 0, 0); err != nil || len(recs) == 0 {
+		t.Errorf("the surviving head reads %d records (err %v)", len(recs), err)
+	}
+}

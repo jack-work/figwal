@@ -237,7 +237,8 @@ func planMainMarkers(mainDir string) (map[string]nodeMarker, error) {
 		}
 	}
 	var tangled []string
-	depth := lineageDepths(mainDir, paths)
+	byLeaf := lineageIndex(paths)
+	depth := lineageDepths(mainDir, paths, byLeaf)
 	for trunk, rels := range carriers {
 		if len(rels) < 2 {
 			continue
@@ -249,12 +250,15 @@ func planMainMarkers(mainDir string) (map[string]nodeMarker, error) {
 		// store is refused as tangled by this run and by every one after it.
 		// Lineage is the same relation the check validates.
 		sort.Slice(rels, func(i, j int) bool { return depth[rels[i]] < depth[rels[j]] })
-		if !isLineageChain(mainDir, rels) {
-			// Two nodes claim one trunk without one descending from the
-			// other, so there is no "the newest" to pick. Refused rather
+		if !isLineageChain(mainDir, rels, byLeaf) {
+			// Nodes claim one trunk without lying on one line of
+			// descent, so there is no "the newest" to pick. Refused rather
 			// than guessed: choosing wrong publishes an aria's older half
-			// as its present.
-			tangled = append(tangled, fmt.Sprintf("trunk %q is claimed by %v, which is not one chain", trunk, rels))
+			// as its present. A gap in the line is NOT this case -- that is
+			// an interrupted migration, and isLineageChain follows ancestry
+			// so that it resumes.
+			tangled = append(tangled, fmt.Sprintf(
+				"trunk %q is claimed by %v, and no one of them descends from the others", trunk, rels))
 			continue
 		}
 		for _, rel := range rels[:len(rels)-1] {
@@ -275,15 +279,22 @@ func planMainMarkers(mainDir string) (map[string]nodeMarker, error) {
 	return markers, nil
 }
 
-// lineageDepths counts each main-channel node's ancestors, by the same
-// parent relation the chain check uses -- a node's nesting while it is still
-// nested, its .node once it has moved. Path depth is not a substitute: a
-// half-migrated chain holds both kinds at once.
-func lineageDepths(mainDir string, paths []string) map[string]int {
+// lineageIndex maps every main-channel node's LEAF name to where it
+// currently sits. Both the depth count and the ancestry test walk it, so
+// they agree by construction.
+func lineageIndex(paths []string) map[string]string {
 	byLeaf := make(map[string]string, len(paths))
 	for _, rel := range paths {
 		byLeaf[filepath.Base(rel)] = rel
 	}
+	return byLeaf
+}
+
+// lineageDepths counts each main-channel node's ancestors, by the same
+// parent relation the chain check uses -- a node's nesting while it is still
+// nested, its .node once it has moved. Path depth is not a substitute: a
+// half-migrated chain holds both kinds at once.
+func lineageDepths(mainDir string, paths []string, byLeaf map[string]string) map[string]int {
 	depth := make(map[string]int, len(paths))
 	for _, rel := range paths {
 		cur, d := rel, 0
@@ -302,15 +313,49 @@ func lineageDepths(mainDir string, paths []string) map[string]int {
 	return depth
 }
 
-// isLineageChain reports whether rels, ordered shallowest first, is a single
-// descent: each one's parent is the one before it.
-func isLineageChain(mainDir string, rels []string) bool {
+// isLineageChain reports whether rels, ordered shallowest first, lie on ONE
+// LINE OF DESCENT. Ancestry, not parenthood, and the difference destroyed a
+// store.
+//
+// The migration demotes the middle of a chain as it goes. Killed between two
+// of those writes, the nodes still claiming a trunk are a grandparent and a
+// grandchild -- one descent, with the demoted node between them, and NOT
+// adjacent. Testing immediate parentage called that tangled and refused the
+// store, permanently: every later run made the same judgement, and 340
+// conversations whose bytes were entirely intact could not be opened.
+//
+// A fuzz worker measured the window by node count rather than time: kills at
+// 57 through 441 of 483 main nodes all poisoned the store, ~80% of the main
+// phase. It is not a race, it is the ordinary case.
+func isLineageChain(mainDir string, rels []string, byLeaf map[string]string) bool {
 	for i := 1; i < len(rels); i++ {
-		if mainParentLeaf(mainDir, rels[i]) != filepath.Base(rels[i-1]) {
+		if !isAncestorOf(mainDir, byLeaf, rels[i-1], rels[i]) {
 			return false
 		}
 	}
 	return true
+}
+
+// isAncestorOf walks up from desc looking for anc. Bounded by the node
+// count, for the same reason the depth walk is: a marker cycle is
+// corruption and must not hang the migration.
+func isAncestorOf(mainDir string, byLeaf map[string]string, anc, desc string) bool {
+	want, cur := filepath.Base(anc), desc
+	for range byLeaf {
+		parent := mainParentLeaf(mainDir, cur)
+		if parent == "" {
+			return false
+		}
+		if parent == want {
+			return true
+		}
+		next, ok := byLeaf[parent]
+		if !ok {
+			return false
+		}
+		cur = next
+	}
+	return false
 }
 
 // parentLeaf is the leaf name of a nested path's parent, empty at depth 1.
