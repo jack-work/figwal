@@ -331,3 +331,68 @@ func TestAStoresMainChannelRootAlwaysHoldsASegment(t *testing.T) {
 	t.Fatalf("a fresh store's main channel root holds no segment (%d entries); "+
 		"hasChannelContent's dotfile exception is no longer safe", len(ents))
 }
+
+// The reducer NAME is a registry key, not a property of the records. A real
+// store carries reducer "jsonmerge" while figaro registers the same fold
+// under "chalkboard"; refusing on that difference rejected a store whose
+// records are exactly what the caller expects, and it would have met every
+// existing user on their first run.
+func TestAReducerRenameDoesNotRefuseAStore(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenStore(dir, testStoreOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := s.SpawnUnderRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(string(tr), "ir", 0, []byte(`{"turn":1}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	patch, err := MapSetPatch([]string{"k"}, []byte(`"v"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(string(tr), "chalkboard", 0, patch, nil); err != nil {
+		t.Fatal(err)
+	}
+	before, err := chalkboardState(t, s, string(tr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(before, `"k"`) {
+		t.Fatalf("fixture board is %q; the test cannot show a fold surviving anything", before)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rewrite the manifest the way an older build left it: the same fold,
+	// registered under a different key.
+	m, err := readManifestFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, c := range m.Channels {
+		if c.Name == "chalkboard" {
+			m.Channels[i].Reducer = "jsonmerge"
+		}
+	}
+	if err := writeManifest(dir, m); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := OpenStore(dir, testStoreOptions())
+	if err != nil {
+		t.Fatalf("a store whose reducer is registered under another name must open: %v", err)
+	}
+	defer s2.Close()
+	after, err := chalkboardState(t, s2, string(tr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Errorf("board across the reducer rename: got %q want %q", after, before)
+	}
+}

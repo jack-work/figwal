@@ -789,21 +789,27 @@ func reconcileChannelProps(dir string, cfg Config, man manifest) (manifest, erro
 			man.Channels[i].Opaque = want.Opaque
 			changed = true
 		}
-		// KIND AND REDUCER ARE REFUSED, NOT ADOPTED, and that asymmetry is
-		// the point. Unkeyed and Opaque describe how a record is written,
-		// and mixed records read back correctly. Kind describes what the
-		// records ARE: folding a log's records as if they had been patches
-		// is not a reconciliation, and dropping a fold abandons state
-		// readers depend on. Neither has a converter, so neither is
-		// guessed. Without this, a channel that became a reducer kept
-		// Kind=log forever -- the reducer never ran and StateAt answered
-		// nothing, silently, which is the same class of miss as the two
-		// above.
-		if want.Kind.String() != mc.Kind || want.Reducer != mc.Reducer {
+		// KIND is refused, not adopted, and the asymmetry is the point.
+		// Unkeyed and Opaque describe how a record is WRITTEN, and mixed
+		// records read back correctly. Kind describes what the records
+		// ARE: folding a log's entries as if they had been patches is not
+		// a reconciliation, and dropping a fold abandons state readers
+		// depend on. Neither direction has a converter, so neither is
+		// guessed.
+		//
+		// THE REDUCER NAME IS NOT PART OF THAT, and comparing it was a
+		// near-miss that would have bricked every existing store: a real
+		// store carries reducer "jsonmerge" while this caller registers
+		// the same fold under "chalkboard", so a refusal on the name
+		// rejected a store whose records are exactly what the caller
+		// expects. The name is a REGISTRY KEY, not a property of the
+		// records, and resolveReducer already resolves it three ways --
+		// by name, by channel, then the builtins. It stays the manifest's.
+		if want.Kind.String() != mc.Kind {
 			return man, fmt.Errorf(
-				"xwal: channel %q is %q/%q on disk but the caller declares %q/%q; "+
+				"xwal: channel %q is %q on disk but the caller declares %q; "+
 					"a channel's kind cannot be reinterpreted without a converter",
-				mc.Name, mc.Kind, mc.Reducer, want.Kind.String(), want.Reducer)
+				mc.Name, mc.Kind, want.Kind.String())
 		}
 	}
 	if !changed {

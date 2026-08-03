@@ -49,7 +49,14 @@ func buildNestedFixture(t *testing.T) (dir string, before forestSnapshot) {
 				t.Fatal(err)
 			}
 		}
-		if _, err := s.Append(string(prev), "chalkboard", 0, fmt.Appendf(nil, `{"depth":%d}`, i), nil); err != nil {
+		// A REAL patch: MapReducer folds MapPatch, not a bare object, so a
+		// raw `{"depth":N}` is a no-op and every board assertion built on
+		// one compares "{}" to "{}".
+		patch, perr := MapSetPatch([]string{fmt.Sprintf("depth%d", i)}, []byte(`"set"`))
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		if _, err := s.Append(string(prev), "chalkboard", 0, patch, nil); err != nil {
 			t.Fatal(err)
 		}
 		// INTERIOR of prev's OWN records, so the child nests under prev
@@ -73,6 +80,15 @@ func buildNestedFixture(t *testing.T) (dir string, before forestSnapshot) {
 		t.Fatal(err)
 	}
 	before = snapshotForest(t, s, dir)
+	folded := false
+	for _, b := range before.board {
+		if b != "" && b != "{}" {
+			folded = true
+		}
+	}
+	if !folded {
+		t.Fatal("no aria's board folded to anything: every board assertion in this file would be vacuous")
+	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
