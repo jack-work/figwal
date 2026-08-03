@@ -335,6 +335,14 @@ func open(dir string, cfg Config, store *log.Store, branch ...string) (*XWAL, er
 		}
 		cdir := x.channelDir(mc.Name)
 		// Flat nodes name their parent; nested ones let disk walk "..".
+		//
+		// When openFlatParent returns nil -- no parent, or an ancestor with
+		// no directory and nothing above it -- opts.Parent stays nil and
+		// disk.Open falls back to walking "..", which in the flat layout is
+		// the CHANNEL ROOT. That is correct only because the null root's key
+		// is the empty string, so the root node's log IS the channel
+		// directory. Renaming the root key would sever every depth-1 node,
+		// silently, as fewer records rather than an error.
 		if cfg.ParentOf != nil && len(branch) == 1 {
 			p, perr := x.openFlatParent(mc.Name, cfg.ParentOf(branch[0]), opts, store)
 			if perr != nil {
