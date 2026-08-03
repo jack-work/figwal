@@ -305,3 +305,29 @@ func TestAnEmptyChannelDirectoryStillCreatesAStore(t *testing.T) {
 		t.Fatalf("the created store does not work: %v", err)
 	}
 }
+
+// The claim the dotfile exception rests on: a store this build writes
+// always has a segment in the main channel's root, because that is where
+// the genesis record goes. If that stops being true, the exception stops
+// being safe and hasChannelContent must count any entry at all.
+func TestAStoresMainChannelRootAlwaysHoldsASegment(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenStore(dir, testStoreOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ents, err := os.ReadDir(filepath.Join(dir, "ir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if !strings.HasPrefix(e.Name(), ".") && !e.IsDir() {
+			return // a segment: the guard can never judge this store empty
+		}
+	}
+	t.Fatalf("a fresh store's main channel root holds no segment (%d entries); "+
+		"hasChannelContent's dotfile exception is no longer safe", len(ents))
+}

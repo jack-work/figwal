@@ -816,8 +816,18 @@ func reconcileChannelProps(dir string, cfg Config, man manifest) (manifest, erro
 }
 
 // hasChannelContent reports whether a channel directory holds anything a
-// store would own: a node directory or a segment. Dot-entries do not count
-// -- a stray marker alone is not a store.
+// store would own: a node directory or a segment.
+//
+// Dot-entries do not count, and the exception is safe for ONE reason worth
+// stating rather than inferring: every store this build writes puts the
+// genesis record in the main channel's root, so a real store always has a
+// segment file there and can never be judged empty. A directory holding
+// only dotfiles -- a restore that copied .fork and no segments, a stray
+// .absorb-* from an interrupted Detach -- is debris with no records to
+// lose, and gets a fresh manifest rather than a permanent refusal.
+//
+// If the genesis ever stops being written, this exception stops being safe
+// and the test becomes "any entry at all".
 func hasChannelContent(dir string) bool {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
