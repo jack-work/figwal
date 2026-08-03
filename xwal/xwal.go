@@ -223,7 +223,17 @@ type manifest struct {
 	Main     string            `json:"main"`
 	Codec    string            `json:"codec"`
 	Channels []manifestChannel `json:"channels"`
+	// Layout is the on-disk TOPOLOGY version: 4 is flat, absent (0) is the
+	// nested v3 layout this build cannot read. It is stamped on creation and
+	// by Flatten, and openTrunks refuses anything else. LayoutFrom records
+	// what a migrated store came from, and is what sanctions the migration-era
+	// compatibility in CursorAt.
+	Layout     int `json:"layout,omitempty"`
+	LayoutFrom int `json:"layout_from,omitempty"`
 }
+
+// layoutVersion is the flat layout: every node at depth 1, lineage in .node.
+const layoutVersion = 4
 
 type manifestChannel struct {
 	Name    string `json:"name"`
@@ -428,7 +438,7 @@ func loadOrCreateManifest(dir string, cfg Config) (manifest, error) {
 	if _, err := codecByName(codecName); err != nil {
 		return manifest{}, err
 	}
-	m := manifest{Main: cfg.Main, Codec: codecName}
+	m := manifest{Main: cfg.Main, Codec: codecName, Layout: layoutVersion}
 	seenMain := false
 	seen := map[string]struct{}{}
 	for _, c := range cfg.Channels {

@@ -1835,17 +1835,28 @@ func numSuffix(s string, prefix byte) int {
 	return n
 }
 
+// readManifestFile is the read-only load, for the callers that want one
+// field and must not create anything. loadOrCreateManifest is the writing
+// path; this one is why there are no longer three hand-rolled readers.
+func readManifestFile(dir string) (manifest, error) {
+	data, err := os.ReadFile(filepath.Join(dir, manifestName))
+	if err != nil {
+		return manifest{}, fmt.Errorf("xwal: read manifest: %w", err)
+	}
+	var m manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return manifest{}, fmt.Errorf("xwal: parse manifest: %w", err)
+	}
+	return m, nil
+}
+
 // channelNames reads the manifest and returns every channel's name (each
 // maps directly to a dir under the root: "ir", "chalkboard",
 // "translations/<provider>", …).
 func channelNames(dir string) ([]string, error) {
-	data, err := os.ReadFile(filepath.Join(dir, manifestName))
+	m, err := readManifestFile(dir)
 	if err != nil {
-		return nil, fmt.Errorf("xwal: read manifest: %w", err)
-	}
-	var m manifest
-	if err := json.Unmarshal(data, &m); err != nil {
-		return nil, fmt.Errorf("xwal: parse manifest: %w", err)
+		return nil, err
 	}
 	out := make([]string, 0, len(m.Channels))
 	for _, c := range m.Channels {
@@ -1856,13 +1867,9 @@ func channelNames(dir string) ([]string, error) {
 
 // mainChannelName reads the manifest to find the main channel name.
 func mainChannelName(dir string) (string, error) {
-	data, err := os.ReadFile(filepath.Join(dir, manifestName))
+	m, err := readManifestFile(dir)
 	if err != nil {
-		return "", fmt.Errorf("xwal: read manifest: %w", err)
-	}
-	var m manifest
-	if err := json.Unmarshal(data, &m); err != nil {
-		return "", fmt.Errorf("xwal: parse manifest: %w", err)
+		return "", err
 	}
 	return m.Main, nil
 }
