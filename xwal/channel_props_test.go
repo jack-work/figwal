@@ -1,6 +1,8 @@
 package xwal
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -239,5 +241,48 @@ func TestAChannelsKindIsRefusedRatherThanReinterpreted(t *testing.T) {
 	_, err = OpenStore(dir, testStoreOptions())
 	if err == nil || !strings.Contains(err.Error(), "kind cannot be reinterpreted") {
 		t.Fatalf("reinterpreting a channel's kind: got %v, want a refusal", err)
+	}
+}
+
+// Deleting the manifest from a store that still holds data used to be
+// TOTAL SILENT LOSS, and by the shortest possible route: the failing open
+// wrote a fresh manifest on its way out, stamped with this build's layout.
+// NeedsFlatten then answered no on a NESTED store, the migration never
+// ran, and the next open reported zero arias at exit 0 with every node
+// untouched on disk. The layout gate cannot help when the stamp is written
+// before anything inspects the shape.
+func TestAManifestIsNotInventedForAStoreThatHasData(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenStore(dir, testStoreOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := s.SpawnUnderRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(string(tr), "ir", 0, []byte(`{"turn":1}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, manifestName)); err != nil {
+		t.Fatal(err)
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		_, err := OpenStore(dir, testStoreOptions())
+		if err == nil {
+			t.Fatalf("open %d succeeded on a store with no manifest", attempt)
+		}
+		if !strings.Contains(err.Error(), "refusing to invent") {
+			t.Fatalf("open %d: %v", attempt, err)
+		}
+		// And it must not have written one, or the SECOND open would take
+		// the fresh-store path and report an empty forest.
+		if _, statErr := os.Stat(filepath.Join(dir, manifestName)); !os.IsNotExist(statErr) {
+			t.Fatalf("open %d wrote a manifest while refusing (err %v)", attempt, statErr)
+		}
 	}
 }

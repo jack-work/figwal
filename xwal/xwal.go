@@ -458,6 +458,25 @@ func loadOrCreateManifest(dir string, cfg Config) (manifest, error) {
 	if cfg.Main == "" || len(cfg.Channels) == 0 {
 		return manifest{}, fmt.Errorf("xwal: no manifest at %s and no Config to create one", dir)
 	}
+	// REFUSE TO INVENT A MANIFEST FOR A STORE THAT ALREADY EXISTS. The
+	// manifest is the only record of which channels a store has and what
+	// they are; writing a fresh one over live data silently drops every
+	// channel the caller does not currently declare, and stamps the store
+	// as this build's layout without anything having looked at its shape.
+	//
+	// A fuzz worker turned that into total, silent loss: delete xwal.json
+	// from a NESTED store and the failing open still wrote a manifest
+	// stamped layout=4, so NeedsFlatten then answered no, the migration
+	// never ran, and the next open reported ZERO arias at exit 0 -- with
+	// 430 nodes untouched on disk. That is exactly what the layout gate
+	// exists to prevent, defeated by the stamp being written first.
+	if pathExists(filepath.Join(dir, cfg.Main)) {
+		return manifest{}, fmt.Errorf(
+			"xwal: %s holds a %q channel but no %s; refusing to invent one, because a fresh "+
+				"manifest would drop every channel not currently declared and claim a layout "+
+				"nothing has verified",
+			dir, cfg.Main, manifestName)
+	}
 	codecName := cfg.Codec
 	if codecName == "" {
 		codecName = "jsonl"
