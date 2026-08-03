@@ -765,6 +765,22 @@ func reconcileChannelProps(dir string, cfg Config, man manifest) (manifest, erro
 			man.Channels[i].Opaque = want.Opaque
 			changed = true
 		}
+		// KIND AND REDUCER ARE REFUSED, NOT ADOPTED, and that asymmetry is
+		// the point. Unkeyed and Opaque describe how a record is written,
+		// and mixed records read back correctly. Kind describes what the
+		// records ARE: folding a log's records as if they had been patches
+		// is not a reconciliation, and dropping a fold abandons state
+		// readers depend on. Neither has a converter, so neither is
+		// guessed. Without this, a channel that became a reducer kept
+		// Kind=log forever -- the reducer never ran and StateAt answered
+		// nothing, silently, which is the same class of miss as the two
+		// above.
+		if want.Kind.String() != mc.Kind || want.Reducer != mc.Reducer {
+			return man, fmt.Errorf(
+				"xwal: channel %q is %q/%q on disk but the caller declares %q/%q; "+
+					"a channel's kind cannot be reinterpreted without a converter",
+				mc.Name, mc.Kind, mc.Reducer, want.Kind.String(), want.Reducer)
+		}
 	}
 	if !changed {
 		return man, nil

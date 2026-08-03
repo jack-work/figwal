@@ -202,3 +202,42 @@ func TestOpaqueReconcilesAndMixedRecordsStillRead(t *testing.T) {
 		}
 	}
 }
+
+// Kind and Reducer drift the same way as Unkeyed and Opaque, and are the
+// one case that must REFUSE rather than adopt: folding records that were
+// never patches is not a reconciliation, and dropping a fold abandons
+// state readers depend on. Neither has a converter.
+func TestAChannelsKindIsRefusedRatherThanReinterpreted(t *testing.T) {
+	dir := t.TempDir()
+	plain := testStoreOptions()
+	delete(plain.Reducers, "chalkboard") // born a plain log
+	s, err := OpenStore(dir, plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := s.SpawnUnderRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(string(tr), "ir", 0, []byte(`{"turn":1}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(string(tr), "chalkboard", 1, []byte(`{"not":"a patch"}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if m, err := readManifestFile(dir); err != nil {
+		t.Fatal(err)
+	} else if chanSpec(m, "chalkboard").Kind != "log" {
+		t.Fatalf("fixture channel is %q, want log", chanSpec(m, "chalkboard").Kind)
+	}
+
+	// Now the caller calls it reducible. Silently adopting that would run
+	// a fold over records that were never patches.
+	_, err = OpenStore(dir, testStoreOptions())
+	if err == nil || !strings.Contains(err.Error(), "kind cannot be reinterpreted") {
+		t.Fatalf("reinterpreting a channel's kind: got %v, want a refusal", err)
+	}
+}

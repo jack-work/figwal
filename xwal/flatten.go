@@ -341,7 +341,7 @@ func isLineageChain(mainDir string, rels []string, byLeaf map[string]string) boo
 // corruption and must not hang the migration.
 func isAncestorOf(mainDir string, byLeaf map[string]string, anc, desc string) bool {
 	want, cur := filepath.Base(anc), desc
-	for range byLeaf {
+	for i := 0; i < len(byLeaf); i++ {
 		parent := mainParentLeaf(mainDir, cur)
 		if parent == "" {
 			return false
