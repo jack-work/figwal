@@ -716,6 +716,65 @@ func channelFromManifest(cfg Config, mc manifestChannel) (*channel, error) {
 // between the manifest write and the backfill with no sentinel left behind.
 // A partial backfill is the sentinel's job, so the root dir is the whole
 // test — no forest walk.
+// reconcileChannelProps brings an existing manifest's per-channel
+// properties up to what the caller now declares. The manifest is
+// authoritative for a store that exists, and materializeManifestChannels
+// only ever added MISSING directories -- so a property introduced after a
+// store was created never reached it.
+//
+// That was not a theoretical gap. The chalkboard became UNKEYED and no
+// store anyone already had adopted it: the whole design (append without
+// reading the timeline, no lock, a `set` that lands mid-turn) applied to
+// stores created by the new build and to nothing else, silently. A fuzz
+// worker found it from outside as a `set` the parent kept and a tail
+// fork's child never saw, and as a `set` that a SIGKILL lost although its
+// bytes were already on disk -- crash recovery trims a related record
+// keyed ahead of the durable main tail, and a keyed board patch written
+// between turns is exactly that.
+//
+// KEYED -> UNKEYED ONLY. The reverse is refused: records already written
+// carry no main LT, and reading them as keyed reads every one as key 0.
+// There is no converter that could invent a key.
+//
+// OPAQUE DRIFTS IN BOTH DIRECTIONS, and safely, because the decoder keys
+// off the FRAME and not off the channel: frameObj.payload() base64-decodes
+// when the record has a p64 field and does not when it has p. A channel
+// that changes its mind therefore reads back mixed records correctly.
+func reconcileChannelProps(dir string, cfg Config, man manifest) (manifest, error) {
+	declared := make(map[string]ChannelSpec, len(cfg.Channels))
+	for _, c := range cfg.Channels {
+		declared[c.Name] = c
+	}
+	changed := false
+	for i, mc := range man.Channels {
+		want, ok := declared[mc.Name]
+		if !ok {
+			continue // the caller says nothing about this channel
+		}
+		if want.Unkeyed && !mc.Unkeyed {
+			man.Channels[i].Unkeyed = true
+			changed = true
+		}
+		if mc.Unkeyed && !want.Unkeyed {
+			return man, fmt.Errorf(
+				"xwal: channel %q is unkeyed on disk but the caller declares it keyed; "+
+					"its records carry no main LT and there is no converter that could invent one",
+				mc.Name)
+		}
+		if want.Opaque != mc.Opaque {
+			man.Channels[i].Opaque = want.Opaque
+			changed = true
+		}
+	}
+	if !changed {
+		return man, nil
+	}
+	if err := writeManifest(dir, man); err != nil {
+		return man, err
+	}
+	return man, nil
+}
+
 func materializeManifestChannels(root string, cfg Config, man manifest) (manifest, error) {
 	for _, mc := range man.Channels {
 		if mc.Name == man.Main || pathExists(filepath.Join(root, mc.Name)) {

@@ -392,26 +392,29 @@ func (o StoreOptions) config() Config {
 	opaque, unkeyed := nameSet(o.Opaque), nameSet(o.Unkeyed)
 	seen := map[string]bool{o.Main: true}
 	cfg.Channels = append(cfg.Channels, ChannelSpec{Name: o.Main, Opaque: opaque[o.Main]})
-	reducible := make([]string, 0, len(o.Reducers))
+	// The UNION of every name the options mention, once. Three loops over
+	// three name sets is how a channel named ONLY in Unkeyed came to be
+	// declared nowhere: it is not a reducer and not opaque, so it fell
+	// through both, and reconciliation could not see it to fix an existing
+	// store. This is the third time a per-channel property has been lost in
+	// a copy of the same loop; the next one lands here alone.
+	names := make([]string, 0, len(o.Reducers)+len(o.Opaque)+len(o.Unkeyed))
 	for name := range o.Reducers {
-		reducible = append(reducible, name)
+		names = append(names, name)
 	}
-	sort.Strings(reducible)
-	for _, name := range reducible {
+	names = append(names, o.Opaque...)
+	names = append(names, o.Unkeyed...)
+	sort.Strings(names)
+	for _, name := range names {
 		if seen[name] {
 			continue
 		}
 		seen[name] = true
-		cfg.Channels = append(cfg.Channels, ChannelSpec{
-			Name: name, Kind: ChannelReducible, Reducer: name, Opaque: opaque[name], Unkeyed: unkeyed[name],
-		})
-	}
-	for _, name := range o.Opaque {
-		if seen[name] {
-			continue
+		spec := ChannelSpec{Name: name, Opaque: opaque[name], Unkeyed: unkeyed[name]}
+		if _, ok := o.Reducers[name]; ok {
+			spec.Kind, spec.Reducer = ChannelReducible, name
 		}
-		seen[name] = true
-		cfg.Channels = append(cfg.Channels, ChannelSpec{Name: name, Opaque: true, Unkeyed: unkeyed[name]})
+		cfg.Channels = append(cfg.Channels, spec)
 	}
 	return cfg
 }

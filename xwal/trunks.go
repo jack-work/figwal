@@ -210,7 +210,7 @@ func openTrunks(dir string, cfg Config) (*Trunks, error) {
 	if err != nil {
 		return nil, err
 	}
-	if man, err = reconcileUnkeyed(dir, cfg, man); err != nil {
+	if man, err = reconcileChannelProps(dir, cfg, man); err != nil {
 		return nil, err
 	}
 	if man, err = materializeManifestChannels(dir, cfg, man); err != nil {

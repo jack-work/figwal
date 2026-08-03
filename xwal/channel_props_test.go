@@ -109,3 +109,96 @@ func chanSpec(m manifest, name string) manifestChannel {
 	}
 	return manifestChannel{}
 }
+
+// A channel named ONLY in Unkeyed -- not a reducer, not opaque -- was
+// declared in no ChannelSpec at all, so reconciliation could not see it and
+// an existing store kept it keyed forever. The new-store path hid it:
+// autoCreateChannel reads the options directly.
+func TestAnUnkeyedOnlyChannelIsDeclaredAndReconciled(t *testing.T) {
+	dir := t.TempDir()
+	old := testStoreOptions()
+	s, err := OpenStore(dir, old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := s.SpawnUnderRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(string(tr), "ir", 0, []byte(`{"turn":1}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	// A plain log channel, born keyed because nothing said otherwise.
+	if _, err := s.Append(string(tr), "notes", 1, []byte(`{"n":1}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	now := testStoreOptions()
+	now.Unkeyed = []string{"notes"} // neither a reducer nor opaque
+	s2, err := OpenStore(dir, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	m, err := readManifestFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !chanSpec(m, "notes").Unkeyed {
+		t.Error("an unkeyed-only channel stayed keyed on disk: it was declared nowhere")
+	}
+}
+
+// Opaque drifts too, and safely: the decoder keys off the frame, so a
+// channel that changes its mind reads back mixed records correctly.
+func TestOpaqueReconcilesAndMixedRecordsStillRead(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenStore(dir, testStoreOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := s.SpawnUnderRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(string(tr), "ir", 0, []byte(`{"turn":1}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(string(tr), "notes", 1, []byte(`{"plain":1}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	now := testStoreOptions()
+	now.Opaque = []string{"notes"}
+	s2, err := OpenStore(dir, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if m, err := readManifestFile(dir); err != nil {
+		t.Fatal(err)
+	} else if !chanSpec(m, "notes").Opaque {
+		t.Fatal("the channel did not become opaque on disk")
+	}
+	if _, err := s2.Append(string(tr), "notes", 1, []byte(`{"encoded":1}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	recs, err := s2.RecordsFrom(string(tr), "notes", 0, 0)
+	if err != nil {
+		t.Fatalf("reading a channel with records from both sides of the flip: %v", err)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("read %d records, want 2", len(recs))
+	}
+	for _, r := range recs {
+		if !strings.Contains(string(r.Payload), `1}`) {
+			t.Errorf("record decoded wrong across the flip: %q", r.Payload)
+		}
+	}
+}
