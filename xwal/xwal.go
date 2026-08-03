@@ -470,9 +470,14 @@ func loadOrCreateManifest(dir string, cfg Config) (manifest, error) {
 	// never ran, and the next open reported ZERO arias at exit 0 -- with
 	// 430 nodes untouched on disk. That is exactly what the layout gate
 	// exists to prevent, defeated by the stamp being written first.
-	if pathExists(filepath.Join(dir, cfg.Main)) {
+	// EMPTINESS, not existence. A bare directory -- a botched copy, an
+	// interrupted restore, a caller that mkdir'd ahead -- holds no nodes,
+	// no segments, no channels to drop and no layout to misjudge, so it
+	// goes to the create path. Refusing it would brick a store that has
+	// nothing in it, with a message about data that is not there.
+	if hasChannelContent(filepath.Join(dir, cfg.Main)) {
 		return manifest{}, fmt.Errorf(
-			"xwal: %s holds a %q channel but no %s; refusing to invent one, because a fresh "+
+			"xwal: %s holds data in %q but no %s; refusing to invent one, because a fresh "+
 				"manifest would drop every channel not currently declared and claim a layout "+
 				"nothing has verified",
 			dir, cfg.Main, manifestName)
@@ -808,6 +813,22 @@ func reconcileChannelProps(dir string, cfg Config, man manifest) (manifest, erro
 		return man, err
 	}
 	return man, nil
+}
+
+// hasChannelContent reports whether a channel directory holds anything a
+// store would own: a node directory or a segment. Dot-entries do not count
+// -- a stray marker alone is not a store.
+func hasChannelContent(dir string) bool {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range ents {
+		if !strings.HasPrefix(e.Name(), ".") {
+			return true
+		}
+	}
+	return false
 }
 
 func materializeManifestChannels(root string, cfg Config, man manifest) (manifest, error) {

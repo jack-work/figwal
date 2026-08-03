@@ -286,3 +286,22 @@ func TestAManifestIsNotInventedForAStoreThatHasData(t *testing.T) {
 		}
 	}
 }
+
+// The refusal above must test EMPTINESS, not existence. A bare main
+// directory -- a botched copy, an interrupted restore, a caller that
+// mkdir'd ahead -- has nothing to protect, and refusing it bricks a store
+// that holds nothing while claiming the user's data is at stake.
+func TestAnEmptyChannelDirectoryStillCreatesAStore(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "ir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := OpenStore(dir, testStoreOptions())
+	if err != nil {
+		t.Fatalf("an empty %q directory must not block creation: %v", "ir", err)
+	}
+	defer s.Close()
+	if _, err := s.SpawnUnderRoot(); err != nil {
+		t.Fatalf("the created store does not work: %v", err)
+	}
+}
