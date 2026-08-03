@@ -198,7 +198,11 @@ func openTrunks(dir string, cfg Config) (*Trunks, error) {
 	// conversations, because RebuildFrom reads ONE directory and a v3 node
 	// has no .node. There is no third path: either the store is the layout
 	// this build writes, or it is refused, and Flatten is the way through.
-	if man.Layout != layoutVersion {
+	switch {
+	case man.Layout > layoutVersion:
+		return nil, fmt.Errorf("%w: store %s is layout %d, this build reads %d",
+			ErrFutureLayout, dir, man.Layout, layoutVersion)
+	case man.Layout < layoutVersion:
 		return nil, fmt.Errorf("%w: store %s is layout %d, this build writes %d",
 			ErrLegacyLayout, dir, man.Layout, layoutVersion)
 	}

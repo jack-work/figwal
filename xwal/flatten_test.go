@@ -2,6 +2,7 @@ package xwal
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -559,9 +560,9 @@ func TestFlattenStampsTheLayoutOnlyWhenItFinishes(t *testing.T) {
 	if m, err = readManifestFile(dir); err != nil {
 		t.Fatal(err)
 	}
-	if m.Layout != layoutVersion || m.LayoutFrom != legacyLayoutVersion {
-		t.Errorf("stamp after migration: layout %d from %d, want %d from %d",
-			m.Layout, m.LayoutFrom, layoutVersion, legacyLayoutVersion)
+	if m.Layout != layoutVersion || !m.UnstampedRecords {
+		t.Errorf("stamp after migration: layout %d unstamped_records %v, want %d and true",
+			m.Layout, m.UnstampedRecords, layoutVersion)
 	}
 	// A store created by this build is v4 outright, and has no migration
 	// provenance to sanction anything with.
@@ -574,8 +575,11 @@ func TestFlattenStampsTheLayoutOnlyWhenItFinishes(t *testing.T) {
 	if m, err = readManifestFile(fresh); err != nil {
 		t.Fatal(err)
 	}
-	if m.Layout != layoutVersion || m.LayoutFrom != 0 {
-		t.Errorf("fresh store: layout %d from %d, want %d from 0", m.Layout, m.LayoutFrom, layoutVersion)
+	// A store this build created has no pre-stamp records, so it must NOT
+	// carry the flag that sanctions reading as if it did.
+	if m.Layout != layoutVersion || m.UnstampedRecords {
+		t.Errorf("fresh store: layout %d unstamped_records %v, want %d and false",
+			m.Layout, m.UnstampedRecords, layoutVersion)
 	}
 }
 
@@ -679,5 +683,179 @@ func TestFlattenLeavesOneHeadPerTrunkChain(t *testing.T) {
 	}
 	if len(recs) == 0 {
 		t.Error("the surviving head reads nothing")
+	}
+}
+
+// An interrupted run leaves a chain MIXED: the deep node has moved to depth
+// 1 while its ancestor is still nested. Ranking those by PATH depth puts the
+// moved head first, the chain check then compares the wrong pair, and the
+// store is refused as tangled -- by that run and by every one after it. The
+// real store has 44 chains, so it is 44 chances per migration.
+func TestFlattenResumesAChainInterruptedMidMove(t *testing.T) {
+	dir, before := buildNestedFixture(t)
+	paths, err := nodePaths(filepath.Join(dir, "ir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parent, child string
+	for _, p := range paths {
+		for _, q := range paths {
+			if filepath.Dir(q) == p && pathDepth(p) >= 2 {
+				parent, child = p, q
+			}
+		}
+	}
+	if child == "" {
+		t.Fatal("fixture has no nested parent/child pair")
+	}
+	shared, err := os.ReadFile(filepath.Join(dir, "ir", parent, legacyTrunkName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ir", child, legacyTrunkName), shared, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	trunk := strings.TrimSpace(string(shared))
+
+	// Interrupt exactly where it hurts: the head is migrated and moved, its
+	// ancestor is untouched and still nested under its own parent.
+	head := filepath.Base(child)
+	if err := writeNodeMarker(filepath.Join(dir, "ir", child), nodeMarker{
+		from: filepath.Base(parent), kind: "conversation", trunk: trunk,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "ir", child, legacyTrunkName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "ir", child), filepath.Join(dir, "ir", head)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Flatten(dir); err != nil {
+		t.Fatalf("resume a chain interrupted mid-move: %v", err)
+	}
+	s, err := OpenStore(dir, testStoreOptions())
+	if err != nil {
+		t.Fatalf("open after the resumed chain migration: %v", err)
+	}
+	defer s.Close()
+	if got, ok := s.HeadNode(trunk); !ok || got != head {
+		t.Errorf("head after resume is %q (ok %v), want the deepest node %q", got, ok, head)
+	}
+	if len(s.List()) != len(before.trunks)-1 { // the chain absorbed one trunk id
+		t.Errorf("trunks after resume: %d, want %d", len(s.List()), len(before.trunks)-1)
+	}
+}
+
+func TestOpenRefusesAStoreFromANewerBuild(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenStore(dir, testStoreOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err := readManifestFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Layout = layoutVersion + 1
+	if err := writeManifest(dir, m); err != nil {
+		t.Fatal(err)
+	}
+	// A migration cannot help a store from the future, and must not be
+	// offered: Flatten would walk it and stamp it BACK to this layout.
+	if need, err := NeedsFlatten(dir); err != nil || need {
+		t.Errorf("NeedsFlatten on a newer store: %v (err %v), want false", need, err)
+	}
+	if _, err := OpenStore(dir, testStoreOptions()); !errors.Is(err, ErrFutureLayout) {
+		t.Errorf("open of a newer store: got %v, want ErrFutureLayout", err)
+	}
+}
+
+// The cursor fallback is migration-era, and the flag is its gate. A channel
+// born AFTER a main record leaves that record with no stamp for it, and on a
+// store this build wrote the fallback then answers with the channel's whole
+// TAIL -- unkeyed records carry main LT 0, so every one of them reads as
+// "at or below" any main LT. A fork there would inherit records written
+// after it branched.
+func TestCursorFallbackIsUnreachableOnAStoreThisBuildCreated(t *testing.T) {
+	dir := t.TempDir()
+	opts := testStoreOptions()
+	opts.Unkeyed = []string{"notes"}
+	s, err := OpenStore(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	trunk, err := s.SpawnUnderRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := s.Append(string(trunk), "ir", 0, fmt.Appendf(nil, `{"i":%d}`, i), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The channel is born AFTER those records, so none of them stamps it.
+	for i := 0; i < 2; i++ {
+		if _, err := s.Append(string(trunk), "notes", 0, fmt.Appendf(nil, `{"n":%d}`, i), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	x, err := s.Trunks.Head(string(trunk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer x.Close()
+	// The premise, checked rather than assumed: the channel really is
+	// unkeyed, so its records carry no main LT and the fallback has
+	// something wrong to say.
+	if lt, ok, err := x.chans["notes"].lookupAtOrBelow(1); err != nil || !ok || lt == 0 {
+		t.Fatalf("the fallback would answer %d (ok %v, err %v); this test cannot fail unless it answers something", lt, ok, err)
+	}
+	for _, at := range []uint64{1, 2} {
+		cur, err := x.CursorAt(at, "notes")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cur != 0 {
+			t.Errorf("cursor at main %d is %d; the channel did not exist yet, so it must be 0", at, cur)
+		}
+	}
+}
+
+// And it IS reachable on a migrated one, which is the whole reason the
+// fallback survives: those stores have related records still carrying the
+// main LT they were keyed by.
+func TestCursorFallbackServesAMigratedStore(t *testing.T) {
+	dir, _ := buildNestedFixture(t)
+	if _, err := Flatten(dir); err != nil {
+		t.Fatal(err)
+	}
+	s, err := OpenStore(dir, testStoreOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	found := false
+	for _, ti := range s.List() {
+		x, err := s.Trunks.Head(ti.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cur, err := x.CursorAt(mainTail(x), "chalkboard")
+		x.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cur > 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("no trunk resolved a chalkboard cursor: the migration-era fallback is not running")
 	}
 }

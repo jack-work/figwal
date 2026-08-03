@@ -205,11 +205,18 @@ func planMainMarkers(mainDir string) (map[string]nodeMarker, error) {
 		}
 	}
 	var tangled []string
+	depth := lineageDepths(mainDir, paths)
 	for trunk, rels := range carriers {
 		if len(rels) < 2 {
 			continue
 		}
-		sort.Slice(rels, func(i, j int) bool { return pathDepth(rels[i]) < pathDepth(rels[j]) })
+		// Rank by LINEAGE depth, not by path depth. An interrupted run
+		// leaves a chain MIXED -- the deep node already moved to depth 1
+		// while its ancestor is still nested -- and by path depth the moved
+		// head sorts FIRST, the chain check compares the wrong pair, and the
+		// store is refused as tangled by this run and by every one after it.
+		// Lineage is the same relation the check validates.
+		sort.Slice(rels, func(i, j int) bool { return depth[rels[i]] < depth[rels[j]] })
 		if !isLineageChain(mainDir, rels) {
 			// Two nodes claim one trunk without one descending from the
 			// other, so there is no "the newest" to pick. Refused rather
@@ -234,6 +241,33 @@ func planMainMarkers(mainDir string) (map[string]nodeMarker, error) {
 		return nil, fmt.Errorf("xwal: cannot flatten %s:\n  %s", mainDir, strings.Join(tangled, "\n  "))
 	}
 	return markers, nil
+}
+
+// lineageDepths counts each main-channel node's ancestors, by the same
+// parent relation the chain check uses -- a node's nesting while it is still
+// nested, its .node once it has moved. Path depth is not a substitute: a
+// half-migrated chain holds both kinds at once.
+func lineageDepths(mainDir string, paths []string) map[string]int {
+	byLeaf := make(map[string]string, len(paths))
+	for _, rel := range paths {
+		byLeaf[filepath.Base(rel)] = rel
+	}
+	depth := make(map[string]int, len(paths))
+	for _, rel := range paths {
+		cur, d := rel, 0
+		// Bounded by the node count: a marker cycle is corruption, and a
+		// migration must refuse to hang on one.
+		for range paths {
+			next, ok := byLeaf[mainParentLeaf(mainDir, cur)]
+			if !ok {
+				break
+			}
+			d++
+			cur = next
+		}
+		depth[rel] = d
+	}
+	return depth
 }
 
 // isLineageChain reports whether rels, ordered shallowest first, is a single
@@ -292,7 +326,9 @@ func readLegacyPair(dir string) (n nodeMarker, ok bool) {
 
 // NeedsFlatten reports whether a store must be migrated before it can be
 // opened. It reads one file, so it is cheap enough for every open. A
-// directory with no manifest is not a store yet and needs nothing.
+// directory with no manifest is not a store yet and needs nothing, and a
+// store from a NEWER build needs no migration either -- it needs a newer
+// binary, and the open says so.
 func NeedsFlatten(root string) (bool, error) {
 	m, err := readManifestFile(root)
 	if err != nil {
@@ -301,16 +337,22 @@ func NeedsFlatten(root string) (bool, error) {
 		}
 		return false, err
 	}
-	return m.Layout != layoutVersion, nil
+	return m.Layout < layoutVersion, nil
 }
 
 // errNoForkBase reports a node directory with neither a .fork marker nor a
 // segment at index 1. A missing .fork means "owns its log from 1" to this
-// build (validForkNode, ensureBackfillFork), which the move preserves. With
-// no segment at 1 the base is not that: it would be derived at open from the
-// node's parent, and after flattening that parent is the channel root rather
-// than the node it was nested under. Refused, because a silently rebased
-// channel looks like data loss months later.
+// build (validForkNode, ensureBackfillFork), which the move preserves; with
+// no segment at 1 the base would be derived at open from the node's parent,
+// and after flattening that parent is the channel root rather than the node
+// it was nested under.
+//
+// THIS GUARD IS WHAT MAKES A FLAT CHAIN READ. After the move an ancestor is
+// reached by opening its log explicitly, and it delegates further up only
+// because it carries a base. A nested container directory that held a child
+// and no records of its own would flatten into an empty log claiming to own
+// its numbering from 1, and would cut the head off from everything above
+// it. Refused instead, because that reads as data loss months later.
 type errNoForkBase struct{ ch, rel string }
 
 func (e *errNoForkBase) Error() string {
@@ -364,11 +406,6 @@ func plannedMarker(chanDir, rel string) (m nodeMarker, need bool, err error) {
 	return m, true, nil
 }
 
-// legacyLayoutVersion is the nested layout Flatten migrates FROM. A store
-// that has been through it records it, and that record is the only thing
-// that sanctions the migration-era cursor fallback in CursorAt.
-const legacyLayoutVersion = 3
-
 // FlattenReport is what Apply did, in counts. Counts rather than durations:
 // this runs once, on stores that differ by two orders of magnitude in size
 // and on filesystems 60x apart in per-file cost.
@@ -416,8 +453,27 @@ func (p *FlattenPlan) apply() (FlattenReport, error) {
 	rep := FlattenReport{Nodes: p.Nodes}
 	for _, cp := range p.Channels {
 		dir := filepath.Join(p.Root, cp.Name)
+		// A rename is durable when BOTH directories it touches are synced.
+		// The channel root is synced once at the end; every SOURCE parent
+		// has to be synced too, or a crash can leave a node visible at its
+		// old path AND its new one -- and the resumed run then sees two
+		// directories flattening to one leaf and refuses on collision.
+		touched := map[string]bool{}
+		syncTouched := func(d string) error {
+			if !touched[d] {
+				return nil
+			}
+			delete(touched, d)
+			return disk.SyncDir(d)
+		}
 		for _, n := range cp.Nodes {
 			src := filepath.Join(dir, n.Rel)
+			// Deepest first, so by the time a directory moves, everything
+			// that left it already has. Sync it before it goes: after the
+			// rename its old path is gone and cannot be opened.
+			if err := syncTouched(src); err != nil {
+				return rep, err
+			}
 			if n.Marker != nil {
 				if err := writeNodeMarker(src, *n.Marker); err != nil {
 					return rep, err
@@ -439,7 +495,13 @@ func (p *FlattenPlan) apply() (FlattenReport, error) {
 			if err := os.Rename(src, filepath.Join(dir, n.Flat)); err != nil {
 				return rep, fmt.Errorf("xwal: flatten %s/%s: %w", cp.Name, n.Rel, err)
 			}
+			touched[filepath.Dir(src)] = true
 			rep.Moved++
+		}
+		for d := range touched {
+			if err := disk.SyncDir(d); err != nil {
+				return rep, err
+			}
 		}
 		if err := disk.SyncDir(dir); err != nil {
 			return rep, err
@@ -454,7 +516,11 @@ func (p *FlattenPlan) apply() (FlattenReport, error) {
 		return rep, err
 	}
 	if m.Layout != layoutVersion {
-		m.LayoutFrom, m.Layout = legacyLayoutVersion, layoutVersion
+		// Every store this runs on predates the cursor stamp, whether or not
+		// it was ever nested: the stamp and this layout shipped together.
+		// That, and not "it came from v3", is what the flag records -- an
+		// already-flat store gets it too, and truthfully.
+		m.UnstampedRecords, m.Layout = true, layoutVersion
 		if err := writeManifest(p.Root, m); err != nil {
 			return rep, err
 		}
