@@ -113,6 +113,13 @@ var topologyWaitTimeout = 3 * time.Second
 // live head (never existed, removed, or relabeled away by Promote).
 var ErrUnknownTrunk = errors.New("xwal: unknown trunk")
 
+// ErrUnknownStump reports a stump name that is not a depth-1 stump node.
+var ErrUnknownStump = errors.New("xwal: unknown stump")
+
+// ErrStumpHasChildren reports a stump still hosting trunks. Removing it would
+// strand them: their history begins in its birth record.
+var ErrStumpHasChildren = errors.New("xwal: stump still has children")
+
 // NodeID and TrunkID are string ids (a node id is a branch dir name; a
 // trunk id is "t<N>").
 type (
@@ -1476,6 +1483,49 @@ func (t *Trunks) CreateStump(name string) error {
 		return fmt.Errorf("xwal: create-stump %q: %w", name, err)
 	}
 	return nil
+}
+
+// RemoveStump deletes a childless stump.
+//
+// A stump is the cauterization boundary: its birth record is the shared prefix
+// every trunk beneath it reads through, so it is removable only once nothing
+// is beneath it. That is a MECHANISM, not a policy — this refuses a stump with
+// children rather than removing them, and it never decides on its own that an
+// empty stump is garbage. Callers that mint stumps by content hash (figaro
+// names them <outfit>@<hash>) collect them on their own delete path.
+//
+// Refusing rather than no-op'ing on a surviving child is deliberate: a caller
+// checks Stumps() first, so arriving here with children means the two raced,
+// and a silent success would hide it.
+func (t *Trunks) RemoveStump(name string) error {
+	endMutation, err := t.beginTopologyMutation()
+	if err != nil {
+		return err
+	}
+	defer endMutation()
+	if err := t.ensureNoOpenHeads(); err != nil {
+		return err
+	}
+	t.retireRootHotPreservingValidation()
+
+	n := t.node(name)
+	if n == nil || n.Kind != "loadout" {
+		return fmt.Errorf("%w %q", ErrUnknownStump, name)
+	}
+	if kids := t.idx.ChildrenOf(name); len(kids) > 0 {
+		return fmt.Errorf("%w: %q has %d", ErrStumpHasChildren, name, len(kids))
+	}
+
+	names, err := channelNames(t.root)
+	if err != nil {
+		return err
+	}
+	for _, ch := range names {
+		if err := os.RemoveAll(filepath.Join(t.root, ch, name)); err != nil {
+			return err
+		}
+	}
+	return t.rebuild()
 }
 
 // StumpHead opens a stump's branch for appending its birth content (IR +

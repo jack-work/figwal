@@ -237,6 +237,21 @@ func (s *Store) Remove(trunk string, recursive bool) error {
 	return err
 }
 
+// RemoveStump deletes a childless stump. See Trunks.RemoveStump: it refuses
+// while any trunk is still beneath it.
+//
+// The pending flush is drained first for the same reason Remove drains it: a
+// buffered record for a lineage whose directory is about to vanish would be
+// written back by the flusher into a tree that no longer has a home for it.
+func (s *Store) RemoveStump(name string) error {
+	s.syncDirty()
+	if err := s.Trunks.RemoveStump(name); err != nil {
+		return err
+	}
+	s.purgeVanished()
+	return nil
+}
+
 // Clear wipes a channel's own data for a trunk's lineage and reseeds it
 // empty, atomically with the flusher: pending buffers for the channel
 // are drained and every hot handle is retired under the topology lock
