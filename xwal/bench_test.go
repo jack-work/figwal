@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
-	"sync/atomic"
 	"testing"
 
 	"github.com/jack-work/figwal/disk"
@@ -298,30 +297,66 @@ func BenchmarkTrunksLongAria(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
+			// THE FIXTURE MUTATES UNDER THE APPEND SUBBENCHES: every append
+			// grows the tail the next append pays for, so under the
+			// framework's b.N escalation per-op cost becomes a function of
+			// b.N itself (the brief's mistake #4: history length IS b.N —
+			// observed at 584µs/op with b.N driven to 10^6, ten minutes per
+			// output line). The scratch trunk is re-forked every
+			// rebuildEvery appends with the timer stopped, pinning the tail
+			// within [size, size+rebuildEvery] regardless of benchtime, so
+			// the SLOPE comes from the 1k/10k/50k sizes and never from N.
+			const rebuildEvery = 256
 			b.Run("Append", func(b *testing.B) {
 				b.ReportAllocs()
+				scratch := other
+				var err error
 				for i := 0; i < b.N; i++ {
-					if _, _, err := trunks.Append(trunk, 0, []byte(`{"kind":"event"}`), nil); err != nil {
+					if i%rebuildEvery == 0 && i > 0 {
+						b.StopTimer()
+						scratch, err = trunks.ForkTail(trunk)
+						if err != nil {
+							b.Fatal(err)
+						}
+						b.StartTimer()
+					}
+					if _, _, err := trunks.Append(scratch, 0, []byte(`{"kind":"event"}`), nil); err != nil {
 						b.Fatal(err)
 					}
 				}
 			})
 
+			// Interleaved appends across two lineages — the cross-trunk
+			// overhead relative to the single-trunk Append above. (This
+			// was RunParallel once, but parallel goroutines cannot pause
+			// the timer to re-pin their fixture, and unpinned fixtures are
+			// the exact b.N trap this rewrite removes; contention wants a
+			// dedicated, fixture-stable benchmark if it wants measuring.)
 			b.Run("AppendTwoTrunks", func(b *testing.B) {
-				var next atomic.Uint64
-				b.ReportAllocs()
-				b.RunParallel(func(pb *testing.PB) {
-					for pb.Next() {
-						target := trunk
-						if next.Add(1)&1 == 0 {
-							target = other
+				b.StopTimer()
+				pair := [2]TrunkID{}
+				repair := func() {
+					for j := range pair {
+						p, err := trunks.ForkTail(trunk)
+						if err != nil {
+							b.Fatal(err)
 						}
-						if _, _, err := trunks.Append(target, 0, []byte(`{"kind":"event"}`), nil); err != nil {
-							b.Error(err)
-							return
-						}
+						pair[j] = p
 					}
-				})
+				}
+				repair()
+				b.ReportAllocs()
+				b.StartTimer()
+				for i := 0; i < b.N; i++ {
+					if i%rebuildEvery == 0 && i > 0 {
+						b.StopTimer()
+						repair()
+						b.StartTimer()
+					}
+					if _, _, err := trunks.Append(pair[i&1], 0, []byte(`{"kind":"event"}`), nil); err != nil {
+						b.Fatal(err)
+					}
+				}
 			})
 		})
 	}
