@@ -1168,7 +1168,7 @@ func (t *Trunks) forkFlat(parentKey, kind string, mintTrunk bool) (string, error
 	child := t.mintNode()
 	var trunk string
 	if mintTrunk {
-		trunk = t.mintTrunk()
+		trunk = t.mintTrunk(kind)
 	}
 	bases, err := t.channelBases(parentKey, 0)
 	if err != nil {
@@ -1338,7 +1338,9 @@ func (t *Trunks) ForkAt(trunk string, atMainLT uint64) (string, error) {
 // Related channels share up to their last entry keyed at or below it.
 func (t *Trunks) forkFlatAt(parentKey string, atMainLT uint64) (string, error) {
 	child := t.mintNode()
-	trunk := t.mintTrunk()
+	// Interior forks re-split conversations; nothing else has a tail to
+	// split at an interior LT.
+	trunk := t.mintTrunk("conversation")
 	bases, err := t.channelBases(parentKey, atMainLT)
 	if err != nil {
 		return "", err
@@ -1898,7 +1900,7 @@ func (t *Trunks) Nodes() map[string]NodeInfo {
 
 func (t *Trunks) mintNode() string { return t.idx.MintNode() }
 
-func (t *Trunks) mintTrunk() string { return t.idx.MintTrunk() }
+func (t *Trunks) mintTrunk(kind string) string { return t.idx.MintTrunk(kind) }
 
 // trunkExists reports whether any cached node already carries this trunk id
 // (collision check for a custom minter). Caller holds t.mu.

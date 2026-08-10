@@ -28,7 +28,7 @@ type StoreOptions struct {
 	Codec       string
 	SegmentSize int64
 	Genesis     []byte
-	MintTrunkID func() string
+	MintTrunkID func(kind string) string
 }
 
 type Store struct {

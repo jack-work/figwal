@@ -90,8 +90,11 @@ type Config struct {
 	// MintTrunkID, if set, generates trunk ids instead of the default
 	// sequential "t<N>" (the Trunks layer retries on collision). Lets a
 	// consumer use opaque ids; not persisted directly — the ids land in
-	// the .trunk markers.
-	MintTrunkID func() string
+	// the .trunk markers. The node KIND being minted is passed in, so a
+	// consumer can give different species different id shapes (figaro
+	// mints unbound forms as "@<hex>" — the sigil that makes a form id
+	// unmistakably not an aria id — and conversations as bare hex).
+	MintTrunkID func(kind string) string
 	// ParentOf resolves a flat node's logical parent. Empty means none.
 	ParentOf func(node string) string
 	// Now is the wall clock, a TEST SEAM ONLY. Every record xwal writes

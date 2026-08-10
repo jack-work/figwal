@@ -37,10 +37,10 @@ type Index struct {
 	// asserts on the count because the cost is syscalls, which a wall-clock
 	// assertion only catches on a slow filesystem.
 	rebuilds atomic.Uint64
-	mintID   func() string
+	mintID   func(kind string) string
 }
 
-func newIndex(mintTrunkID func() string) *Index {
+func newIndex(mintTrunkID func(kind string) string) *Index {
 	return &Index{nodes: map[string]*NodeInfo{}, heads: map[string]string{}, mintID: mintTrunkID}
 }
 
@@ -170,9 +170,9 @@ func (x *Index) MintNode() string {
 	return id
 }
 
-func (x *Index) MintTrunk() string {
+func (x *Index) MintTrunk(kind string) string {
 	if x.mintID != nil {
-		return x.mintID()
+		return x.mintID(kind)
 	}
 	x.mu.Lock()
 	defer x.mu.Unlock()
