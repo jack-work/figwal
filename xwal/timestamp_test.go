@@ -1,11 +1,14 @@
 package xwal
 
 import (
+	"bytes"
 	"fmt"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jack-work/figwal/segment"
 )
 
 // fakeClock is a controllable Config.Now: tests advance it and every
@@ -169,12 +172,12 @@ func TestFastDecodeParsesTimestampShapes(t *testing.T) {
 		wantOK bool
 	}{
 		{"p+t", []byte(`{"m":3,"p":{"a":1},"t":1754850000000}`), 1754850000000, true},
-		{"p+x+t", []byte(`{"m":3,"p":true,"x":"m","t":5}`), 5, true},
+		{"p+t+x (canonical)", []byte(`{"m":3,"p":true,"t":5,"x":"m"}`), 5, true},
 		{"p64+t", []byte(`{"m":3,"p64":"eyJ6IjoxfQ==","t":9}`), 9, true},
 		{"legacy p", []byte(`{"m":3,"p":{"a":1}}`), 0, true},
 		{"legacy p+x", []byte(`{"m":3,"p":1,"x":2}`), 0, true},
-		{"t then c falls back", []byte(`{"m":3,"p":{},"t":5,"c":{"b":1}}`), 0, false},
-		{"trailing garbage", []byte(`{"m":3,"p":{},"t":5,"z":1}`), 0, false},
+		{"x before t (non-canonical) falls back", []byte(`{"m":3,"p":true,"x":"m","t":5}`), 5, false},
+		{"t then c falls back", []byte(`{"m":3,"p":{},"t":5,"c":{"b":1}}`), 5, false},
 	}
 	for _, tt := range cases {
 		_, _, _, ts, ok := fastDecodeFrame(tt.frame)
@@ -186,14 +189,15 @@ func TestFastDecodeParsesTimestampShapes(t *testing.T) {
 			t.Errorf("%s: ts = %d, want %d", tt.name, ts, tt.wantTS)
 		}
 		// Whatever the fast path declines, the slow path must still decode
-		// identically — the two paths may never disagree on TS.
+		// it — and wantTS is the truth for BOTH paths: order-agnostic
+		// json.Unmarshal reads t wherever it sits.
 		var rec Record
 		rec, err := decodeRecordFrom(1, tt.frame, true)
 		if err != nil {
 			t.Fatalf("%s: slow path: %v", tt.name, err)
 		}
-		if tt.wantOK && rec.TS != tt.wantTS {
-			t.Errorf("%s: slow TS = %d, fast TS = %d — paths disagree", tt.name, rec.TS, ts)
+		if rec.TS != tt.wantTS {
+			t.Errorf("%s: slow TS = %d, want %d", tt.name, rec.TS, tt.wantTS)
 		}
 	}
 }
@@ -251,10 +255,12 @@ func TestLastTSLegacyStoreThenFreshAppend(t *testing.T) {
 }
 
 // The encoder's own output must take the FAST decode path — not merely
-// decode correctly via the slow one. If this fails, every read of every
-// new record silently pays the reflection path forever, which is exactly
-// the degradation the shape canary above exists to catch; this one closes
-// the loop by testing the real encoder against it, byte for byte.
+// decode correctly via the slow one — and so must the bytes the JSONL
+// codec hands back AFTER a disk round-trip, which are NOT the encoder's
+// bytes: the codec re-canonicalizes key order. Testing only the encoder
+// side is exactly how the first draft shipped a fast path that every
+// segment read missed. If this fails, every read of every new record
+// silently pays the reflection path forever.
 func TestEncoderOutputTakesFastPath(t *testing.T) {
 	frames := map[string][]byte{
 		"channel":        encodeChannelFrame(7, []byte(`{"a":1}`), nil, false, 1754850000000),
@@ -263,6 +269,7 @@ func TestEncoderOutputTakesFastPath(t *testing.T) {
 		"unkeyed":        encodeChannelFrame(0, []byte(`{"k":"v"}`), nil, false, 1754850000000),
 		"main no-cursor": encodeStampedFrame(3, []byte(`"x"`), nil, false, nil, 1754850000000),
 	}
+	codec := segment.JSONLCodec{}
 	for name, f := range frames {
 		_, _, _, ts, ok := fastDecodeFrame(f)
 		if !ok {
@@ -271,6 +278,24 @@ func TestEncoderOutputTakesFastPath(t *testing.T) {
 		}
 		if ts != 1754850000000 {
 			t.Errorf("%s: fast path ts = %d", name, ts)
+		}
+		// And through the codec: Frame canonicalizes, ReadFrame strips the
+		// sidecars — the result must STILL take the fast path.
+		line, err := codec.Frame(1, f)
+		if err != nil {
+			t.Fatalf("%s: codec.Frame: %v", name, err)
+		}
+		back, _, err := codec.ReadFrame(bytes.NewReader(line), 0, int64(len(line)))
+		if err != nil {
+			t.Fatalf("%s: codec.ReadFrame: %v", name, err)
+		}
+		_, _, _, ts, ok = fastDecodeFrame(back)
+		if !ok {
+			t.Errorf("%s: DISK bytes rejected by fast path: %s", name, back)
+			continue
+		}
+		if ts != 1754850000000 {
+			t.Errorf("%s: disk bytes fast ts = %d", name, ts)
 		}
 	}
 }

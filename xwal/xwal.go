@@ -2095,14 +2095,23 @@ type frameObj struct {
 	M   uint64          `json:"m"`
 	P   json.RawMessage `json:"p,omitempty"`
 	P64 *string         `json:"p64,omitempty"`
-	X   json.RawMessage `json:"x,omitempty"`
 	// T is the record's server timestamp in unix milliseconds, stamped by
 	// xwal at append time — mandatory on every new record, never supplied
-	// by the caller. Declared AFTER X so the marshal order keeps the
-	// `{"m":N,"p":…` prefix the fast decoder keys on; legacy records
-	// simply lack it and read back as zero ("we can tolerate without
-	// them"). Placed before C so a main record reads m,p,x,t,c.
-	T int64 `json:"t,omitempty"`
+	// by the caller. Legacy records simply lack it and read back as zero
+	// ("we can tolerate without them").
+	//
+	// DECLARED IN ALPHABETICAL POSITION (after p64, before x), and that
+	// placement is load-bearing: the JSONL codec re-canonicalizes every
+	// line into alphabetical key order on disk, so a frame read back from
+	// a segment is m,p,t,x regardless of what the encoder emitted. The
+	// first draft declared T after X — encoder bytes and disk bytes then
+	// DISAGREED, the fast decoder matched only the encoder's order, and
+	// every meta-carrying record read from disk silently paid the
+	// reflection path: StateAt +283%, LookupHot +354% on the long-aria
+	// bench. Keeping struct order == canonical order makes encoder
+	// output and disk output byte-identical, one grammar for both.
+	T int64           `json:"t,omitempty"`
+	X json.RawMessage `json:"x,omitempty"`
 	// C is the cursor stamp, present only on MAIN records: the tail of every
 	// UNKEYED channel at the moment this record was written.
 	//
@@ -2305,42 +2314,43 @@ func fastDecodeFrame(f []byte) (uint64, []byte, []byte, int64, bool) {
 	if end+1 == len(f) && f[end] == '}' {
 		return mainLT, payload, nil, 0, true
 	}
-	// Optional meta: ,"x":<value>
-	var meta []byte
-	const metaPrefix = `,"x":`
-	if end+len(metaPrefix) < len(f) && string(f[end:end+len(metaPrefix)]) == metaPrefix {
-		i = end + len(metaPrefix)
-		end, ok = jsonValueEnd(f, i)
-		if !ok {
-			return 0, nil, nil, 0, false
-		}
-		meta = f[i:end]
-		if end+1 == len(f) && f[end] == '}' {
-			return mainLT, payload, meta, 0, true
-		}
-	}
-	// Optional timestamp: ,"t":<digits> — always the LAST field the fast
-	// shape allows (frameObj declares T after X; records with cursors take
-	// the slow path via decodeRecordFrom's isMain branch).
-	const tsPrefix = `,"t":`
-	if end+len(tsPrefix) >= len(f) || string(f[end:end+len(tsPrefix)]) != tsPrefix {
-		return 0, nil, nil, 0, false
-	}
-	i = end + len(tsPrefix)
-	start = i
+	// Optional timestamp FIRST — canonical (alphabetical) order is
+	// m, p/p64, t, x: the JSONL codec re-sorts keys on disk, and the
+	// encoder declares them in the same order so both byte streams
+	// match this one grammar.
 	var ts int64
-	for i < len(f) && f[i] >= '0' && f[i] <= '9' {
-		d := int64(f[i] - '0')
-		if ts > ((1<<63-1)-d)/10 {
+	const tsPrefix = `,"t":`
+	if end+len(tsPrefix) < len(f) && string(f[end:end+len(tsPrefix)]) == tsPrefix {
+		i = end + len(tsPrefix)
+		start = i
+		for i < len(f) && f[i] >= '0' && f[i] <= '9' {
+			d := int64(f[i] - '0')
+			if ts > ((1<<63-1)-d)/10 {
+				return 0, nil, nil, 0, false
+			}
+			ts = ts*10 + d
+			i++
+		}
+		if i == start {
 			return 0, nil, nil, 0, false
 		}
-		ts = ts*10 + d
-		i++
+		if i+1 == len(f) && f[i] == '}' {
+			return mainLT, payload, nil, ts, true
+		}
+		end = i
 	}
-	if i == start || i+1 != len(f) || f[i] != '}' {
+	// Optional meta: ,"x":<value>, the last field of the fast shape
+	// (records with cursors take the slow path via decodeRecordFrom).
+	const metaPrefix = `,"x":`
+	if end+len(metaPrefix) >= len(f) || string(f[end:end+len(metaPrefix)]) != metaPrefix {
 		return 0, nil, nil, 0, false
 	}
-	return mainLT, payload, meta, ts, true
+	i = end + len(metaPrefix)
+	end, ok = jsonValueEnd(f, i)
+	if !ok || end+1 != len(f) || f[end] != '}' {
+		return 0, nil, nil, 0, false
+	}
+	return mainLT, payload, f[i:end], ts, true
 }
 
 func jsonValueEnd(b []byte, start int) (int, bool) {
