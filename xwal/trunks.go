@@ -1449,6 +1449,16 @@ func (t *Trunks) remove(trunk string, recursive bool) ([]TrunkID, error) {
 // stumps, addressed with SpawnUnderRoot / SpawnUnderStump. SpawnChild
 // remains for spawning a fresh child under an existing trunk.
 func (t *Trunks) SpawnChild(parent TrunkID) (TrunkID, error) {
+	return t.SpawnChildKind(parent, "conversation")
+}
+
+// SpawnChildKind is SpawnChild with a caller-chosen node kind. This is how
+// a live, patchable trunk hosts children of a different species — figaro
+// binds a figaro out of an unbound form with kind "conversation", and
+// forks form from form with kind "form". The parent is not written, not
+// frozen, and stays appendable: a fork snapshots the parent's channels at
+// their bases and later parent appends belong to the parent alone.
+func (t *Trunks) SpawnChildKind(parent TrunkID, kind string) (TrunkID, error) {
 	endMutation, err := t.beginFlatCreate()
 	if err != nil {
 		return "", err
@@ -1458,7 +1468,7 @@ func (t *Trunks) SpawnChild(parent TrunkID) (TrunkID, error) {
 	if !ok {
 		return "", fmt.Errorf("%w %q", ErrUnknownTrunk, parent)
 	}
-	return t.forkFlat(nodeKey, "conversation", true)
+	return t.forkFlat(nodeKey, kind, true)
 }
 
 // CreateStump mints a markerless, named depth-1 child of the root — the
@@ -1567,6 +1577,12 @@ func (t *Trunks) StumpHead(name string) (*XWAL, error) {
 
 // SpawnUnderStump mints a new trunk (a top-level aria) as a child of a stump.
 func (t *Trunks) SpawnUnderStump(name string) (TrunkID, error) {
+	return t.SpawnUnderStumpKind(name, "conversation")
+}
+
+// SpawnUnderStumpKind is SpawnUnderStump with a caller-chosen node kind,
+// recorded in the child's marker and reported by listings.
+func (t *Trunks) SpawnUnderStumpKind(name, kind string) (TrunkID, error) {
 	endMutation, err := t.beginFlatCreate()
 	if err != nil {
 		return "", err
@@ -1575,18 +1591,27 @@ func (t *Trunks) SpawnUnderStump(name string) (TrunkID, error) {
 	if n := t.node(name); n == nil || n.Kind != "loadout" {
 		return "", fmt.Errorf("xwal: no stump %q", name)
 	}
-	return t.forkFlat(name, "conversation", true)
+	return t.forkFlat(name, kind, true)
 }
 
 // SpawnUnderRoot mints a new trunk directly under the root (a top-level
 // trunk with no stump — e.g. a loadoutless conversation).
 func (t *Trunks) SpawnUnderRoot() (TrunkID, error) {
+	return t.SpawnUnderRootKind("conversation")
+}
+
+// SpawnUnderRootKind is SpawnUnderRoot with a caller-chosen node kind —
+// how a consumer mints something under the root that is NOT a
+// conversation (figaro's unbound forms fork the null root with kind
+// "form"). The kind lands in the node marker, is immutable from then on
+// (a fork never converts), and is what listings discriminate by.
+func (t *Trunks) SpawnUnderRootKind(kind string) (TrunkID, error) {
 	endMutation, err := t.beginFlatCreate()
 	if err != nil {
 		return "", err
 	}
 	defer endMutation()
-	return t.forkFlat("", "conversation", true)
+	return t.forkFlat("", kind, true)
 }
 
 // OwnerTrunk returns the trunk id of the node that OWNS atMainLT along the
@@ -1762,6 +1787,7 @@ type TrunkInfo struct {
 	Head       []string // head node branch
 	Parent     string   // parent trunk id ("" if rooted at a stump or the root)
 	Stump      string   // stump name, if the trunk is rooted directly at a stump
+	Kind       string   // the founding node's kind, from its marker ("conversation", "form", …)
 	BranchedLT uint64
 	Tip        uint64
 }
@@ -1779,6 +1805,9 @@ func (t *Trunks) List() []TrunkInfo {
 		unlockLineage := t.lockLineage(id)
 		key := t.head(id)
 		ti := TrunkInfo{ID: id, Head: []string{key}}
+		if n := t.node(key); n != nil {
+			ti.Kind = n.Kind
+		}
 		ti.Parent, ti.Stump, ti.BranchedLT = t.lineage(id)
 		if x, err := t.openHotTopology(key); err == nil {
 			ti.Tip = mainTail(x)
@@ -1841,6 +1870,9 @@ func (t *Trunks) ListLight() []TrunkInfo {
 	for _, id := range t.idx.LiveTrunks() {
 		key := t.head(id)
 		ti := TrunkInfo{ID: id, Head: []string{key}}
+		if n := t.node(key); n != nil {
+			ti.Kind = n.Kind
+		}
 		ti.Parent, ti.Stump, ti.BranchedLT = t.lineage(id)
 		out = append(out, ti)
 	}
