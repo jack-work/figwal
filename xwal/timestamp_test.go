@@ -249,3 +249,28 @@ func TestLastTSLegacyStoreThenFreshAppend(t *testing.T) {
 		t.Errorf("LastTS after first stamped append = %d, want 7000", got)
 	}
 }
+
+// The encoder's own output must take the FAST decode path — not merely
+// decode correctly via the slow one. If this fails, every read of every
+// new record silently pays the reflection path forever, which is exactly
+// the degradation the shape canary above exists to catch; this one closes
+// the loop by testing the real encoder against it, byte for byte.
+func TestEncoderOutputTakesFastPath(t *testing.T) {
+	frames := map[string][]byte{
+		"channel":        encodeChannelFrame(7, []byte(`{"a":1}`), nil, false, 1754850000000),
+		"channel+meta":   encodeChannelFrame(7, []byte(`{"a":1}`), []byte(`"fp"`), false, 1754850000000),
+		"opaque":         encodeChannelFrame(7, []byte(`{"z":1}`), nil, true, 1754850000000),
+		"unkeyed":        encodeChannelFrame(0, []byte(`{"k":"v"}`), nil, false, 1754850000000),
+		"main no-cursor": encodeStampedFrame(3, []byte(`"x"`), nil, false, nil, 1754850000000),
+	}
+	for name, f := range frames {
+		_, _, _, ts, ok := fastDecodeFrame(f)
+		if !ok {
+			t.Errorf("%s: encoder output rejected by fast path: %s", name, f)
+			continue
+		}
+		if ts != 1754850000000 {
+			t.Errorf("%s: fast path ts = %d", name, ts)
+		}
+	}
+}
