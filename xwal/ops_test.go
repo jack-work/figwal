@@ -13,8 +13,8 @@ func TestDecodeFrameFastPathMatchesJSON(t *testing.T) {
 		{`true`, `["meta",{"x":1}]`},
 	}
 	for _, tt := range tests {
-		frame := encodeFrame(184467, []byte(tt.payload), []byte(tt.meta))
-		mainLT, payload, meta, ok := fastDecodeFrame(frame)
+		frame := encodeFrame(184467, []byte(tt.payload), []byte(tt.meta), 1754850000000)
+		mainLT, payload, meta, ts, ok := fastDecodeFrame(frame)
 		if !ok {
 			t.Fatalf("fastDecodeFrame rejected %s", frame)
 		}
@@ -22,12 +22,15 @@ func TestDecodeFrameFastPathMatchesJSON(t *testing.T) {
 			t.Fatalf("decoded (%d, %s, %s), want (184467, %s, %s)",
 				mainLT, payload, meta, tt.payload, tt.meta)
 		}
+		if ts != 1754850000000 {
+			t.Fatalf("decoded ts = %d, want 1754850000000", ts)
+		}
 	}
 }
 
 func TestDecodeFrameFallsBackForNonCanonicalOrder(t *testing.T) {
 	frame := []byte(`{"p":{"ok":true},"m":7,"x":"meta"}`)
-	if _, _, _, ok := fastDecodeFrame(frame); ok {
+	if _, _, _, _, ok := fastDecodeFrame(frame); ok {
 		t.Fatal("non-canonical frame took fast path")
 	}
 	r, err := decodeRecord(3, frame)

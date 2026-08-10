@@ -13,6 +13,10 @@ import (
 
 const benchSegmentSize = 64 << 10
 
+// benchTS is a realistic record timestamp so benchmark frames carry the
+// same byte weight production frames do.
+const benchTS = int64(1754850000000)
+
 func benchReducer(_ []byte, patch []byte) ([]byte, error) {
 	return append([]byte(nil), patch...), nil
 }
@@ -62,7 +66,7 @@ func buildLongAria(b *testing.B, records int) (string, Config) {
 			if spec.Name == "state" {
 				payload = []byte(fmt.Sprintf(`{"turn":%d}`, i))
 			}
-			if err := l.Write(uint64(i), encodeFrame(uint64(i), payload, []byte(`{"source":"bench"}`))); err != nil {
+			if err := l.Write(uint64(i), encodeFrame(uint64(i), payload, []byte(`{"source":"bench"}`), benchTS)); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -217,52 +221,38 @@ func buildLongTrunk(b *testing.B, records int) (*Trunks, Config, TrunkID, uint64
 	if err != nil {
 		b.Fatal(err)
 	}
-	branch, err := trunks.headKey(trunk)
-	if err != nil {
-		b.Fatal(err)
-	}
-	for _, spec := range cfg.Channels {
-		opts := disk.Options{
-			Codec:       segment.JSONLCodec{},
-			SegmentSize: cfg.SegmentSize,
-		}
-		if spec.Kind == ChannelReducible {
-			r := cfg.Registry[spec.Reducer]
-			opts.OnSegmentOpen = reducibleFold(r.Reduce, r.Initial)
-		}
-		chDir := filepath.Join(dir, spec.Name, branch)
-		if !pathExists(chDir) {
-			chDir = filepath.Join(dir, spec.Name)
-		}
-		l, err := disk.Open(chDir, opts)
+	// Built through the REAL append path. The hand-rolled disk writer this
+	// replaces encoded frames straight into channel dirs and drifted from
+	// the layout when fork-base continuity moved into the log layer — it
+	// failed with "write index out of order" and, worse, benchmarked a
+	// store shape no production code ever writes.
+	for i := 1; i <= records; i++ {
+		payload := fmt.Appendf(nil, `{"kind":"event","seq":%d,"text":"representative agent timeline payload"}`, i)
+		_, lt, err := trunks.Append(trunk, 0, payload, []byte(`{"source":"bench"}`))
 		if err != nil {
 			b.Fatal(err)
 		}
-		for i := 0; i < records; i++ {
-			idx := uint64(i + 1)
-			if l.ForkBase() > 0 {
-				idx++
-			}
-			mainLT := uint64(i + 2)
-			payload := []byte(fmt.Sprintf(`{"kind":"event","seq":%d,"text":"representative agent timeline payload"}`, i+1))
-			if spec.Name == "state" {
-				payload = []byte(fmt.Sprintf(`{"turn":%d}`, i+1))
-			}
-			if spec.Name == "ir" {
-				mainLT = idx
-			}
-			if err := l.Write(idx, encodeFrame(mainLT, payload, []byte(`{"source":"bench"}`))); err != nil {
-				b.Fatal(err)
-			}
-		}
-		if err := l.Sync(); err != nil {
+		if _, err := trunks.AppendChannel(trunk, "translations", lt, payload, []byte(`{"source":"bench"}`)); err != nil {
 			b.Fatal(err)
 		}
-		if err := l.Close(); err != nil {
+		if _, err := trunks.AppendChannel(trunk, "state", lt, fmt.Appendf(nil, `{"turn":%d}`, i), []byte(`{"source":"bench"}`)); err != nil {
 			b.Fatal(err)
 		}
 	}
-	return trunks, cfg, trunk, uint64(records + 1)
+	// Seal memory to disk so the open-shaped subbenches measure segments,
+	// not the flusher's backlog.
+	x, err := trunks.Head(trunk)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := x.SyncCoherent(); err != nil {
+		b.Fatal(err)
+	}
+	if err := x.Close(); err != nil {
+		b.Fatal(err)
+	}
+	// Root genesis at LT 1, then `records` own appends: global tail.
+	return trunks, cfg, trunk, uint64(records) + 1
 }
 
 func BenchmarkTrunksLongAria(b *testing.B) {

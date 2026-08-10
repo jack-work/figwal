@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/jack-work/figwal/disk"
 	"github.com/jack-work/figwal/log"
@@ -92,6 +94,10 @@ type Config struct {
 	MintTrunkID func() string
 	// ParentOf resolves a flat node's logical parent. Empty means none.
 	ParentOf func(node string) string
+	// Now is the wall clock, a TEST SEAM ONLY. Every record xwal writes
+	// carries a server timestamp stamped at append time — mandatory,
+	// supplied by xwal itself, never by the caller. Defaults to time.Now.
+	Now func() time.Time
 }
 
 var errStopRange = errors.New("xwal: stop range")
@@ -119,6 +125,16 @@ type XWAL struct {
 	chans  map[string]*channel
 	cfg    Config
 	codec  segment.SegmentCodec
+	// nowMS is the record clock in unix milliseconds (Config.Now or
+	// time.Now). Every append stamps its record with it.
+	nowMS func() int64
+	// lastTS is the newest record timestamp this node has seen — hydrated
+	// from channel tails at open, advanced (monotonically) on every append.
+	// A lock-free primitive on purpose: "when was this node last written"
+	// must be answerable without touching a segment or waiting on a writer.
+	// A POINTER because sharedView hands out copies of this struct and
+	// every view must advance the one counter the hot handle hydrated.
+	lastTS *atomic.Int64
 	// unstampedRecords: this store came through Flatten, so its main
 	// records predate the cursor stamp. Gates the fallback in CursorAt.
 	unstampedRecords bool
@@ -371,7 +387,64 @@ func open(dir string, cfg Config, store *log.Store, branch ...string) (*XWAL, er
 		x.chans[mc.Name] = ch
 		x.order = append(x.order, mc.Name)
 	}
+	x.nowMS = unixMilliClock(cfg.Now)
+	x.lastTS = new(atomic.Int64)
+	x.hydrateLastTS()
 	return x, nil
+}
+
+// unixMilliClock adapts the Config.Now test seam (or the real clock) to
+// the record timestamp unit.
+func unixMilliClock(now func() time.Time) func() int64 {
+	if now == nil {
+		return func() int64 { return time.Now().UnixMilli() }
+	}
+	return func() int64 { return now().UnixMilli() }
+}
+
+// stampTS reads the clock and advances lastTS monotonically. Called on
+// every append path; the CAS loop is for cross-channel concurrency (each
+// channel serializes its own appends, but two channels may append at once).
+func (x *XWAL) stampTS() int64 {
+	ts := x.nowMS()
+	for {
+		cur := x.lastTS.Load()
+		if ts <= cur || x.lastTS.CompareAndSwap(cur, ts) {
+			return ts
+		}
+	}
+}
+
+// LastTS returns the newest record timestamp this node has seen, in unix
+// milliseconds — hydrated from channel tails at open, advanced on every
+// append. Zero when the node has no timestamped records (empty, or written
+// entirely before timestamps existed). Lock-free.
+func (x *XWAL) LastTS() int64 { return x.lastTS.Load() }
+
+// hydrateLastTS seeds lastTS from the tail record of every channel. One
+// frame read per non-empty channel, at open only. Legacy tails without a
+// timestamp contribute zero — "we can tolerate without them".
+func (x *XWAL) hydrateLastTS() {
+	var max int64
+	for _, name := range x.order {
+		ch := x.chans[name]
+		last := ch.log.LastIndex()
+		if last == 0 {
+			continue
+		}
+		f, err := ch.log.Read(last)
+		if err != nil {
+			continue
+		}
+		r, err := decodeRecordFrom(last, f, name == x.main)
+		if err != nil {
+			continue
+		}
+		if r.TS > max {
+			max = r.TS
+		}
+	}
+	x.lastTS.Store(max)
 }
 
 // channelDir resolves a channel's directory for this branch, falling
@@ -1571,7 +1644,7 @@ func (x *XWAL) AppendMain(payload, meta []byte) (uint64, error) {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 	next := ch.log.LastIndex() + 1
-	if err := ch.log.Write(next, encodeStampedFrame(next, payload, meta, ch.opaque, x.unkeyedCursors())); err != nil {
+	if err := ch.log.Write(next, encodeStampedFrame(next, payload, meta, ch.opaque, x.unkeyedCursors(), x.stampTS())); err != nil {
 		return 0, err
 	}
 	if ch.fkScan || ch.fkBuilt {
@@ -1601,7 +1674,7 @@ func (x *XWAL) Append(channelName string, mainLT uint64, payload, meta []byte) (
 	// the cursor main stamps, not from a key stored here.
 	if ch.unkeyed {
 		next := ch.log.LastIndex() + 1
-		if err := ch.log.Write(next, encodeChannelFrame(0, payload, meta, ch.opaque)); err != nil {
+		if err := ch.log.Write(next, encodeChannelFrame(0, payload, meta, ch.opaque, x.stampTS())); err != nil {
 			return 0, err
 		}
 		return next, nil
@@ -1613,7 +1686,7 @@ func (x *XWAL) Append(channelName string, mainLT uint64, payload, meta []byte) (
 			channelName, mainLT, lastMain)
 	}
 	next := ch.log.LastIndex() + 1
-	if err := ch.log.Write(next, encodeChannelFrame(mainLT, payload, meta, ch.opaque)); err != nil {
+	if err := ch.log.Write(next, encodeChannelFrame(mainLT, payload, meta, ch.opaque, x.stampTS())); err != nil {
 		return 0, err
 	}
 	if ch.fkScan || ch.fkBuilt {
@@ -1923,9 +1996,17 @@ func (x *XWAL) sharedView(release func() error, releaseRoot func(), retire func(
 		// here too. Forgetting this one silenced the migration-era cursor
 		// path on the ONLY route that opens a head.
 		unstampedRecords: x.unstampedRecords,
-		release:          release,
-		releaseRoot:      releaseRoot,
-		retire:           retire,
+		// The clock and the lastTS COUNTER are shared, not copied: an
+		// append through any view must advance the counter every other
+		// view reads. (This comment exists because the field above's
+		// warning was proven right the very first time a field was added
+		// after it — LastTS read zero through Head until the view carried
+		// these two.)
+		nowMS:       x.nowMS,
+		lastTS:      x.lastTS,
+		release:     release,
+		releaseRoot: releaseRoot,
+		retire:      retire,
 	}
 }
 
@@ -2015,6 +2096,13 @@ type frameObj struct {
 	P   json.RawMessage `json:"p,omitempty"`
 	P64 *string         `json:"p64,omitempty"`
 	X   json.RawMessage `json:"x,omitempty"`
+	// T is the record's server timestamp in unix milliseconds, stamped by
+	// xwal at append time — mandatory on every new record, never supplied
+	// by the caller. Declared AFTER X so the marshal order keeps the
+	// `{"m":N,"p":…` prefix the fast decoder keys on; legacy records
+	// simply lack it and read back as zero ("we can tolerate without
+	// them"). Placed before C so a main record reads m,p,x,t,c.
+	T int64 `json:"t,omitempty"`
 	// C is the cursor stamp, present only on MAIN records: the tail of every
 	// UNKEYED channel at the moment this record was written.
 	//
@@ -2037,6 +2125,10 @@ type Record struct {
 	MainLT    uint64
 	Payload   []byte
 	Meta      []byte
+	// TS is the record's server timestamp in unix milliseconds, stamped
+	// by xwal at append. Zero on records written before timestamps
+	// existed.
+	TS int64
 	// Cursors, on MAIN records only: where each unkeyed channel stood when
 	// this record was written. A reader walking the timeline already holds
 	// this, so it can attribute an unkeyed channel's records to turns
@@ -2055,16 +2147,16 @@ func embedJSON(b []byte) json.RawMessage {
 	return json.RawMessage(q)
 }
 
-func encodeFrame(mainLT uint64, payload, meta []byte) []byte {
-	return encodeChannelFrame(mainLT, payload, meta, false)
+func encodeFrame(mainLT uint64, payload, meta []byte, ts int64) []byte {
+	return encodeChannelFrame(mainLT, payload, meta, false, ts)
 }
 
-func encodeChannelFrame(mainLT uint64, payload, meta []byte, opaque bool) []byte {
-	return encodeStampedFrame(mainLT, payload, meta, opaque, nil)
+func encodeChannelFrame(mainLT uint64, payload, meta []byte, opaque bool, ts int64) []byte {
+	return encodeStampedFrame(mainLT, payload, meta, opaque, nil, ts)
 }
 
-func encodeStampedFrame(mainLT uint64, payload, meta []byte, opaque bool, cursors map[string]uint64) []byte {
-	o := frameObj{M: mainLT, C: cursors}
+func encodeStampedFrame(mainLT uint64, payload, meta []byte, opaque bool, cursors map[string]uint64, ts int64) []byte {
+	o := frameObj{M: mainLT, C: cursors, T: ts}
 	if opaque {
 		encoded := base64.StdEncoding.EncodeToString(payload)
 		o.P64 = &encoded
@@ -2082,7 +2174,7 @@ func encodeStampedFrame(mainLT uint64, payload, meta []byte, opaque bool, cursor
 // decodeFrame returns the main-LT and payload, ignoring meta. Used by the
 // fold and fork-boundary paths that don't care about meta.
 func decodeFrame(f []byte) (uint64, []byte, error) {
-	if m, p, _, ok := fastDecodeFrame(f); ok {
+	if m, p, _, _, ok := fastDecodeFrame(f); ok {
 		return m, p, nil
 	}
 	var o frameObj
@@ -2108,8 +2200,8 @@ func decodeRecord(channelLT uint64, f []byte) (Record, error) {
 }
 
 func decodeRecordFrom(channelLT uint64, f []byte, isMain bool) (Record, error) {
-	if m, p, x, ok := fastDecodeFrame(f); ok && !isMain {
-		return Record{ChannelLT: channelLT, MainLT: m, Payload: p, Meta: x}, nil
+	if m, p, x, ts, ok := fastDecodeFrame(f); ok && !isMain {
+		return Record{ChannelLT: channelLT, MainLT: m, Payload: p, Meta: x, TS: ts}, nil
 	}
 	var o frameObj
 	if err := json.Unmarshal(f, &o); err != nil {
@@ -2119,7 +2211,7 @@ func decodeRecordFrom(channelLT uint64, f []byte, isMain bool) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
-	return Record{ChannelLT: channelLT, MainLT: o.M, Payload: payload, Meta: o.X, Cursors: o.C}, nil
+	return Record{ChannelLT: channelLT, MainLT: o.M, Payload: payload, Meta: o.X, TS: o.T, Cursors: o.C}, nil
 }
 
 func (o frameObj) payload() ([]byte, error) {
@@ -2165,10 +2257,10 @@ func fastDecodeMainLT(f []byte) (uint64, bool) {
 	return mainLT, i > start && i < len(f) && f[i] == ','
 }
 
-func fastDecodeFrame(f []byte) (uint64, []byte, []byte, bool) {
+func fastDecodeFrame(f []byte) (uint64, []byte, []byte, int64, bool) {
 	const prefix = `{"m":`
 	if len(f) <= len(prefix) || string(f[:len(prefix)]) != prefix || !json.Valid(f) {
-		return 0, nil, nil, false
+		return 0, nil, nil, 0, false
 	}
 	i := len(prefix)
 	var mainLT uint64
@@ -2176,13 +2268,13 @@ func fastDecodeFrame(f []byte) (uint64, []byte, []byte, bool) {
 	for i < len(f) && f[i] >= '0' && f[i] <= '9' {
 		d := uint64(f[i] - '0')
 		if mainLT > (^uint64(0)-d)/10 {
-			return 0, nil, nil, false
+			return 0, nil, nil, 0, false
 		}
 		mainLT = mainLT*10 + d
 		i++
 	}
 	if i == start {
-		return 0, nil, nil, false
+		return 0, nil, nil, 0, false
 	}
 	opaque := false
 	switch {
@@ -2192,37 +2284,63 @@ func fastDecodeFrame(f []byte) (uint64, []byte, []byte, bool) {
 		i += 7
 		opaque = true
 	default:
-		return 0, nil, nil, false
+		return 0, nil, nil, 0, false
 	}
 	end, ok := jsonValueEnd(f, i)
 	if !ok {
-		return 0, nil, nil, false
+		return 0, nil, nil, 0, false
 	}
 	payload := f[i:end]
 	if opaque {
 		if len(payload) < 2 || payload[0] != '"' || payload[len(payload)-1] != '"' {
-			return 0, nil, nil, false
+			return 0, nil, nil, 0, false
 		}
 		decoded := make([]byte, base64.StdEncoding.DecodedLen(len(payload)-2))
 		n, err := base64.StdEncoding.Decode(decoded, payload[1:len(payload)-1])
 		if err != nil {
-			return 0, nil, nil, false
+			return 0, nil, nil, 0, false
 		}
 		payload = decoded[:n]
 	}
 	if end+1 == len(f) && f[end] == '}' {
-		return mainLT, payload, nil, true
+		return mainLT, payload, nil, 0, true
 	}
+	// Optional meta: ,"x":<value>
+	var meta []byte
 	const metaPrefix = `,"x":`
-	if end+len(metaPrefix) >= len(f) || string(f[end:end+len(metaPrefix)]) != metaPrefix {
-		return 0, nil, nil, false
+	if end+len(metaPrefix) < len(f) && string(f[end:end+len(metaPrefix)]) == metaPrefix {
+		i = end + len(metaPrefix)
+		end, ok = jsonValueEnd(f, i)
+		if !ok {
+			return 0, nil, nil, 0, false
+		}
+		meta = f[i:end]
+		if end+1 == len(f) && f[end] == '}' {
+			return mainLT, payload, meta, 0, true
+		}
 	}
-	i = end + len(metaPrefix)
-	end, ok = jsonValueEnd(f, i)
-	if !ok || end+1 != len(f) || f[end] != '}' {
-		return 0, nil, nil, false
+	// Optional timestamp: ,"t":<digits> — always the LAST field the fast
+	// shape allows (frameObj declares T after X; records with cursors take
+	// the slow path via decodeRecordFrom's isMain branch).
+	const tsPrefix = `,"t":`
+	if end+len(tsPrefix) >= len(f) || string(f[end:end+len(tsPrefix)]) != tsPrefix {
+		return 0, nil, nil, 0, false
 	}
-	return mainLT, payload, f[i:end], true
+	i = end + len(tsPrefix)
+	start = i
+	var ts int64
+	for i < len(f) && f[i] >= '0' && f[i] <= '9' {
+		d := int64(f[i] - '0')
+		if ts > ((1<<63-1)-d)/10 {
+			return 0, nil, nil, 0, false
+		}
+		ts = ts*10 + d
+		i++
+	}
+	if i == start || i+1 != len(f) || f[i] != '}' {
+		return 0, nil, nil, 0, false
+	}
+	return mainLT, payload, meta, ts, true
 }
 
 func jsonValueEnd(b []byte, start int) (int, bool) {

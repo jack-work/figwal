@@ -15,7 +15,7 @@ var (
 )
 
 func TestOpaqueFrameDecodesLegacyAndOpaque(t *testing.T) {
-	legacy := encodeFrame(7, opaquePayloadOne, []byte(`"meta"`))
+	legacy := encodeFrame(7, opaquePayloadOne, []byte(`"meta"`), 0)
 	record, err := decodeRecord(1, legacy)
 	if err != nil {
 		t.Fatal(err)
@@ -24,7 +24,7 @@ func TestOpaqueFrameDecodesLegacyAndOpaque(t *testing.T) {
 		t.Fatalf("legacy payload = %q", record.Payload)
 	}
 
-	opaque := encodeChannelFrame(8, opaquePayloadTwo, []byte(`"meta"`), true)
+	opaque := encodeChannelFrame(8, opaquePayloadTwo, []byte(`"meta"`), true, 0)
 	if bytes.Contains(opaque, []byte(`"role"`)) {
 		t.Fatalf("opaque frame embeds raw payload: %s", opaque)
 	}
