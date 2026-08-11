@@ -54,6 +54,11 @@ type Trunks struct {
 	hot     *trunkStore
 	retired map[*trunkStore]struct{}
 
+	// ltsReg retains each node's lastTS counter across open/close/evict
+	// cycles (16 bytes per node ever addressed). See docs/architecture.md,
+	// "Recency: LastTS".
+	ltsReg *lastTSRegistry
+
 	validationMu             sync.Mutex
 	validationGeneration     uint64
 	validatedTopologyVersion uint64
@@ -176,7 +181,8 @@ func createTrunks(dir string, cfg Config) (*Trunks, error) {
 	}
 	x.Close()
 
-	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: cfg.Main, idx: newIndex(cfg.MintTrunkID)}
+	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: cfg.Main, idx: newIndex(cfg.MintTrunkID), ltsReg: newLastTSRegistry()}
+	t.cfg.ltsReg = t.ltsReg
 	t.cfg.ParentOf = t.idx.ParentOf
 	if err := t.rebuild(); err != nil {
 		return nil, err
@@ -234,7 +240,8 @@ func openTrunks(dir string, cfg Config) (*Trunks, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: main, idx: newIndex(cfg.MintTrunkID)}
+	t := &Trunks{root: dir, registryRoot: root, cfg: cfg, main: main, idx: newIndex(cfg.MintTrunkID), ltsReg: newLastTSRegistry()}
+	t.cfg.ltsReg = t.ltsReg
 	t.cfg.ParentOf = t.idx.ParentOf
 	if err := t.rebuild(); err != nil {
 		return nil, err
@@ -2001,29 +2008,4 @@ func (t *Trunks) Kind(trunk TrunkID) (string, bool) {
 		return "", false
 	}
 	return n.Kind, true
-}
-
-// LastTS is the newest record timestamp anywhere in a trunk, in unix
-// millis — the "when was this last written" a listing sorts by. Served
-// from the open handle's lock-free counter; a cold trunk pays one head
-// open (hydration reads one tail frame per channel) and the hot-store
-// cache keeps it warm after that. Zero for a trunk written entirely
-// before timestamps existed. Stumps are addressed by StumpLastTS.
-func (t *Trunks) LastTS(trunk TrunkID) int64 {
-	x, err := t.Head(trunk)
-	if err != nil {
-		return 0
-	}
-	defer x.Close()
-	return x.LastTS()
-}
-
-// StumpLastTS is LastTS for a named stump (legacy forms).
-func (t *Trunks) StumpLastTS(name string) int64 {
-	x, err := t.StumpHead(name)
-	if err != nil {
-		return 0
-	}
-	defer x.Close()
-	return x.LastTS()
 }

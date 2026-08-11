@@ -265,3 +265,47 @@ This durability surface implements workload
 `212c263a-64b4-47af-9570-95702e164055`. See
 [`primitives.md`](./primitives.md) for each one's signature and
 invariant.
+
+## Recency: LastTS
+
+Every record xwal writes carries a server timestamp (`t`, unix millis) in
+its frame, stamped at append time from `Config.Now` (a test seam;
+defaults to the real clock). It is mandatory and supplied by xwal itself —
+callers cannot set or omit it. Records written before timestamps existed
+simply lack the field and decode with `TS == 0`; they are tolerated
+forever and never migrated (the JSONL `_hash` covers the payload, so old
+bytes stand).
+
+"When was this node last written" is answered by `Trunks.LastTS(trunk)`
+(and `StumpLastTS(name)` for legacy stumps), designed for the consumer
+that asks it N times per listing:
+
+- **The counter outlives the handle.** `Trunks` owns a registry of
+  per-node `atomic.Int64` counters (16 bytes per node ever addressed,
+  retained for the life of the `Trunks`). An XWAL opened through Trunks
+  wires its internal `lastTS` pointer to the registry's counter, so every
+  append through any handle — and every `sharedView` of it — advances the
+  one counter a listing reads. Open, close, and hot-store eviction do not
+  touch it. This is not a cache of derived data: it is the same primitive
+  the appender bumps, merely kept.
+- **Warm reads are free.** Registry hit: one map lookup, one atomic load.
+  Measured: ~28ns, 0 B, 0 allocs per call.
+- **Cold reads are a file read.** First query for a node this process has
+  never opened runs a bounded tail probe: the lexically newest segment
+  file per channel directory the node owns, scan to the last complete
+  frame, decode its `t`, take the max — no full `Open`, no segment
+  indexing, no watermark folds. Measured: ~36µs, ~73KB transient, 126
+  allocs, paid once per node per process (the probe hydrates the retained
+  counter). A full `Open` later merges monotonically (CAS-max) into the
+  same counter, so probe and hydration can never regress an append.
+- **Never a wake.** LastTS opens (at most) segment files. Whether the
+  consumer's node has an agent, a daemon, or anything else attached is
+  invisible from here — a listing over dormant nodes stays dormant.
+
+The frame's `t` sits in ALPHABETICAL key position (`m, p/p64, t, x`)
+because the JSONL codec canonicalizes key order on disk; encoder output
+and disk output are byte-identical, and the fast-path frame decoder
+speaks that one grammar. (The first draft ordered the encoder differently
+from the disk and every meta-carrying segment read silently fell to the
+reflection path — found by benchmark comparison, not by tests, and pinned
+by canaries that round-trip the codec since.)

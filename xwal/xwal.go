@@ -97,6 +97,9 @@ type Config struct {
 	MintTrunkID func(kind string) string
 	// ParentOf resolves a flat node's logical parent. Empty means none.
 	ParentOf func(node string) string
+	// ltsReg, when set by the owning Trunks, retains each node's lastTS
+	// counter across open/close/evict cycles. Package-private on purpose.
+	ltsReg *lastTSRegistry
 	// Now is the wall clock, a TEST SEAM ONLY. Every record xwal writes
 	// carries a server timestamp stamped at append time — mandatory,
 	// supplied by xwal itself, never by the caller. Defaults to time.Now.
@@ -391,8 +394,20 @@ func open(dir string, cfg Config, store *log.Store, branch ...string) (*XWAL, er
 		x.order = append(x.order, mc.Name)
 	}
 	x.nowMS = unixMilliClock(cfg.Now)
-	x.lastTS = new(atomic.Int64)
-	x.hydrateLastTS()
+	if cfg.ltsReg != nil {
+		key := ""
+		if len(branch) > 0 {
+			key = branch[0]
+		}
+		n := cfg.ltsReg.counter(key)
+		x.lastTS = &n.ts
+		if n.hydrated.CompareAndSwap(false, true) {
+			x.hydrateLastTS()
+		}
+	} else {
+		x.lastTS = new(atomic.Int64)
+		x.hydrateLastTS()
+	}
 	return x, nil
 }
 
@@ -447,7 +462,7 @@ func (x *XWAL) hydrateLastTS() {
 			max = r.TS
 		}
 	}
-	x.lastTS.Store(max)
+	mergeMax(x.lastTS, max)
 }
 
 // channelDir resolves a channel's directory for this branch, falling
