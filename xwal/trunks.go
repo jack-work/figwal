@@ -1082,8 +1082,18 @@ func (t *Trunks) Head(trunk string) (*XWAL, error) {
 
 // Append adds a main-timeline entry at the trunk's tail. atMainLT is
 // ignored — appends never fork; ForkAt is the only forking path.
+// AppendCursors is Append for the MAIN channel with extra cursor
+// entries (see XWAL.AppendMainCursors).
+func (t *Trunks) AppendCursors(trunk string, payload, meta []byte, extra map[string]uint64) (string, uint64, error) {
+	return t.appendMainWith(trunk, payload, meta, extra)
+}
+
 func (t *Trunks) Append(trunk string, atMainLT uint64, payload, meta []byte) (string, uint64, error) {
 	_ = atMainLT
+	return t.appendMainWith(trunk, payload, meta, nil)
+}
+
+func (t *Trunks) appendMainWith(trunk string, payload, meta []byte, extra map[string]uint64) (string, uint64, error) {
 	unlockLineage := t.lockLineage(trunk)
 	defer unlockLineage()
 
@@ -1100,7 +1110,7 @@ func (t *Trunks) Append(trunk string, atMainLT uint64, payload, meta []byte) (st
 	if err != nil {
 		return "", 0, err
 	}
-	lt, appendErr := x.AppendMain(payload, meta)
+	lt, appendErr := x.AppendMainCursors(payload, meta, extra)
 	_ = release()
 	if appendErr != nil {
 		return "", 0, appendErr

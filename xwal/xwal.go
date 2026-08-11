@@ -1658,11 +1658,31 @@ func (x *XWAL) unkeyedCursors() map[string]uint64 {
 // channel. The returned mainLT is the channel index it landed at;
 // related-channel entries reference it.
 func (x *XWAL) AppendMain(payload, meta []byte) (uint64, error) {
+	return x.AppendMainCursors(payload, meta, nil)
+}
+
+// AppendMainCursors is AppendMain with caller-supplied EXTRA cursor
+// entries merged into the record's cursor stamp. The stamp already says
+// where every unkeyed channel of THIS node stood; the extra entries let
+// a consumer record positions xwal cannot know — figaro stamps each
+// observed (studied) form's version under a "study:"-prefixed key, so
+// one map carries the whole observed set. Extra keys must not collide
+// with channel names; the caller owns its namespace.
+func (x *XWAL) AppendMainCursors(payload, meta []byte, extra map[string]uint64) (uint64, error) {
 	ch := x.chans[x.main]
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
+	cursors := x.unkeyedCursors()
+	if len(extra) > 0 {
+		if cursors == nil {
+			cursors = make(map[string]uint64, len(extra))
+		}
+		for k, v := range extra {
+			cursors[k] = v
+		}
+	}
 	next := ch.log.LastIndex() + 1
-	if err := ch.log.Write(next, encodeStampedFrame(next, payload, meta, ch.opaque, x.unkeyedCursors(), x.stampTS())); err != nil {
+	if err := ch.log.Write(next, encodeStampedFrame(next, payload, meta, ch.opaque, cursors, x.stampTS())); err != nil {
 		return 0, err
 	}
 	if ch.fkScan || ch.fkBuilt {
