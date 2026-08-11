@@ -1981,3 +1981,49 @@ func ownFirstIdx(x *XWAL) uint64 {
 	}
 	return 1
 }
+
+// Kind reports a trunk's node kind ("conversation", "form", "loadout", …)
+// from the in-memory index — no log opened. The founding node carries it
+// (flat layout: one node per trunk), so this is the cheap discriminator
+// consumers split listings and birth verbs on.
+func (t *Trunks) Kind(trunk TrunkID) (string, bool) {
+	endRead, err := t.beginTrackedRead()
+	if err != nil {
+		return "", false
+	}
+	defer endRead()
+	key, ok := t.anchorOf(trunk)
+	if !ok {
+		return "", false
+	}
+	n := t.node(key)
+	if n == nil {
+		return "", false
+	}
+	return n.Kind, true
+}
+
+// LastTS is the newest record timestamp anywhere in a trunk, in unix
+// millis — the "when was this last written" a listing sorts by. Served
+// from the open handle's lock-free counter; a cold trunk pays one head
+// open (hydration reads one tail frame per channel) and the hot-store
+// cache keeps it warm after that. Zero for a trunk written entirely
+// before timestamps existed. Stumps are addressed by StumpLastTS.
+func (t *Trunks) LastTS(trunk TrunkID) int64 {
+	x, err := t.Head(trunk)
+	if err != nil {
+		return 0
+	}
+	defer x.Close()
+	return x.LastTS()
+}
+
+// StumpLastTS is LastTS for a named stump (legacy forms).
+func (t *Trunks) StumpLastTS(name string) int64 {
+	x, err := t.StumpHead(name)
+	if err != nil {
+		return 0
+	}
+	defer x.Close()
+	return x.LastTS()
+}
