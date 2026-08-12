@@ -1421,6 +1421,7 @@ func (t *Trunks) remove(trunk string, recursive bool) ([]TrunkID, error) {
 
 	// Collect the trunks living in the founding node's subtree.
 	sub := map[string]bool{}
+	var keys []string
 	kids := t.idx.ChildIndex()
 	var walk func(string)
 	walk = func(key string) {
@@ -1428,6 +1429,7 @@ func (t *Trunks) remove(trunk string, recursive bool) ([]TrunkID, error) {
 		if n == nil {
 			return
 		}
+		keys = append(keys, key)
 		if n.Trunk != "" {
 			sub[n.Trunk] = true
 		}
@@ -1445,15 +1447,19 @@ func (t *Trunks) remove(trunk string, recursive bool) ([]TrunkID, error) {
 		removed = append(removed, id)
 	}
 
-	// Delete the founding node's subtree dir in every channel.
-	branch := []string{foundKey}
+	// EVERY node of the subtree, in every channel. The layout is flat, so a
+	// descendant is a sibling directory: taking the founding node alone
+	// leaves the rest behind pointing at a .from that is no longer there,
+	// and the index reads those orphans back as roots.
 	names, err := channelNames(t.root)
 	if err != nil {
 		return nil, err
 	}
 	for _, ch := range names {
-		if err := os.RemoveAll(filepath.Join(append([]string{t.root, ch}, branch...)...)); err != nil {
-			return nil, err
+		for _, key := range keys {
+			if err := os.RemoveAll(filepath.Join(t.root, ch, key)); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return removed, t.rebuild()
