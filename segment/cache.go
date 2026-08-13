@@ -39,6 +39,7 @@ type cache struct {
 	budget atomic.Int64
 	bytes  atomic.Int64
 	clock  atomic.Int64
+	loads  atomic.Int64
 
 	mu   sync.Mutex
 	held map[*Segment]struct{}
@@ -64,6 +65,12 @@ func SetCacheBudget(bytes int64) {
 // CacheBudget and CachedBytes report the bound and what is held against it.
 func CacheBudget() int64 { return payloadCache.budget.Load() }
 func CachedBytes() int64 { return payloadCache.bytes.Load() }
+
+// CacheLoads counts how many times a segment's payloads have been read into
+// memory. A number that climbs with READS rather than with distinct segments
+// is the alarm: something is dropping blocks as fast as they are built, and
+// every read is paying for a whole segment.
+func CacheLoads() int64 { return payloadCache.loads.Load() }
 
 // CachedSegments reports how many segments currently hold a block.
 func CachedSegments() int {
@@ -162,6 +169,7 @@ func (s *Segment) cachedPayloads() *block {
 	if err != nil {
 		return nil
 	}
+	payloadCache.loads.Add(1)
 	s.usedAt.Store(payloadCache.tick())
 	if !s.block.CompareAndSwap(nil, b) {
 		return s.block.Load()
