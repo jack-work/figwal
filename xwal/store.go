@@ -29,6 +29,16 @@ type StoreOptions struct {
 	SegmentSize int64
 	Genesis     []byte
 	MintTrunkID func(kind string) string
+
+	// NoBackgroundFlush stops the periodic syncDirty pass. A caller that
+	// syncs explicitly before publishing (SyncChannelThrough) needs no
+	// second, later opinion about when a record becomes durable, and a
+	// background flush that can turn a REJECTED write durable afterwards is
+	// worse than no flush at all.
+	//
+	// Off by default: existing callers keep the buffered behaviour.
+	// TODO: remove once nothing relies on the lazy path.
+	NoBackgroundFlush bool
 }
 
 type Store struct {
@@ -126,7 +136,9 @@ func (s *Store) run() {
 		case <-ticker.C:
 		case <-s.kick:
 		}
-		s.syncDirty()
+		if !s.opts.NoBackgroundFlush {
+			s.syncDirty()
+		}
 		s.evictIdle()
 	}
 }

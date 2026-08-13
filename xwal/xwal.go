@@ -1970,6 +1970,18 @@ func (x *XWAL) StateAt(channelName string, channelLT uint64) ([]byte, error) {
 	return ch.log.StateAt(channelLT)
 }
 
+// SyncChannelThrough persists one channel up to idx and no further. It is
+// what a writer calls between appending a batch and publishing it: Sync
+// would flush every channel, and SyncCoherent bounds related channels by the
+// main tail, which would tie one channel's durability to another's.
+func (x *XWAL) SyncChannelThrough(channelName string, idx uint64) error {
+	ch := x.chans[channelName]
+	if ch == nil {
+		return fmt.Errorf("xwal: no channel %q", channelName)
+	}
+	return ch.log.SyncThrough(idx)
+}
+
 // tailMain returns the main LT of the channel's last entry.
 func (x *XWAL) tailMain(ch *channel) (uint64, bool, error) {
 	last := ch.log.LastIndex()

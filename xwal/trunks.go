@@ -2025,3 +2025,15 @@ func (t *Trunks) Kind(trunk TrunkID) (string, bool) {
 	}
 	return n.Kind, true
 }
+
+// SyncChannelThrough persists one channel of one trunk up to idx. The
+// borrow-and-release dance is the same one Append performs, so a writer can
+// append a batch and then make exactly that batch durable.
+func (t *Trunks) SyncChannelThrough(trunk, channel string, idx uint64) error {
+	x, err := t.Head(trunk)
+	if err != nil {
+		return err
+	}
+	defer x.Close()
+	return x.SyncChannelThrough(channel, idx)
+}
