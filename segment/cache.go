@@ -121,16 +121,26 @@ func (c *cache) evictTo(budget int64) {
 		if c.bytes.Load() <= budget {
 			return
 		}
-		b := s.block.Load()
-		if b == nil {
-			delete(c.held, s)
-			continue
-		}
-		if s.block.CompareAndSwap(b, nil) {
-			c.bytes.Add(-b.bytes)
-		}
-		delete(c.held, s)
+		c.dropLocked(s, s.block.Load())
 	}
+}
+
+// dropLocked releases the block the evictor read, and reports whether it was
+// the one still installed. A LOST race means an append extended the block
+// between the load and the swap: the segment keeps its (larger) block and
+// stays in the held set, because forgetting it there would charge bytes to a
+// segment nothing could ever evict.
+func (c *cache) dropLocked(s *Segment, b *block) bool {
+	if b == nil {
+		delete(c.held, s)
+		return true
+	}
+	if !s.block.CompareAndSwap(b, nil) {
+		return false
+	}
+	c.bytes.Add(-b.bytes)
+	delete(c.held, s)
+	return true
 }
 
 // cachedPayloads returns this segment's block, loading it if the budget
