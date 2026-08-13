@@ -105,3 +105,63 @@ func TestCacheAccountingSurvivesAppendVersusEvict(t *testing.T) {
 	}
 	_ = os.Remove(filepath.Join(dir, "seg"))
 }
+
+// The budget bounds a BUSY process. SweepIdle is the other half: a process
+// that has gone quiet gives the memory back, which is what an idle clock is
+// for. A block read since the cutoff must survive; one that has not must not.
+func TestSweepIdleDropsWhatNobodyReads(t *testing.T) {
+	old := CacheBudget()
+	defer SetCacheBudget(old)
+	SetCacheBudget(8 << 20)
+
+	dir := t.TempDir()
+	mk := func(name string) *Segment {
+		s, err := Create(filepath.Join(dir, name), BinaryCodec{}, 1, 1<<24)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload := make([]byte, 512)
+		for i := 0; i < 16; i++ {
+			if _, err := s.Append(payload); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := s.ReadIndex(0); err != nil { // load its block
+			t.Fatal(err)
+		}
+		return s
+	}
+	hot, cold := mk("hot"), mk("cold")
+	defer hot.Close()
+	defer cold.Close()
+	if hot.block.Load() == nil || cold.block.Load() == nil {
+		t.Fatal("fixture failed to load both blocks")
+	}
+	before := CachedBytes()
+
+	// One sweep with nothing read: both are still within the keep window.
+	if dropped, _ := SweepIdle(2); dropped != 0 {
+		t.Fatalf("first sweep dropped %d blocks, want 0", dropped)
+	}
+	// Read the hot one, then sweep past the window twice.
+	for i := 0; i < 3; i++ {
+		if _, err := hot.ReadIndex(0); err != nil {
+			t.Fatal(err)
+		}
+		SweepIdle(2)
+	}
+	if hot.block.Load() == nil {
+		t.Fatal("a block read on every sweep was dropped as idle")
+	}
+	if cold.block.Load() != nil {
+		t.Fatal("a block nobody read survived three sweeps")
+	}
+	if got := CachedBytes(); got >= before {
+		t.Fatalf("sweeping freed nothing: %d bytes held, was %d", got, before)
+	}
+	// And what was dropped still reads.
+	p, err := cold.ReadIndex(3)
+	if err != nil || len(p) != 512 {
+		t.Fatalf("swept segment no longer reads: %v", err)
+	}
+}

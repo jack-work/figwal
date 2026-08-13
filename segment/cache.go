@@ -35,10 +35,19 @@ type block struct {
 // cache is the process-wide registry of loaded blocks. It holds no payloads
 // itself: it knows which segments have one, how large it is, and when it was
 // last touched, which is everything eviction needs.
+//
+// Recency is an EPOCH, not a per-read counter. The first version stamped a
+// global counter on every cached read, which is an atomic read-modify-write
+// on one cache line shared by every reader in the process: reads measured 26
+// ns on one core and 47 ns on sixteen, getting slower the more of them there
+// were. The epoch advances when a block is loaded and when a sweep runs --
+// both rare -- and a reader only STORES it, and only when its segment's stamp
+// is stale. A shared read plus an occasional store to the segment's own line
+// costs nothing to scale.
 type cache struct {
 	budget atomic.Int64
 	bytes  atomic.Int64
-	clock  atomic.Int64
+	epoch  atomic.Int64
 	loads  atomic.Int64
 
 	mu   sync.Mutex
@@ -79,7 +88,14 @@ func CachedSegments() int {
 	return len(payloadCache.held)
 }
 
-func (c *cache) tick() int64 { return c.clock.Add(1) }
+// stamp marks the segment as used in the current epoch, storing only when
+// that is not already what it says.
+func (c *cache) stamp(s *Segment) {
+	now := c.epoch.Load()
+	if s.usedAt.Load() != now {
+		s.usedAt.Store(now)
+	}
+}
 
 func (c *cache) admit(s *Segment, b *block) {
 	c.mu.Lock()
@@ -154,7 +170,7 @@ func (c *cache) dropLocked(s *Segment, b *block) bool {
 // allows. A nil result means the caller must read from the file.
 func (s *Segment) cachedPayloads() *block {
 	if b := s.block.Load(); b != nil {
-		s.usedAt.Store(payloadCache.tick())
+		payloadCache.stamp(s)
 		return b
 	}
 	if payloadCache.budget.Load() <= 0 {
@@ -170,12 +186,46 @@ func (s *Segment) cachedPayloads() *block {
 		return nil
 	}
 	payloadCache.loads.Add(1)
-	s.usedAt.Store(payloadCache.tick())
+	s.usedAt.Store(payloadCache.epoch.Add(1))
 	if !s.block.CompareAndSwap(nil, b) {
 		return s.block.Load()
 	}
 	payloadCache.admit(s, b)
 	return b
+}
+
+// SweepIdle drops every block not read since `keep` sweeps ago and advances
+// the epoch. It is the IDLE half of the policy: the budget bounds a busy
+// process, and this returns the memory of one that has gone quiet. A caller
+// with an idle clock of its own (figaro has three) should drive this from the
+// same sweep rather than invent a fourth number.
+//
+// Returns how many blocks were dropped and how many bytes that freed.
+func SweepIdle(keep int64) (dropped int, freed int64) {
+	if keep < 0 {
+		return 0, 0
+	}
+	now := payloadCache.epoch.Add(1)
+	cutoff := now - keep
+	payloadCache.mu.Lock()
+	defer payloadCache.mu.Unlock()
+	for s := range payloadCache.held {
+		// >= : a block stamped in the cutoff epoch has not yet gone a full
+		// `keep` sweeps without a read.
+		if s.usedAt.Load() >= cutoff {
+			continue
+		}
+		b := s.block.Load()
+		if b == nil {
+			delete(payloadCache.held, s)
+			continue
+		}
+		if payloadCache.dropLocked(s, b) {
+			dropped++
+			freed += b.bytes
+		}
+	}
+	return dropped, freed
 }
 
 // readAllPayloads reads every record of the segment in one pass.
@@ -219,7 +269,7 @@ func (s *Segment) extendBlock(payload []byte) {
 	}
 	if s.block.CompareAndSwap(old, nb) {
 		payloadCache.charge(nb.bytes - old.bytes)
-		s.usedAt.Store(payloadCache.tick())
+		payloadCache.stamp(s)
 	}
 }
 

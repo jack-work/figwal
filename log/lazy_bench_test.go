@@ -135,3 +135,23 @@ func BenchmarkOpenManySegments(b *testing.B) {
 		}
 	})
 }
+
+// Every cached read stamps a global counter for the LRU. That is an atomic
+// RMW on one cache line, shared by every reader in the process: exactly the
+// shape that reads fine on one core and collapses on sixteen.
+func BenchmarkParallelCachedReads(b *testing.B) {
+	l := benchFixture(b, 2000, 512)
+	defer l.Close()
+	if _, err := l.Read(1); err != nil {
+		b.Fatal(err)
+	}
+	b.RunParallel(func(pb *testing.PB) {
+		i := uint64(0)
+		for pb.Next() {
+			i++
+			if _, err := l.Read(i%2000 + 1); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
