@@ -473,7 +473,7 @@ func (x *XWAL) channelDir(name string) string {
 	base := filepath.Join(x.root, name)
 	dir := base
 	for i := 1; i <= len(x.branch); i++ {
-		cand := filepath.Join(append([]string{base}, x.branch[:i]...)...)
+		cand := filepath.Join(append([]string{base}, fsNames(x.branch[:i])...)...)
 		if pathExists(cand) {
 			if name != x.main {
 				if _, err := readForkBaseFile(filepath.Join(cand, ".fork")); err != nil &&
@@ -2472,7 +2472,7 @@ func (x *XWAL) openFlatParent(chName, node string, opts disk.Options, store *log
 			opts.Parent = p.Disk()
 		}
 	}
-	dir := filepath.Join(x.root, chName, node)
+	dir := filepath.Join(x.root, chName, fsName(node))
 	// An ancestor with no directory in this channel is PASSED THROUGH, not
 	// created. log.Open would MkdirAll an empty log, and an empty log owns
 	// its numbering from 1 -- so this node would stop delegating and sever

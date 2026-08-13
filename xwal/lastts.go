@@ -94,7 +94,7 @@ func (t *Trunks) probeLastTS(key string) int64 {
 		if !e.IsDir() {
 			continue
 		}
-		dir := filepath.Join(t.root, e.Name(), key)
+		dir := filepath.Join(t.root, e.Name(), fsName(key))
 		if ts := tailFrameTS(dir, codec); ts > max {
 			max = ts
 		}

@@ -1192,7 +1192,7 @@ func (t *Trunks) forkFlat(parentKey, kind string, mintTrunk bool) (string, error
 		return "", err
 	}
 	for name, base := range bases {
-		dir := filepath.Join(t.root, name, child)
+		dir := filepath.Join(t.root, name, fsName(child))
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return "", err
 		}
@@ -1220,7 +1220,7 @@ func (t *Trunks) forkFlatNamed(parentKey, name, kind string) error {
 		return err
 	}
 	for chName, base := range bases {
-		dir := filepath.Join(t.root, chName, name)
+		dir := filepath.Join(t.root, chName, fsName(name))
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
@@ -1363,7 +1363,7 @@ func (t *Trunks) forkFlatAt(parentKey string, atMainLT uint64) (string, error) {
 		return "", err
 	}
 	for name, base := range bases {
-		dir := filepath.Join(t.root, name, child)
+		dir := filepath.Join(t.root, name, fsName(child))
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return "", err
 		}
@@ -1457,7 +1457,7 @@ func (t *Trunks) remove(trunk string, recursive bool) ([]TrunkID, error) {
 	}
 	for _, ch := range names {
 		for _, key := range keys {
-			if err := os.RemoveAll(filepath.Join(t.root, ch, key)); err != nil {
+			if err := os.RemoveAll(filepath.Join(t.root, ch, fsName(key))); err != nil {
 				return nil, err
 			}
 		}
@@ -1556,7 +1556,7 @@ func (t *Trunks) RemoveStump(name string) error {
 		return err
 	}
 	for _, ch := range names {
-		if err := os.RemoveAll(filepath.Join(t.root, ch, name)); err != nil {
+		if err := os.RemoveAll(filepath.Join(t.root, ch, fsName(name))); err != nil {
 			return err
 		}
 	}
@@ -1942,7 +1942,7 @@ func (t *Trunks) irDir(key string) string {
 	if key == "" {
 		return filepath.Join(t.root, t.main)
 	}
-	return filepath.Join(t.root, t.main, key)
+	return filepath.Join(t.root, t.main, fsName(key))
 }
 
 // numSuffix parses the numeric suffix of e.g. "n12" / "t3" given the

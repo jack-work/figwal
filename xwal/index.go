@@ -200,7 +200,10 @@ func (x *Index) RebuildFrom(mainDir string) error {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
-		if err := x.addLocked(filepath.Join(mainDir, e.Name()), e.Name(), false); err != nil {
+		// The DIRECTORY name is the encoded form; the KEY is what callers
+		// named. They differ only for a key holding a character a filesystem
+		// reserves (see fsName).
+		if err := x.addLocked(filepath.Join(mainDir, e.Name()), keyName(e.Name()), false); err != nil {
 			return err
 		}
 	}

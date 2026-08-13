@@ -58,7 +58,7 @@ func repairCoherentCuts(t *Trunks) error {
 			if mc.Name == man.Main {
 				continue
 			}
-			dir := filepath.Join(t.root, mc.Name, key)
+			dir := filepath.Join(t.root, mc.Name, fsName(key))
 			if !pathExists(dir) {
 				continue
 			}

@@ -569,7 +569,7 @@ func (p *FlattenPlan) apply() (FlattenReport, error) {
 			if n.Rel == n.Flat {
 				continue // already at depth 1 under its final name
 			}
-			if err := os.Rename(src, filepath.Join(dir, n.Flat)); err != nil {
+			if err := os.Rename(src, filepath.Join(dir, fsName(n.Flat))); err != nil {
 				return rep, fmt.Errorf("xwal: flatten %s/%s: %w", cp.Name, n.Rel, err)
 			}
 			touched[filepath.Dir(src)] = true
@@ -646,9 +646,9 @@ func nodePaths(chanDir string) ([]string, error) {
 			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 				continue
 			}
-			child := e.Name()
+			child := keyName(e.Name())
 			if rel != "" {
-				child = filepath.Join(rel, e.Name())
+				child = filepath.Join(rel, keyName(e.Name()))
 			}
 			out = append(out, child)
 			if err := walk(child); err != nil {
