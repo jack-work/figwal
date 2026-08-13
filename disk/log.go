@@ -58,7 +58,7 @@ type Log struct {
 	opts       Options
 	codec      segment.SegmentCodec
 	ext        string
-	sealed     []*segment.Segment
+	sealed     []*sealedSeg
 	active     *segment.Segment
 	parent     *Log // nil for root logs
 	ownsParent bool
@@ -142,7 +142,7 @@ func Open(dir string, opts Options) (*Log, error) {
 		// Validate the on-disk first segment lines up with the marker.
 		var firstBase uint64
 		if len(l.sealed) > 0 {
-			firstBase = l.sealed[0].FirstIndex()
+			firstBase = l.sealed[0].BaseIndex()
 		} else {
 			firstBase = l.active.FirstIndex()
 		}
@@ -277,7 +277,10 @@ func (l *Log) Range(from uint64, fn func(idx uint64, payload []byte) error) erro
 	}
 	cur := from
 	for cur <= last {
-		s := l.findSegmentLocked(cur)
+		s, err := l.findSegmentLocked(cur)
+		if err != nil {
+			return err
+		}
 		if s == nil {
 			return ErrNotFound
 		}
@@ -316,7 +319,11 @@ func (l *Log) ScanFromEnd(from uint64, fn func(idx uint64, payload []byte) error
 			idx = from
 		}
 		for idx >= first {
-			s := l.findSegmentLocked(idx)
+			s, err := l.findSegmentLocked(idx)
+			if err != nil {
+				l.mu.RUnlock()
+				return err
+			}
 			if s == nil {
 				l.mu.RUnlock()
 				return ErrNotFound
@@ -361,21 +368,20 @@ func (l *Log) TruncateFront(beforeIdx uint64) error {
 	if len(l.sealed) == 0 {
 		return nil
 	}
-	kept := make([]*segment.Segment, 0, len(l.sealed))
+	kept := make([]*sealedSeg, 0, len(l.sealed))
 	dropped := 0
-	for _, s := range l.sealed {
-		if s.LastIndex() < beforeIdx {
-			path := s.Path()
-			if err := s.Close(); err != nil {
+	for _, ss := range l.sealed {
+		if ss.LastIndex() < beforeIdx {
+			if err := ss.close(); err != nil {
 				return err
 			}
-			if err := os.Remove(path); err != nil {
+			if err := os.Remove(ss.Path()); err != nil {
 				return err
 			}
 			dropped++
 			continue
 		}
-		kept = append(kept, s)
+		kept = append(kept, ss)
 	}
 	l.sealed = kept
 	if dropped == 0 {
@@ -403,7 +409,10 @@ func (l *Log) Read(idx uint64) ([]byte, error) {
 	if l.isEmptyLocked() {
 		return nil, ErrEmpty
 	}
-	s := l.findSegmentLocked(idx)
+	s, err := l.findSegmentLocked(idx)
+	if err != nil {
+		return nil, err
+	}
 	if s == nil {
 		return nil, ErrNotFound
 	}
@@ -482,7 +491,10 @@ func (l *Log) HeaderAt(idx uint64) ([]byte, error) {
 	if l.isEmptyLocked() {
 		return nil, ErrEmpty
 	}
-	s := l.findSegmentLocked(idx)
+	s, err := l.findSegmentLocked(idx)
+	if err != nil {
+		return nil, err
+	}
 	if s == nil {
 		return nil, ErrNotFound
 	}
@@ -508,7 +520,10 @@ func (l *Log) stateAtLocked(idx uint64) ([]byte, error) {
 	if l.parent != nil && idx < l.forkBase {
 		return l.parent.StateAt(idx)
 	}
-	s := l.findSegmentLocked(idx)
+	s, err := l.findSegmentLocked(idx)
+	if err != nil {
+		return nil, err
+	}
 	if s == nil {
 		return nil, ErrNotFound
 	}
@@ -531,8 +546,8 @@ func (l *Log) SegmentBaseIndexes() []uint64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	out := make([]uint64, 0, len(l.sealed)+1)
-	for _, s := range l.sealed {
-		out = append(out, s.BaseIndex())
+	for _, ss := range l.sealed {
+		out = append(out, ss.BaseIndex())
 	}
 	if l.active != nil && l.active.Count() > 0 {
 		out = append(out, l.active.BaseIndex())
@@ -566,7 +581,14 @@ func (l *Log) RangeOwn(from uint64, fn func(idx uint64, payload []byte) error) e
 		}
 		return nil
 	}
-	for _, s := range l.sealed {
+	for _, ss := range l.sealed {
+		if ss.LastIndex() < from {
+			continue
+		}
+		s, err := l.openSealed(ss)
+		if err != nil {
+			return err
+		}
 		if err := walk(s); err != nil {
 			return err
 		}
@@ -583,8 +605,8 @@ func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	var errs []error
-	for _, s := range l.sealed {
-		if err := s.Close(); err != nil {
+	for _, ss := range l.sealed {
+		if err := ss.close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -613,7 +635,11 @@ func (l *Log) openActiveLocked(baseIndex uint64) error {
 		var prevHeader []byte
 		var sealed [][]byte
 		if n := len(l.sealed); n > 0 {
-			prev := l.sealed[n-1]
+			prev, perr := l.openSealed(l.sealed[n-1])
+			if perr != nil {
+				s.Close()
+				return perr
+			}
 			prevHeader = prev.Header()
 			sealed, err = segPayloads(prev)
 			if err != nil {
@@ -673,7 +699,7 @@ func (l *Log) rotateLocked(baseIndex uint64) error {
 			"sealedBase", l.active.BaseIndex(),
 			"sealedLast", l.active.LastIndex(),
 			"newBase", baseIndex)
-		l.sealed = append(l.sealed, l.active)
+		l.sealed = append(l.sealed, wrapOpen(l.active))
 		l.active = nil
 	}
 	return l.openActiveLocked(baseIndex)
@@ -688,7 +714,7 @@ func (l *Log) isEmptyLocked() bool {
 
 func (l *Log) firstIndexLocked() uint64 {
 	if len(l.sealed) > 0 {
-		return l.sealed[0].FirstIndex()
+		return l.sealed[0].BaseIndex()
 	}
 	if l.active != nil && l.active.Count() > 0 {
 		return l.active.FirstIndex()
@@ -706,18 +732,18 @@ func (l *Log) lastIndexLocked() uint64 {
 	return 0
 }
 
-func (l *Log) findSegmentLocked(idx uint64) *segment.Segment {
-	i := sort.Search(len(l.sealed), func(i int) bool {
-		return l.sealed[i].LastIndex() >= idx
-	})
-	if i < len(l.sealed) && idx >= l.sealed[i].FirstIndex() {
-		return l.sealed[i]
+// findSegmentLocked routes idx to its segment, opening a sealed one on
+// demand. The routing itself needs no open: a segment file is named for its
+// base index, so the bases alone say which file holds which record.
+func (l *Log) findSegmentLocked(idx uint64) (*segment.Segment, error) {
+	if ss, ok := l.sealedFor(idx); ok {
+		return l.openSealed(ss)
 	}
 	if l.active != nil && l.active.Count() > 0 &&
 		idx >= l.active.FirstIndex() && idx <= l.active.LastIndex() {
-		return l.active
+		return l.active, nil
 	}
-	return nil
+	return nil, nil
 }
 
 // known segment extensions, used to detect codec mismatch in a directory.
@@ -785,14 +811,16 @@ func (l *Log) loadSegments() error {
 		bases = append(bases, base)
 	}
 	sort.Slice(bases, func(i, j int) bool { return bases[i] < bases[j] })
+	// Only the NEWEST segment is opened: it is the one that takes appends and
+	// the only one that can carry a torn tail. The sealed ones are recorded
+	// by name and opened when a read lands in them. A sealed segment's range
+	// is [base_i, base_{i+1} - 1], which the names alone give.
 	for i, base := range bases {
 		path := filepath.Join(l.dir, l.segName(base))
-		isLast := i == len(bases)-1
-		headered := l.opts.OnSegmentOpen != nil
-		if isLast {
+		if i == len(bases)-1 {
 			var s *segment.Segment
 			var err error
-			if headered {
+			if l.opts.OnSegmentOpen != nil {
 				s, err = segment.OpenHeadered(path, l.codec, base, l.opts.SegmentSize)
 			} else {
 				s, err = segment.Open(path, l.codec, base, l.opts.SegmentSize)
@@ -801,19 +829,9 @@ func (l *Log) loadSegments() error {
 				return fmt.Errorf("open active segment %d: %w", base, err)
 			}
 			l.active = s
-		} else {
-			var s *segment.Segment
-			var err error
-			if headered {
-				s, err = segment.OpenReadOnlyHeadered(path, l.codec, base)
-			} else {
-				s, err = segment.OpenReadOnly(path, l.codec, base)
-			}
-			if err != nil {
-				return fmt.Errorf("open sealed segment %d: %w", base, err)
-			}
-			l.sealed = append(l.sealed, s)
+			break
 		}
+		l.sealed = append(l.sealed, newSealed(base, bases[i+1]-1, path))
 	}
 	return l.reseedEmptyActiveHeader()
 }
@@ -831,9 +849,11 @@ func (l *Log) reseedEmptyActiveHeader() error {
 	var prevHeader []byte
 	var sealed [][]byte
 	if n := len(l.sealed); n > 0 {
-		prev := l.sealed[n-1]
+		prev, err := l.openSealed(l.sealed[n-1])
+		if err != nil {
+			return err
+		}
 		prevHeader = prev.Header()
-		var err error
 		sealed, err = segPayloads(prev)
 		if err != nil {
 			return err
@@ -869,8 +889,10 @@ func parseSegName(name, ext string) (uint64, error) {
 func (l *Log) DropPayloadCache() {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	for _, s := range l.sealed {
-		s.DropCache()
+	for _, ss := range l.sealed {
+		if s := ss.loaded(); s != nil {
+			s.DropCache()
+		}
 	}
 	if l.active != nil {
 		l.active.DropCache()

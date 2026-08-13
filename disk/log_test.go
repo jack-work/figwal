@@ -381,7 +381,7 @@ func TestTruncateFrontKeepsStraddlingSegment(t *testing.T) {
 	if len(l.sealed) == 0 {
 		t.Fatal("expected sealed segments")
 	}
-	cut := l.sealed[0].FirstIndex() // do not drop the first segment
+	cut := l.sealed[0].BaseIndex() // do not drop the first segment
 	if err := l.TruncateFront(cut); err != nil {
 		t.Fatal(err)
 	}

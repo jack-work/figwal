@@ -77,3 +77,61 @@ func BenchmarkPointReadCachedVsDisk(b *testing.B) {
 		}
 	})
 }
+
+// What OPENING a log costs. Every sealed segment used to be opened and
+// scanned end to end (frame walk plus CRC) before anyone asked for a record;
+// only the newest one is opened now, and the rest are opened by the read
+// that lands in them.
+func BenchmarkOpenManySegments(b *testing.B) {
+	dir := b.TempDir()
+	opts := Options{SegmentSize: 64 << 10}
+	l, err := Open(dir, opts)
+	if err != nil {
+		b.Fatal(err)
+	}
+	payload := make([]byte, 512)
+	for i := 1; i <= 4000; i++ { // ~32 segments
+		if err := l.Write(uint64(i), payload); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		b.Fatal(err)
+	}
+	b.Run("open", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			o, err := Open(dir, opts)
+			if err != nil {
+				b.Fatal(err)
+			}
+			o.Close()
+		}
+	})
+	b.Run("open+read1", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			o, err := Open(dir, opts)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if _, err := o.Read(1); err != nil {
+				b.Fatal(err)
+			}
+			o.Close()
+		}
+	})
+	b.Run("open+readall", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			o, err := Open(dir, opts)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := o.Range(1, func(uint64, []byte) error { return nil }); err != nil {
+				b.Fatal(err)
+			}
+			o.Close()
+		}
+	})
+}

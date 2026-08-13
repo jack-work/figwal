@@ -304,10 +304,19 @@ func (l *Log) forkImpl(atIdx uint64, childName, oldFutureName string, oldFutureE
 			return nil, err
 		}
 		if l.active.Count() > 0 {
-			l.sealed = append(l.sealed, l.active)
+			l.sealed = append(l.sealed, wrapOpen(l.active))
 			l.active = nil
 		}
 	}
+
+	// A fork reasons about counts, headers and payloads across the whole
+	// log, so it takes the eager path: every sealed segment is opened before
+	// the plan is made, rather than an on-demand open appearing in the
+	// middle of one already committed to.
+	if err := l.materializeLocked(); err != nil {
+		return nil, err
+	}
+	segs := l.sealedSegments()
 
 	// Header (reducible) mode: the new branches need a fresh watermark
 	// at the fork boundary (state at atIdx-1), because the prefix is
@@ -344,7 +353,7 @@ func (l *Log) forkImpl(atIdx uint64, childName, oldFutureName string, oldFutureE
 		switch {
 		case s.LastIndex() < atIdx:
 			actions[i] = actKeep
-		case s.FirstIndex() >= atIdx:
+		case s.BaseIndex() >= atIdx:
 			actions[i] = actMove
 			hasMoves = true
 		default:
@@ -453,10 +462,11 @@ func (l *Log) forkImpl(atIdx uint64, childName, oldFutureName string, oldFutureE
 
 	// Split the boundary segment if one exists.
 	var prefixReplacement *segment.Segment
-	for i, s := range l.sealed {
+	for i := range l.sealed {
 		if actions[i] != actSplit {
 			continue
 		}
+		s := segs[i]
 		prefixPath := s.Path()
 		prefixTmp := prefixPath + ".tmp"
 		suffixPath := filepath.Join(oldFutureDir, l.segName(atIdx))
@@ -542,10 +552,11 @@ func (l *Log) forkImpl(atIdx uint64, childName, oldFutureName string, oldFutureE
 	}
 
 	// Move whole-move segments into the old-future subdir.
-	for i, s := range l.sealed {
+	for i := range l.sealed {
 		if actions[i] != actMove {
 			continue
 		}
+		s := segs[i]
 		src := s.Path()
 		dst := filepath.Join(oldFutureDir, filepath.Base(src))
 		if err := s.Close(); err != nil {
@@ -595,14 +606,14 @@ func (l *Log) forkImpl(atIdx uint64, childName, oldFutureName string, oldFutureE
 
 	// Rebuild l.sealed: keep the kept segments and the split prefix
 	// (which slots in where the boundary used to be).
-	newSealed := make([]*segment.Segment, 0, len(l.sealed))
-	for i, s := range l.sealed {
+	newSealed := make([]*sealedSeg, 0, len(l.sealed))
+	for i, ss := range l.sealed {
 		switch actions[i] {
 		case actKeep:
-			newSealed = append(newSealed, s)
+			newSealed = append(newSealed, ss)
 		case actSplit:
 			if prefixReplacement != nil {
-				newSealed = append(newSealed, prefixReplacement)
+				newSealed = append(newSealed, wrapOpen(prefixReplacement))
 			}
 		}
 	}
