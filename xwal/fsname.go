@@ -1,6 +1,9 @@
 package xwal
 
-import "strings"
+import (
+	"runtime"
+	"strings"
+)
 
 // A NODE KEY IS NOT A FILENAME.
 //
@@ -16,8 +19,18 @@ import "strings"
 // stores are byte-for-byte unchanged, and nothing needs migrating.
 const fsReserved = `<>:"|?*%`
 
+// fsEncode gates the whole mechanism to the platform that needs it. The
+// reserved set is WINDOWS's; on POSIX every one of those bytes is a legal
+// path component, existing stores already hold literal names (figaro's
+// "@libretto::<id>" among them), and encoding on read made every such
+// node unreachable -- the daemon could not start on a Linux store
+// carrying a libretto. So a POSIX store is byte-for-byte identity in
+// both directions, and only Windows -- where no literal reserved name
+// can exist, because mkdir refuses it -- represents keys encoded.
+var fsEncode = runtime.GOOS == "windows"
+
 func fsName(key string) string {
-	if !strings.ContainsAny(key, fsReserved) {
+	if !fsEncode || !strings.ContainsAny(key, fsReserved) {
 		return key // the overwhelmingly common case, and it allocates nothing
 	}
 	var b strings.Builder
@@ -47,7 +60,7 @@ func fsNames(keys []string) []string {
 
 // keyName is fsName's inverse: the key a directory name stands for.
 func keyName(name string) string {
-	if !strings.Contains(name, "%") {
+	if !fsEncode || !strings.Contains(name, "%") {
 		return name
 	}
 	var b strings.Builder
