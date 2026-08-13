@@ -260,7 +260,12 @@ func TestCachedRangeStopsAtUntruncatedParentBoundary(t *testing.T) {
 	}
 }
 
-func TestCachedForkSnapshotOwnsTruncatedArray(t *testing.T) {
+// A fork MOVES the parent's suffix into another directory. Payloads are no
+// longer copied into RAM at open, so a Snapshot taken before a fork can only
+// serve what the parent still owns. This is the honest statement of the
+// property the array-owning version used to give for free, and it is why a
+// topology mutation demands a private log.
+func TestSnapshotAcrossAForkServesTheKeptPrefix(t *testing.T) {
 	dir := t.TempDir()
 	c, err := Open(dir, Options{Codec: segment.JSONLCodec{}})
 	if err != nil {
@@ -272,6 +277,9 @@ func TestCachedForkSnapshotOwnsTruncatedArray(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := c.Sync(); err != nil {
+		t.Fatal(err)
+	}
 	before := c.Snapshot()
 	child, err := c.Fork(4, "alt")
 	if err != nil {
@@ -279,61 +287,38 @@ func TestCachedForkSnapshotOwnsTruncatedArray(t *testing.T) {
 	}
 	defer child.Close()
 
-	truncated := c.snap.Load()
-	readOnce := make(chan struct{})
-	stop := make(chan struct{})
-	changed := make(chan string, 1)
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		first := true
-		for {
-			got, err := before.Read(4)
-			if err != nil {
-				return
-			}
-			if first {
-				close(readOnce)
-				first = false
-			}
-			if string(got) != `{"i":4}` {
-				select {
-				case changed <- string(got):
-				default:
-				}
-			}
-			select {
-			case <-stop:
-				return
-			default:
-			}
+	// The kept prefix reads identically through the pre-fork snapshot.
+	for i := uint64(1); i <= 3; i++ {
+		got, err := before.Read(i)
+		if err != nil {
+			t.Fatalf("pre-fork snapshot lost kept record %d: %v", i, err)
 		}
-	}()
-	<-readOnce
-	next := append(truncated.entries, []byte(`{"replacement":4}`))
-	if string(next[len(truncated.entries)]) != `{"replacement":4}` {
-		t.Fatal("synthetic post-fork append was not retained")
+		if want := fmt.Sprintf(`{"i":%d}`, i); string(got) != want {
+			t.Fatalf("pre-fork snapshot read %d = %s, want %s", i, got, want)
+		}
 	}
-	close(stop)
-	wg.Wait()
-	select {
-	case got := <-changed:
-		t.Fatalf("concurrent pre-fork snapshot changed after truncated append: %s", got)
-	default:
+	// The moved suffix is gone from the parent's view, and the pre-fork
+	// snapshot does not pretend otherwise: it lives in the old future now,
+	// which serves it byte for byte.
+	if _, err := before.Read(4); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("pre-fork snapshot read of a moved record = %v, want ErrNotFound", err)
 	}
-	got, err := before.Read(4)
+	oldFuture, err := Open(filepath.Join(dir, filepath.Base(dir)),
+		Options{Codec: segment.JSONLCodec{}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != `{"i":4}` {
-		t.Fatalf("pre-fork snapshot changed after truncated append: %s", got)
+	defer oldFuture.Close()
+	got, err := oldFuture.Read(4)
+	if err != nil || string(got) != `{"i":4}` {
+		t.Fatalf("old future read 4 = %q, %v", got, err)
 	}
 }
 
-func TestCachedSiblingForksSharePointer(t *testing.T) {
-	// Two sibling forks created from the same parent should share the
-	// same *cacheSnapshot pointer for the parent chain.
+// Sibling forks read their shared prefix through ONE parent handle rather
+// than through copies of it: nothing below the fork point is duplicated in
+// memory, because nothing below it is in memory at all until it is read.
+func TestCachedSiblingForksShareTheParentHandle(t *testing.T) {
 	dir := t.TempDir()
 	c, _ := Open(dir, Options{Codec: segment.JSONLCodec{}})
 	defer c.Close()
@@ -345,20 +330,18 @@ func TestCachedSiblingForksSharePointer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Close()
-	// The parent snapshot a holds should equal c's current snapshot
-	// pointer (same truncated trunk).
-	if a.snap.Load().parent != c.snap.Load() {
-		t.Fatal("child parent snapshot pointer should equal trunk's snapshot pointer")
+	if a.Disk().Parent() != c.Disk() {
+		t.Fatal("child should read its prefix through the trunk handle")
 	}
 	// N-ary: a branch point accepts a second sibling at the same split
-	// point, and it shares the same trunk snapshot pointer.
+	// point, reading the same trunk.
 	b, err := c.Fork(3, "b")
 	if err != nil {
 		t.Fatalf("second sibling fork should succeed, got %v", err)
 	}
 	defer b.Close()
-	if b.snap.Load().parent != c.snap.Load() {
-		t.Fatal("second child should share the trunk snapshot pointer")
+	if b.Disk().Parent() != c.Disk() {
+		t.Fatal("second child should read the same trunk handle")
 	}
 	if err := b.Write(3, []byte(`{"b":3}`)); err != nil {
 		t.Fatalf("write to second sibling: %v", err)

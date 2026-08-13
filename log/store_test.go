@@ -49,8 +49,8 @@ func TestStoreSiblingForksSharePhysicalPrefixAndSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.snap.Load().parent != b.snap.Load().parent {
-		t.Fatal("sibling cache snapshots copied their shared prefix")
+	if a.Disk().Parent() != b.Disk().Parent() {
+		t.Fatal("sibling logs copied their shared prefix")
 	}
 	if a.Disk().Parent() != b.Disk().Parent() {
 		t.Fatal("sibling disk logs do not share the same prefix location")

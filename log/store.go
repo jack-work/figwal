@@ -90,32 +90,13 @@ func (s *Store) open(abs string, opts Options) (*Log, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// Snapshot the parent the DISK log actually has, not filepath.Dir: a flat
-	// node's parent is a sibling named by the caller.
-	var parent *cacheSnapshot
-	if p := inner.Parent(); p != nil {
-		parentOpts := opts
-		parentOpts.Parent = nil
-		parentLog, err := s.Open(p.Dir(), parentOpts)
-		if err != nil {
-			return nil, err
-		}
-		parent = parentLog.snap.Load()
-	}
-	snap, err := buildOwnSnapshot(inner, parent)
-	if err != nil {
-		return nil, err
-	}
-	l := &Log{inner: inner, shared: true, maxLag: maxLagFor(opts)}
-	l.snap.Store(snap)
-	return l, nil
+	return &Log{inner: inner, shared: true, maxLag: maxLagFor(opts)}, nil
 }
 
-// Evict syncs and drops the cached Log for dir, releasing its in-RAM
-// snapshot; the next Open rebuilds it from disk. The underlying disk
-// log stays cached in the disk store for cheap reload. On sync failure
-// the log stays cached, so no buffered entry is orphaned.
+// Evict syncs and drops the cached Log for dir, releasing the payload
+// blocks its segments hold; the next Open rebuilds nothing but the index.
+// The underlying disk log stays cached in the disk store for cheap reload.
+// On sync failure the log stays cached, so no pending entry is orphaned.
 func (s *Store) Evict(dir string) error {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
@@ -131,6 +112,7 @@ func (s *Store) Evict(dir string) error {
 	if err := l.Sync(); err != nil {
 		return err
 	}
+	l.inner.DropPayloadCache()
 	s.mu.Lock()
 	if s.logs[abs] == l {
 		delete(s.logs, abs)

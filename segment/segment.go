@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -35,6 +37,12 @@ type Segment struct {
 	// decoded header payload.
 	hasHeader bool
 	header    []byte
+
+	// block is this segment's lazily loaded payload cache; see cache.go.
+	// Nil means "not resident": reads fall through to the file.
+	block  atomic.Pointer[block]
+	usedAt atomic.Int64
+	loadMu sync.Mutex
 }
 
 func Create(path string, codec SegmentCodec, baseIndex uint64, maxSize int64) (*Segment, error) {
@@ -209,6 +217,7 @@ func (s *Segment) Append(payload []byte) (offset int64, err error) {
 	s.size += int64(n)
 	s.offsets = append(s.offsets, offset)
 	s.count++
+	s.extendBlock(payload)
 	return offset, nil
 }
 
@@ -261,6 +270,9 @@ func (s *Segment) ReadIndex(i uint64) ([]byte, error) {
 	if i >= s.count {
 		return nil, ErrOutOfRange
 	}
+	if b := s.cachedPayloads(); b != nil && i < uint64(len(b.payloads)) {
+		return b.payloads[i], nil
+	}
 	off := s.offsets[i]
 	nextOff := s.size
 	if int(i)+1 < len(s.offsets) {
@@ -285,10 +297,15 @@ func (s *Segment) nextOffsetAfter(off int64) int64 {
 	return -1
 }
 
-func (s *Segment) Count() uint64      { return s.count }
-func (s *Segment) Sync() error        { return s.f.Sync() }
-func (s *Segment) Size() int64        { return s.size }
-func (s *Segment) Close() error       { return s.f.Close() }
+func (s *Segment) Count() uint64 { return s.count }
+func (s *Segment) Sync() error   { return s.f.Sync() }
+func (s *Segment) Size() int64   { return s.size }
+
+// Close releases the file handle and the segment's payload block.
+func (s *Segment) Close() error {
+	payloadCache.forget(s)
+	return s.f.Close()
+}
 func (s *Segment) Path() string       { return s.path }
 func (s *Segment) ReadOnly() bool     { return s.readOnly }
 func (s *Segment) FirstIndex() uint64 { return s.baseIndex }

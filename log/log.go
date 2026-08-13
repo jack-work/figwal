@@ -1,6 +1,6 @@
 // Package log is the caller-facing figwal log: append-only, segment
-// rotated, fork-able, with an in-memory cache that serves reads
-// lock-free over an atomic snapshot pointer. The underlying disk
+// rotated, fork-able, with reads that serve from a lazily loaded,
+// budgeted payload cache in the segment layer. The underlying disk
 // layout and segment management live in figwal/disk; this package
 // wraps them.
 package log
@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 
 	"github.com/jack-work/figwal/disk"
+	"github.com/jack-work/figwal/segment"
 )
 
 // Re-exported error sentinels so callers don't need to import the
@@ -31,167 +32,125 @@ var (
 // trivial type-name change at the import site.
 type Options = disk.Options
 
-// Log is a figwal write-ahead log. Reads are lock-free over an
-// immutable snapshot held in an atomic.Pointer; many goroutines can
-// read in parallel with zero contention. Writes serialize on a
-// writer mutex, publish a new snapshot immediately, and buffer the
-// payload for a later Sync; disk follows memory with bounded lag. A
-// reader either sees the pre-write or post-write snapshot; never a
-// partial state.
+// SetPayloadCacheBudget bounds the bytes of segment payloads held in memory
+// across every open log in the process. Zero makes every read a pread.
+func SetPayloadCacheBudget(bytes int64) { segment.SetCacheBudget(bytes) }
+
+// PayloadCacheBytes reports what is currently held against that bound.
+func PayloadCacheBytes() int64 { return segment.CachedBytes() }
+
+// Log is a figwal write-ahead log.
 //
-// Forks reshape both the on-disk log and the in-memory cache. The
-// parent's snapshot is truncated to [first, atIdx-1] (a reslice that
-// shares the underlying entry array), and the child gets a fresh
-// snapshot whose parent pointer is the truncated trunk. Sibling forks
-// share parent state by pointer.
+// A record lives in exactly one of two places: the PENDING buffer, which
+// holds what has been appended and not yet synced, or the segment files.
+// Reads consult the pending buffer first and fall through to the segments,
+// whose payloads are loaded lazily and held against a process-wide budget
+// (see figwal/segment). Opening a log therefore costs its index, not its
+// history: a channel nobody reads holds no payloads at all.
+//
+// The pending buffer is published behind an atomic pointer, so a reader of
+// unsynced records takes no lock; below it, a read takes the disk log's read
+// lock, which an append holds only for the write syscall and never for an
+// fsync.
+//
+// Forks reshape the on-disk log only. A child reads its inherited prefix
+// through the parent handle, which is where that prefix has always lived.
 const defaultMaxUnflushedBytes = 64 << 20
 
 type Log struct {
 	inner  *disk.Log
 	wmu    sync.Mutex
 	fmu    sync.Mutex
-	snap   atomic.Pointer[cacheSnapshot]
 	shared bool
 	maxLag int64
 
-	pending      [][]byte
-	pendingFirst uint64
+	// pend is the immutable view of appended-but-unsynced records.
+	// Mutated only under wmu; read lock-free.
+	pend         atomic.Pointer[pendingView]
 	pendingBytes int64
 }
 
-func (s *cacheSnapshot) scanFromEnd(from uint64, fn func(idx uint64, payload []byte) error) error {
-	if len(s.entries) > 0 {
-		first := s.firstIdx
-		idx := first + uint64(len(s.entries)) - 1
-		if from != 0 && from < idx {
-			idx = from
-		}
-		if idx >= first {
-			for {
-				if err := fn(idx, s.entries[idx-first]); err != nil {
-					return err
-				}
-				if idx == first {
-					break
-				}
-				idx--
-			}
-		}
-	}
-	if s.parent != nil && s.forkBase > 0 {
-		parentFrom := s.forkBase - 1
-		if from != 0 && from < parentFrom {
-			parentFrom = from
-		}
-		return s.parent.scanFromEnd(parentFrom, fn)
-	}
-	return nil
+// pendingView is an immutable window of records not yet on disk. Entries is
+// only ever appended to beyond its own length, so a captured view stays
+// valid while the writer moves on.
+type pendingView struct {
+	first   uint64
+	entries [][]byte
 }
 
-// cacheSnapshot is an immutable view of a Log's entries. The entries
-// slice is keyed by `firstIdx + i`. For forked children, parent (with
-// forkBase) covers indices below firstIdx.
-//
-// Once a snapshot is published via atomic.Store, its fields are not
-// mutated. New snapshots are built by re-slicing or appending.
-type cacheSnapshot struct {
-	firstIdx uint64
-	entries  [][]byte
-	parent   *cacheSnapshot
-	forkBase uint64
+func (p *pendingView) last() uint64 { return p.first + uint64(len(p.entries)) - 1 }
+
+func (p *pendingView) at(idx uint64) ([]byte, bool) {
+	if p == nil || len(p.entries) == 0 || idx < p.first {
+		return nil, false
+	}
+	i := idx - p.first
+	if i >= uint64(len(p.entries)) {
+		return nil, false
+	}
+	return p.entries[i], true
 }
 
-// Open opens (or creates) a figwal log at dir and loads its entries
-// into an in-memory cache. For a forked dir, the parent chain is
-// materialized too.
+// Open opens (or creates) a figwal log at dir. It reads the segment index,
+// not the segment payloads.
 func Open(dir string, opts Options) (*Log, error) {
 	inner, err := disk.Open(dir, opts)
 	if err != nil {
 		return nil, err
 	}
-	l := &Log{inner: inner, maxLag: maxLagFor(opts)}
-	snap, err := buildSnapshotFromDisk(inner)
-	if err != nil {
-		inner.Close()
-		return nil, err
-	}
-	l.snap.Store(snap)
-	return l, nil
+	return &Log{inner: inner, maxLag: maxLagFor(opts)}, nil
 }
 
-// buildSnapshotFromDisk materializes a cacheSnapshot from a disk.Log,
-// including the parent chain. Called once at Open; post-publish,
-// snapshots evolve via Write/Fork.
-func buildSnapshotFromDisk(l *disk.Log) (*cacheSnapshot, error) {
-	var parentSnap *cacheSnapshot
-	if p := l.Parent(); p != nil {
-		ps, err := buildSnapshotFromDisk(p)
-		if err != nil {
-			return nil, err
-		}
-		parentSnap = ps
-	}
-	return buildOwnSnapshot(l, parentSnap)
-}
-
-func buildOwnSnapshot(l *disk.Log, parentSnap *cacheSnapshot) (*cacheSnapshot, error) {
-	snap := &cacheSnapshot{
-		parent:   parentSnap,
-		forkBase: l.ForkBase(),
-	}
-	err := l.RangeOwn(0, func(idx uint64, payload []byte) error {
-		cp := make([]byte, len(payload))
-		copy(cp, payload)
-		if len(snap.entries) == 0 {
-			snap.firstIdx = idx
-		}
-		snap.entries = append(snap.entries, cp)
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return snap, nil
-}
-
-// Read returns the payload at idx. Lock-free.
+// Read returns the payload at idx.
 func (l *Log) Read(idx uint64) ([]byte, error) {
-	return l.snap.Load().read(idx)
+	if payload, ok := l.pend.Load().at(idx); ok {
+		return payload, nil
+	}
+	payload, err := l.inner.Read(idx)
+	if errors.Is(err, disk.ErrEmpty) {
+		return nil, ErrNotFound
+	}
+	return payload, err
 }
 
-// Range iterates over entries from `from` to LastIndex, calling fn
-// for each. Lock-free: a single snapshot Load fixes the view for the
-// duration of the iteration; later writes are not visible. Walks the
-// parent chain for indices below the fork's forkBase.
+// Range iterates over entries from `from` to LastIndex, calling fn for each.
+// The pending window is captured before the disk walk and bounds it, so a
+// concurrent sync can neither duplicate nor drop a record mid-iteration.
+// Walks the parent chain for indices below this fork's base.
 func (l *Log) Range(from uint64, fn func(idx uint64, payload []byte) error) error {
-	return l.snap.Load().rangeFromIdx(from, fn)
+	return l.rangeBounded(from, ^uint64(0)-1, l.pend.Load(), fn)
 }
 
-// ScanFromEnd iterates entries in descending index order from from (or the
-// current tail when from is past it). It reads the immutable cache snapshot,
-// including fork prefixes, instead of re-reading disk segments.
+// ScanFromEnd iterates entries in descending index order from `from`, or from
+// the tail when from is zero or past it.
 func (l *Log) ScanFromEnd(from uint64, fn func(idx uint64, payload []byte) error) error {
-	return l.snap.Load().scanFromEnd(from, fn)
+	pend := l.pend.Load()
+	if last := l.LastIndex(); from == 0 || from > last {
+		from = last
+	}
+	return l.scanFromEndBounded(from, pend, fn)
 }
 
 // FirstIndex returns the first index visible from this Log, walking
 // the parent chain if it's a fork.
 func (l *Log) FirstIndex() uint64 {
-	return l.snap.Load().firstIndexRecursive()
+	if first := l.inner.FirstIndex(); first != 0 {
+		return first
+	}
+	if pend := l.pend.Load(); pend != nil && len(pend.entries) > 0 {
+		return pend.first
+	}
+	return 0
 }
 
 // LastIndex returns the highest index in this Log's own entries. For
 // an empty fork it returns forkBase - 1 to reflect that the next
 // write will be forkBase.
 func (l *Log) LastIndex() uint64 {
-	s := l.snap.Load()
-	if n := len(s.entries); n > 0 {
-		return s.firstIdx + uint64(n) - 1
+	if pend := l.pend.Load(); pend != nil && len(pend.entries) > 0 {
+		return pend.last()
 	}
-	if s.forkBase > 0 {
-		return s.forkBase - 1
-	}
-	return 0
+	return l.inner.LastIndex()
 }
 
 func maxLagFor(opts Options) int64 {
@@ -201,9 +160,9 @@ func maxLagFor(opts Options) int64 {
 	return defaultMaxUnflushedBytes
 }
 
-// Write appends an entry to the in-memory snapshot and buffers it for
-// the next Sync. It touches disk only when the un-synced lag exceeds
-// the byte bound, in which case it syncs inline before returning.
+// Write appends an entry to the pending buffer, from which it is
+// immediately readable. It touches disk only when the un-synced lag
+// exceeds the byte bound, in which case it syncs inline before returning.
 func (l *Log) Write(idx uint64, payload []byte) error {
 	if err := l.write(idx, payload); err != nil {
 		return err
@@ -224,50 +183,41 @@ func (l *Log) write(idx uint64, payload []byte) error {
 	if l.inner.IsReadOnly() {
 		return fmt.Errorf("%w: fork parent", ErrReadOnly)
 	}
-	old := l.snap.Load()
-	expected := uint64(1)
-	if n := len(old.entries); n > 0 {
-		expected = old.firstIdx + uint64(n)
-	} else if old.forkBase > 0 {
-		expected = old.forkBase
+	old := l.pend.Load()
+	expected := l.inner.LastIndex() + 1
+	if old != nil && len(old.entries) > 0 {
+		expected = old.last() + 1
 	}
 	if idx != expected {
 		return fmt.Errorf("%w: got %d, want %d", disk.ErrOutOfOrder, idx, expected)
 	}
 	cp := make([]byte, len(payload))
 	copy(cp, payload)
-	entries := append(old.entries, cp)
-	firstIdx := old.firstIdx
-	if len(old.entries) == 0 {
-		firstIdx = idx
+	next := &pendingView{first: idx}
+	if old != nil && len(old.entries) > 0 {
+		next.first = old.first
+		// Appending past the published length never disturbs a captured
+		// view, which sees only its own prefix.
+		next.entries = append(old.entries, cp)
+	} else {
+		next.entries = [][]byte{cp}
 	}
-	if len(l.pending) == 0 {
-		l.pendingFirst = idx
-	}
-	l.pending = append(l.pending, cp)
 	l.pendingBytes += int64(len(cp))
-	l.snap.Store(&cacheSnapshot{
-		firstIdx: firstIdx,
-		entries:  entries,
-		parent:   old.parent,
-		forkBase: old.forkBase,
-	})
+	l.pend.Store(next)
 	return nil
 }
 
-// Sync persists every buffered entry and fsyncs.
+// Sync persists every pending entry and fsyncs.
 //
-// NOT "flush": nothing leaves memory. An append lands in TWO places -- the
-// read cache that serves lookups lock-free, and a queue of records not yet
-// written. Sync drains only the queue and fsyncs; the cache is untouched, so
-// a synced record is still served from RAM. The stdio sense of "flush", where
-// the buffer empties, is the wrong picture and was the wrong name.
+// A synced record leaves the pending buffer and is served from its segment
+// thereafter, whose payloads are cached lazily and evictably. Nothing is
+// lost by the move: the bytes are on disk before the buffer is trimmed.
 //
 // Appends are only briefly blocked (queue bookkeeping); the disk IO runs
 // outside the writer mutex.
 func (l *Log) Sync() error { return l.SyncThrough(^uint64(0)) }
 
-// SyncThrough persists buffered entries with index <= target and fsyncs.
+// SyncThrough persists pending entries with index <= target and fsyncs.
 // The buffer is trimmed only after the fsync succeeds, so a failed
 // sync retries safely: entries that did reach disk before the failure
 // are skipped on the next attempt.
@@ -275,15 +225,17 @@ func (l *Log) SyncThrough(target uint64) error {
 	l.fmu.Lock()
 	defer l.fmu.Unlock()
 	l.wmu.Lock()
+	pend := l.pend.Load()
 	n := 0
-	if len(l.pending) > 0 && target >= l.pendingFirst {
-		n = len(l.pending)
-		if span := target - l.pendingFirst + 1; span < uint64(n) {
+	var first uint64
+	if pend != nil && len(pend.entries) > 0 && target >= pend.first {
+		first = pend.first
+		n = len(pend.entries)
+		if span := target - first + 1; span < uint64(n) {
 			n = int(span)
 		}
 	}
-	batch := l.pending[:n:n]
-	first := l.pendingFirst
+	batch := pend.entriesPrefix(n)
 	l.wmu.Unlock()
 	if n == 0 {
 		return nil
@@ -302,8 +254,10 @@ func (l *Log) SyncThrough(target uint64) error {
 		return err
 	}
 	l.wmu.Lock()
-	l.pending = l.pending[n:]
-	l.pendingFirst = first + uint64(n)
+	cur := l.pend.Load()
+	if cur != nil && cur.first == first {
+		l.pend.Store(&pendingView{first: first + uint64(n), entries: cur.entries[n:]})
+	}
 	for _, p := range batch {
 		l.pendingBytes -= int64(len(p))
 	}
@@ -311,14 +265,20 @@ func (l *Log) SyncThrough(target uint64) error {
 	return nil
 }
 
-// PendingBounds reports the unflushed index range, if any.
+func (p *pendingView) entriesPrefix(n int) [][]byte {
+	if p == nil || n <= 0 {
+		return nil
+	}
+	return p.entries[:n:n]
+}
+
+// PendingBounds reports the unsynced index range, if any.
 func (l *Log) PendingBounds() (first, last uint64, ok bool) {
-	l.wmu.Lock()
-	defer l.wmu.Unlock()
-	if len(l.pending) == 0 {
+	pend := l.pend.Load()
+	if pend == nil || len(pend.entries) == 0 {
 		return 0, 0, false
 	}
-	return l.pendingFirst, l.pendingFirst + uint64(len(l.pending)) - 1, true
+	return pend.first, pend.last(), true
 }
 
 // Hash returns the codec's integrity token for the payload at idx.
@@ -331,11 +291,8 @@ func (l *Log) Hash(idx uint64) (string, error) {
 }
 
 // Fork splits this Log at atIdx. See disk.Log.Fork for semantics
-// (N-ary siblings, re-split below an existing branch point). The cache
-// snapshot is updated for this handle and the returned child; sibling
-// handles already open in memory are NOT updated on a re-split-below —
-// their in-memory parent pointer goes stale. Reopen affected
-// descendants (the on-disk layout is always correct).
+// (N-ary siblings, re-split below an existing branch point). The child
+// reads its inherited prefix through the parent handle.
 func (l *Log) Fork(atIdx uint64, name string, oldFutureNameOpt ...string) (*Log, error) {
 	if l.shared {
 		return nil, ErrSharedMutation
@@ -345,7 +302,7 @@ func (l *Log) Fork(atIdx uint64, name string, oldFutureNameOpt ...string) (*Log,
 	}
 	l.wmu.Lock()
 	defer l.wmu.Unlock()
-	if len(l.pending) > 0 {
+	if pend := l.pend.Load(); pend != nil && len(pend.entries) > 0 {
 		return nil, fmt.Errorf("log fork: raced a concurrent write")
 	}
 
@@ -353,11 +310,11 @@ func (l *Log) Fork(atIdx uint64, name string, oldFutureNameOpt ...string) (*Log,
 	if err != nil {
 		return nil, err
 	}
-	return l.forkCached(atIdx, childInner)
+	return &Log{inner: childInner, maxLag: l.maxLag}, nil
 }
 
 // ForkRehome forks with an explicit list of children to move into the old
-// future. It has the same cache semantics as Fork.
+// future. It has the same semantics as Fork.
 func (l *Log) ForkRehome(atIdx uint64, name, oldFutureName string, rehome []string) (*Log, error) {
 	if l.shared {
 		return nil, ErrSharedMutation
@@ -367,7 +324,7 @@ func (l *Log) ForkRehome(atIdx uint64, name, oldFutureName string, rehome []stri
 	}
 	l.wmu.Lock()
 	defer l.wmu.Unlock()
-	if len(l.pending) > 0 {
+	if pend := l.pend.Load(); pend != nil && len(pend.entries) > 0 {
 		return nil, fmt.Errorf("log fork: raced a concurrent write")
 	}
 
@@ -375,40 +332,11 @@ func (l *Log) ForkRehome(atIdx uint64, name, oldFutureName string, rehome []stri
 	if err != nil {
 		return nil, err
 	}
-	return l.forkCached(atIdx, childInner)
+	return &Log{inner: childInner, maxLag: l.maxLag}, nil
 }
 
-func (l *Log) forkCached(atIdx uint64, childInner *disk.Log) (*Log, error) {
-	old := l.snap.Load()
-	keep := uint64(0)
-	if len(old.entries) > 0 && atIdx > old.firstIdx {
-		keep = atIdx - old.firstIdx
-	}
-	if keep > uint64(len(old.entries)) {
-		return nil, fmt.Errorf("log fork: keep %d exceeds entries %d",
-			keep, len(old.entries))
-	}
-	truncated := &cacheSnapshot{
-		firstIdx: old.firstIdx,
-		// Clamp capacity so a future append cannot overwrite suffix slots
-		// still visible through a pre-fork snapshot.
-		entries:  old.entries[:keep:keep],
-		parent:   old.parent,
-		forkBase: old.forkBase,
-	}
-	l.snap.Store(truncated)
-
-	child := &Log{inner: childInner}
-	child.snap.Store(&cacheSnapshot{
-		parent:   truncated,
-		forkBase: atIdx,
-	})
-	return child, nil
-}
-
-// TruncateFront drops entries below beforeIdx, both on disk and in
-// the cache. Only this Log's own entries are affected; parent
-// entries are untouched.
+// TruncateFront drops entries below beforeIdx on disk. Only this Log's
+// own entries are affected; parent entries are untouched.
 func (l *Log) TruncateFront(beforeIdx uint64) error {
 	if l.shared {
 		return ErrSharedMutation
@@ -418,36 +346,19 @@ func (l *Log) TruncateFront(beforeIdx uint64) error {
 	}
 	l.wmu.Lock()
 	defer l.wmu.Unlock()
-	if err := l.inner.TruncateFront(beforeIdx); err != nil {
-		return err
-	}
-	old := l.snap.Load()
-	if len(old.entries) == 0 || beforeIdx <= old.firstIdx {
-		return nil
-	}
-	cut := beforeIdx - old.firstIdx
-	if cut > uint64(len(old.entries)) {
-		cut = uint64(len(old.entries))
-	}
-	l.snap.Store(&cacheSnapshot{
-		firstIdx: old.firstIdx + cut,
-		entries:  old.entries[cut:],
-		parent:   old.parent,
-		forkBase: old.forkBase,
-	})
-	return nil
+	return l.inner.TruncateFront(beforeIdx)
 }
 
 // Disk returns the underlying disk.Log for advanced operations.
-// Bypassing the Log's writer mutex will desync the cache; prefer the
+// Bypassing the Log's writer mutex will miss pending entries; prefer the
 // Log methods on the hot path.
 func (l *Log) Disk() *disk.Log { return l.inner }
 
 // ForkBase returns the first index this log owns, or zero for a root log.
 func (l *Log) ForkBase() uint64 { return l.inner.ForkBase() }
 
-// RangeOwn delegates an own-entry iteration for topology operations. Normal
-// reads should use Range so they stay on the immutable cache.
+// RangeOwn delegates an own-entry iteration for topology operations. It sees
+// only what is on disk; callers that may have unsynced entries use Range.
 func (l *Log) RangeOwn(from uint64, fn func(idx uint64, payload []byte) error) error {
 	return l.inner.RangeOwn(from, fn)
 }
@@ -458,7 +369,7 @@ func (l *Log) ChildForkBases() (map[string]uint64, error) {
 }
 
 // StateAt reconstructs a header-mode state from the on-disk watermark.
-// The disk fold must see every appended patch, so buffered entries are
+// The disk fold must see every appended patch, so pending entries are
 // synced first.
 func (l *Log) StateAt(idx uint64) ([]byte, error) {
 	if err := l.Sync(); err != nil {
@@ -470,7 +381,7 @@ func (l *Log) StateAt(idx uint64) ([]byte, error) {
 // SegmentBaseIndexes returns this log's own segment bases.
 func (l *Log) SegmentBaseIndexes() []uint64 { return l.inner.SegmentBaseIndexes() }
 
-// Close syncs queued entries and closes the underlying disk.Log.
+// Close syncs pending entries and closes the underlying disk.Log.
 // Parent logs auto-opened during Open are not closed automatically;
 // manage them via a Store or explicit handles for shared lifetimes.
 func (l *Log) Close() error {
@@ -484,88 +395,110 @@ func (l *Log) Close() error {
 	return syncErr
 }
 
-// Snapshot exposes the current snapshot pointer for callers that
-// want a point-in-time consistent view across many operations
-// (typical use: dump the entire log to the network as of "now").
+// Snapshot returns a point-in-time view bounded at the current tail, for
+// callers that want one consistent view across many operations (typical
+// use: dump the log to the network as of "now"). Records appended after
+// the capture are invisible; a topology mutation (fork, truncate) below
+// the capture is not, which is why those require a private log.
 func (l *Log) Snapshot() *Snapshot {
-	return &Snapshot{s: l.snap.Load()}
+	return &Snapshot{l: l, pend: l.pend.Load(), last: l.LastIndex()}
 }
 
-// Snapshot is an immutable point-in-time view of a Log. All access
-// is lock-free; later writes to the Log are not visible.
-type Snapshot struct{ s *cacheSnapshot }
+// Snapshot is a point-in-time view of a Log.
+type Snapshot struct {
+	l    *Log
+	pend *pendingView
+	last uint64
+}
 
-func (s *Snapshot) Read(idx uint64) ([]byte, error) { return s.s.read(idx) }
+func (s *Snapshot) Read(idx uint64) ([]byte, error) {
+	if idx > s.last {
+		return nil, ErrNotFound
+	}
+	if payload, ok := s.pend.at(idx); ok {
+		return payload, nil
+	}
+	payload, err := s.l.inner.Read(idx)
+	if errors.Is(err, disk.ErrEmpty) {
+		return nil, ErrNotFound
+	}
+	return payload, err
+}
+
 func (s *Snapshot) Range(from uint64, fn func(idx uint64, payload []byte) error) error {
-	return s.s.rangeFromIdx(from, fn)
+	return s.l.rangeBounded(from, s.last, s.pend, fn)
 }
+
 func (s *Snapshot) ScanFromEnd(from uint64, fn func(idx uint64, payload []byte) error) error {
-	return s.s.scanFromEnd(from, fn)
-}
-func (s *Snapshot) FirstIndex() uint64 { return s.s.firstIndexRecursive() }
-func (s *Snapshot) LastIndex() uint64 {
-	if n := len(s.s.entries); n > 0 {
-		return s.s.firstIdx + uint64(n) - 1
+	if from == 0 || from > s.last {
+		from = s.last
 	}
-	if s.s.forkBase > 0 {
-		return s.s.forkBase - 1
-	}
-	return 0
+	return s.l.scanFromEndBounded(from, s.pend, fn)
 }
 
-// --- cacheSnapshot methods ---
+func (s *Snapshot) FirstIndex() uint64 { return s.l.FirstIndex() }
+func (s *Snapshot) LastIndex() uint64  { return s.last }
 
-func (s *cacheSnapshot) read(idx uint64) ([]byte, error) {
-	if s.parent != nil && idx < s.forkBase {
-		return s.parent.read(idx)
+// rangeBounded is Range with an explicit upper bound and pending window.
+func (l *Log) rangeBounded(from, upTo uint64, pend *pendingView,
+	fn func(idx uint64, payload []byte) error) error {
+	stop := upTo + 1
+	if pend != nil && len(pend.entries) > 0 && pend.first < stop {
+		stop = pend.first
 	}
-	if len(s.entries) == 0 || idx < s.firstIdx {
-		return nil, ErrNotFound
-	}
-	i := idx - s.firstIdx
-	if i >= uint64(len(s.entries)) {
-		return nil, ErrNotFound
-	}
-	return s.entries[i], nil
-}
-
-func (s *cacheSnapshot) rangeFromIdx(from uint64, fn func(idx uint64, payload []byte) error) error {
-	if s.parent != nil && from < s.forkBase {
-		err := s.parent.rangeFromIdx(from, func(idx uint64, payload []byte) error {
-			if idx >= s.forkBase {
-				return errRangeBoundary
-			}
-			return fn(idx, payload)
-		})
-		if err != nil && !errors.Is(err, errRangeBoundary) {
-			return err
+	err := l.inner.Range(from, func(idx uint64, payload []byte) error {
+		if idx >= stop {
+			return errRangeBoundary
 		}
-		from = s.forkBase
+		return fn(idx, payload)
+	})
+	if err != nil && !errors.Is(err, errRangeBoundary) {
+		return err
 	}
-	if len(s.entries) == 0 {
+	if pend == nil {
 		return nil
 	}
-	start := s.firstIdx
-	if from > start {
-		start = from
-	}
-	end := s.firstIdx + uint64(len(s.entries))
-	for i := start; i < end; i++ {
-		if err := fn(i, s.entries[i-s.firstIdx]); err != nil {
+	for i, payload := range pend.entries {
+		idx := pend.first + uint64(i)
+		if idx < from {
+			continue
+		}
+		if idx > upTo {
+			return nil
+		}
+		if err := fn(idx, payload); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *cacheSnapshot) firstIndexRecursive() uint64 {
-	if s.parent != nil {
-		if first := s.parent.firstIndexRecursive(); first != 0 {
-			return first
+func (l *Log) scanFromEndBounded(from uint64, pend *pendingView,
+	fn func(idx uint64, payload []byte) error) error {
+	if from == 0 {
+		return nil
+	}
+	if pend != nil && len(pend.entries) > 0 && from >= pend.first {
+		idx := from
+		if hi := pend.last(); idx > hi {
+			idx = hi
 		}
+		for ; idx >= pend.first; idx-- {
+			payload, _ := pend.at(idx)
+			if err := fn(idx, payload); err != nil {
+				return err
+			}
+			if idx == 0 {
+				break
+			}
+		}
+		if pend.first == 0 {
+			return nil
+		}
+		from = pend.first - 1
 	}
-	if len(s.entries) == 0 {
-		return 0
+	if from == 0 {
+		return nil
 	}
-	return s.firstIdx
+	return l.inner.ScanFromEnd(from, fn)
 }

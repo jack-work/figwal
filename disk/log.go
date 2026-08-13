@@ -862,3 +862,17 @@ func parseSegName(name, ext string) (uint64, error) {
 	stem := strings.TrimSuffix(name, ext)
 	return strconv.ParseUint(stem, 10, 64)
 }
+
+// DropPayloadCache releases the payload blocks of every segment this log
+// owns. The log stays open and serves reads from its files; this is what an
+// idle unload reclaims now that opening a log retains nothing on its own.
+func (l *Log) DropPayloadCache() {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	for _, s := range l.sealed {
+		s.DropCache()
+	}
+	if l.active != nil {
+		l.active.DropCache()
+	}
+}
