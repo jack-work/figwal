@@ -143,7 +143,9 @@ func (b *Budget) charge(delta int64) {
 
 // epochNow reads the current epoch without advancing it: touches load,
 // loads and sweeps advance.
-func (b *Budget) epochNow() int64 {
+// EpochNow reads the current epoch without advancing it: touches and
+// layer-below stamps load it; loads and sweeps advance it.
+func (b *Budget) EpochNow() int64 {
 	if b == nil {
 		return 0
 	}

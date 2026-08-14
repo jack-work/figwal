@@ -19,6 +19,12 @@ type Cache[U any] struct {
 	// pointer. It receives the coord only; the units are already gone.
 	Evicted func(Coord)
 
+	// Recency, when set, is the layer-below's recency oracle: a coord's
+	// LAST-READ epoch, maintained by that layer on its own lock-free
+	// path (a segment stamps usedAt in nanoseconds; forest must not tax
+	// that read with a lock). Eviction orders by max(run epoch, oracle).
+	Recency func(Coord) int64
+
 	mu    sync.Mutex
 	nodes map[string]*node[U]
 
@@ -45,7 +51,7 @@ type node[U any] struct{ runs []*run[U] } // sorted by coord.From
 // with more readers (segment cache, 2026-08); the generic must not
 // reintroduce what the concrete already paid to remove.
 func (r *run[U]) touch(c *Cache[U]) {
-	if e := c.budget.epochNow(); r.epoch != e {
+	if e := c.budget.EpochNow(); r.epoch != e {
 		r.epoch = e
 	}
 }
@@ -89,7 +95,9 @@ func (c *Cache[U]) Recomposes() int64 {
 // Put seeds units the caller already holds (a seal, a decode already
 // paid for), so the freshest data never costs a rematerialize. Pinned
 // marks a unit range no Source can rebuild -- it stays resident and
-// counted until Trim or Close.
+// counted until Trim or Close. A Put at an existing run's exact coord
+// REPLACES it (the writer's tail growing in place), and the budget is
+// charged the delta.
 func (c *Cache[U]) Put(coord Coord, units []U, pinned bool) {
 	c.mu.Lock()
 	n := c.node(coord.Node)
@@ -98,9 +106,35 @@ func (c *Cache[U]) Put(coord Coord, units []U, pinned bool) {
 	for _, u := range units {
 		r.bytes += int64(c.size(u))
 	}
-	n.insert(r)
+	delta := r.bytes
+	if old := n.at(coord); old != nil {
+		if old.resident {
+			delta -= old.bytes
+		}
+		*old = *r
+	} else {
+		n.insert(r)
+	}
 	c.mu.Unlock()
-	c.budget.charge(r.bytes)
+	c.budget.charge(delta)
+}
+
+// Drop hollows the run at exactly coord (a sealed segment released, a
+// node deleted), returning its bytes to the budget. Pinned runs drop
+// too: Drop is the OWNER saying gone, not the sweep asking.
+func (c *Cache[U]) Drop(coord Coord) {
+	c.mu.Lock()
+	var freed int64
+	if r := c.node(coord.Node).at(coord); r != nil && r.resident {
+		freed = r.bytes
+		r.units = nil
+		r.resident = false
+		r.pinned = false
+	}
+	c.mu.Unlock()
+	if c.budget != nil && freed > 0 {
+		c.budget.bytes.Add(-freed)
+	}
 }
 
 // Range returns the units in (from..to] along lineage, walking fork
@@ -300,6 +334,14 @@ func (c *Cache[U]) bump() int64 {
 	return c.budget.epoch.Add(1)
 }
 
+func (n *node[U]) at(coord Coord) *run[U] {
+	i := sort.Search(len(n.runs), func(i int) bool { return n.runs[i].coord.From >= coord.From })
+	if i < len(n.runs) && n.runs[i].coord == coord {
+		return n.runs[i]
+	}
+	return nil
+}
+
 func (n *node[U]) insert(r *run[U]) {
 	i := sort.Search(len(n.runs), func(i int) bool { return n.runs[i].coord.From >= r.coord.From })
 	n.runs = append(n.runs, nil)
@@ -309,14 +351,26 @@ func (n *node[U]) insert(r *run[U]) {
 
 // ---- the owner half of the accountant ----
 
+func (c *Cache[U]) effEpoch(r *run[U]) int64 {
+	e := r.epoch
+	if c.Recency != nil {
+		if o := c.Recency(r.coord); o > e {
+			e = o
+		}
+	}
+	return e
+}
+
 func (c *Cache[U]) coldest() (int64, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	best, found := int64(0), false
 	for _, n := range c.nodes {
 		for _, r := range n.runs {
-			if r.resident && !r.pinned && (!found || r.epoch < best) {
-				best, found = r.epoch, true
+			if r.resident && !r.pinned {
+				if e := c.effEpoch(r); !found || e < best {
+					best, found = e, true
+				}
 			}
 		}
 	}
@@ -326,10 +380,13 @@ func (c *Cache[U]) coldest() (int64, bool) {
 func (c *Cache[U]) evictColdest() int64 {
 	c.mu.Lock()
 	var victim *run[U]
+	var victimE int64
 	for _, n := range c.nodes {
 		for _, r := range n.runs {
-			if r.resident && !r.pinned && (victim == nil || r.epoch < victim.epoch) {
-				victim = r
+			if r.resident && !r.pinned {
+				if e := c.effEpoch(r); victim == nil || e < victimE {
+					victim, victimE = r, e
+				}
 			}
 		}
 	}
