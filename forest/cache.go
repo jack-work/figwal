@@ -14,6 +14,11 @@ type Cache[U any] struct {
 	key    Keyer[U]
 	budget *Budget
 
+	// Evicted, when set, fires after a run is hollowed (outside all
+	// locks): the hook a lower layer uses to clear its lock-free fast
+	// pointer. It receives the coord only; the units are already gone.
+	Evicted func(Coord)
+
 	mu    sync.Mutex
 	nodes map[string]*node[U]
 
@@ -33,6 +38,17 @@ type run[U any] struct {
 }
 
 type node[U any] struct{ runs []*run[U] } // sorted by coord.From
+
+// touch refreshes recency the cheap way: RECENCY IS AN EPOCH. The epoch
+// advances only on load and sweep (rare); a touched run only STORES it,
+// and only when stale. A bump per read was measured making reads slower
+// with more readers (segment cache, 2026-08); the generic must not
+// reintroduce what the concrete already paid to remove.
+func (r *run[U]) touch(c *Cache[U]) {
+	if e := c.budget.epochNow(); r.epoch != e {
+		r.epoch = e
+	}
+}
 
 // New builds a cache over src, accounted against b (nil = unbounded).
 func New[U any](src Source[U], b *Budget, size Sizer[U], key Keyer[U]) *Cache[U] {
@@ -78,10 +94,10 @@ func (c *Cache[U]) Put(coord Coord, units []U, pinned bool) {
 	c.mu.Lock()
 	n := c.node(coord.Node)
 	r := &run[U]{coord: coord, units: append([]U(nil), units...), pinned: pinned, resident: true}
+	r.epoch = c.bump()
 	for _, u := range units {
 		r.bytes += int64(c.size(u))
 	}
-	r.epoch = c.bump()
 	n.insert(r)
 	c.mu.Unlock()
 	c.budget.charge(r.bytes)
@@ -165,7 +181,7 @@ func (c *Cache[U]) rangeInNode(coord Coord) ([]U, error) {
 			}
 			continue
 		}
-		r.epoch = c.bump()
+		r.touch(c)
 		out = append(out, c.slice(r, pos, coord.To)...)
 		if r.coord.To > pos {
 			pos = r.coord.To
@@ -309,7 +325,6 @@ func (c *Cache[U]) coldest() (int64, bool) {
 
 func (c *Cache[U]) evictColdest() int64 {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	var victim *run[U]
 	for _, n := range c.nodes {
 		for _, r := range n.runs {
@@ -319,10 +334,17 @@ func (c *Cache[U]) evictColdest() int64 {
 		}
 	}
 	if victim == nil {
+		c.mu.Unlock()
 		return 0
 	}
 	freed := victim.bytes
 	victim.units = nil
 	victim.resident = false
+	coord := victim.coord
+	hook := c.Evicted
+	c.mu.Unlock()
+	if hook != nil {
+		hook(coord) // outside every lock: the layer below may lock itself
+	}
 	return freed
 }

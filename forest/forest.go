@@ -141,6 +141,48 @@ func (b *Budget) charge(delta int64) {
 	}
 }
 
+// epochNow reads the current epoch without advancing it: touches load,
+// loads and sweeps advance.
+func (b *Budget) epochNow() int64 {
+	if b == nil {
+		return 0
+	}
+	return b.epoch.Load()
+}
+
+// TrimIdle evicts every unpinned run whose epoch is older than the
+// current epoch minus keep, then advances the epoch: the idle sweep,
+// generalized. Returns runs dropped and bytes freed.
+func (b *Budget) TrimIdle(keep int64) (dropped int, freed int64) {
+	if b == nil {
+		return 0, 0
+	}
+	cutoff := b.epoch.Add(1) - 1 - keep
+	b.mu.Lock()
+	owners := make([]owner, 0, len(b.owners))
+	for o := range b.owners {
+		owners = append(owners, o)
+	}
+	b.mu.Unlock()
+	for _, o := range owners {
+		for {
+			e, ok := o.coldest()
+			if !ok || e >= cutoff {
+				break
+			}
+			f := o.evictColdest()
+			if f <= 0 {
+				break
+			}
+			b.bytes.Add(-f)
+			b.evictions.Add(1)
+			dropped++
+			freed += f
+		}
+	}
+	return dropped, freed
+}
+
 func (b *Budget) adopt(o owner) {
 	if b == nil {
 		return
