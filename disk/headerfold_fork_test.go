@@ -99,12 +99,29 @@ func TestHeaderFold_OnATrunkTheNaivePairingIsCorrect(t *testing.T) {
 
 // TestHeaderFold_AcrossAForkTheNaivePairingIsWRONG is the hazard.
 //
-// It asserts the CURRENT, BROKEN behaviour deliberately, in the shape the
-// campaign uses for a hazard that is about to be fixed: when an exposure
-// lands that gives a consumer the header and its base TOGETHER, this test
-// goes red and whoever lands it must invert it -- which is the point. A
-// silent wrong answer that nobody has written down is the failure mode; a
-// test that says "this is wrong today" is not.
+// AMENDED BY ba221ff1 AFTER SegmentHeaderAt LANDED, on d921742d's ruling.
+// This test was written expecting to be INVERTED once an exposure handed
+// the header and its base together. That instruction was wrong and is
+// withdrawn: ADDING SegmentHeaderAt DOES NOT MAKE THIS FALSE. HeaderAt
+// still walks the parent chain, SegmentBaseIndexes still does not, and
+// pairing them is still wrong below a fork base -- and will REMAIN wrong
+// unless someone changes one of those two functions, which this campaign
+// is not doing. Inverting it would make it assert something untrue on the
+// day it was inverted. Assert the fact, not the wish.
+//
+// SO IT STAYS, AND IT EARNS ITS KEEP TWICE. It is the STANDING REASON
+// disk.Log.SegmentHeaderAt exists -- the positive side is
+// TestSegmentHeaderAt_AcrossAForkItAgreesWhereThePairingDoesNot. And it is
+// a TRIPWIRE: whoever makes this test go red has changed HeaderAt or
+// SegmentBaseIndexes -- most likely by "tidying" SegmentBaseIndexes into
+// walking the parent chain -- and owes the design that depends on that
+// difference a look before landing it.
+//
+// THE MEASURED COUNT, which is the part an argument cannot replace: on a
+// 40-entry reducible log forked at 30, the naive pairing produces WRONG
+// STATE AT 14 OF 29 INDICES BELOW THE FORK BASE, and is correct at EVERY
+// index at or above it. That is why a single-lineage test would have found
+// nothing: the pairing is right everywhere such a test would look.
 func TestHeaderFold_AcrossAForkTheNaivePairingIsWrong(t *testing.T) {
 	dir := t.TempDir()
 	parent := openReducible(t, dir, 256)
@@ -173,10 +190,16 @@ func TestHeaderFold_AcrossAForkTheNaivePairingIsWrong(t *testing.T) {
 	}
 	if wrong == 0 {
 		t.Fatal("EXPECTED THE NAIVE PAIRING TO PRODUCE WRONG STATE BELOW THE FORK " +
-			"BASE. If it no longer does, either SegmentBaseIndexes now walks the " +
-			"parent chain or an exposure landed that hands the header and its base " +
-			"together -- in which case INVERT this test rather than deleting it: it " +
-			"is the only place that records why the pairing was unsafe.")
+			"BASE, AND THIS IS NOT A TEST THAT WANTS FIXING. Pairing HeaderAt " +
+			"(which walks the parent chain) with SegmentBaseIndexes (which does " +
+			"not) is wrong below a fork base and REMAINS wrong; that is the " +
+			"standing reason disk.Log.SegmentHeaderAt exists, and the correct " +
+			"one-call route is asserted by TestSegmentHeaderAt_AcrossAFork" +
+			"ItAgreesWhereThePairingDoesNot. If you are reading this, you have " +
+			"changed HeaderAt or SegmentBaseIndexes -- most likely by making " +
+			"SegmentBaseIndexes walk the parent chain -- and figaro's delta seam " +
+			"depends on the difference between them. DO NOT INVERT OR DELETE this " +
+			"test to make it green: go and look at what you changed.")
 	}
 	t.Logf("the naive pairing produced wrong state at %d of %d indices below the fork base",
 		wrong, cut-1)
